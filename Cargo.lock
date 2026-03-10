@@ -202,6 +202,7 @@ dependencies = [
  "dashmap",
  "indicatif",
  "itertools",
+ "libc",
  "memchr",
  "memmap2",
  "mimalloc",

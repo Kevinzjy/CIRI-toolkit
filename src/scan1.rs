@@ -1,12 +1,9 @@
 //! Scan 1 module: Ultra-high performance multi-format BSJ identification.
-//!
-//! This module implements the first pass of circular RNA identification. It supports
-//! parallel processing of both SAM and BAM files using Mmap-based streaming and
-//! BGZF decompression.
+//! Optimized for TB-scale data using sharded I/O and active Page Cache eviction.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{Write, BufWriter};
+use std::fs::{File};
+use std::io::{Write, BufWriter, BufRead, BufReader};
 use std::borrow::Cow;
 use anyhow::Result;
 use rayon::prelude::*;
@@ -21,17 +18,12 @@ use crate::utils::AlignmentRecord;
 
 /// Core logic for the first scan pass.
 pub struct Scan1 {
-    /// Minimum mapping quality for a read to be considered.
     pub min_mapq_uni: i32,
-    /// Maximum allowed circle size (bp).
     pub max_circle: i32,
-    /// Minimum allowed circle size (bp).
     pub min_circle: i32,
-    /// Minimum linear range size for competition check.
     pub linear_range_size_min: i32,
 }
 
-/// Internal struct to store candidate BSJ information before ranking.
 #[derive(Debug, Clone)]
 struct BSJCandidate {
     result_str: String,
@@ -42,7 +34,6 @@ struct BSJCandidate {
     cigar_pair: String,
 }
 
-/// Fast integer parser from bytes.
 #[inline]
 fn fast_parse_i32(bytes: &[u8]) -> i32 {
     let mut res = 0;
@@ -50,13 +41,20 @@ fn fast_parse_i32(bytes: &[u8]) -> i32 {
     res
 }
 
+/// Advisory eviction: Tells the kernel we no longer need these memory pages.
+fn advise_dontneed(mmap: &Mmap, offset: usize, len: usize) {
+    if len == 0 { return; }
+    unsafe {
+        let ptr = mmap.as_ptr().add(offset);
+        libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTNEED);
+    }
+}
+
 impl Scan1 {
-    /// Creates a new `Scan1` instance with specified thresholds.
     pub fn new(min_mapq_uni: i32, min_circle: i32, max_circle: i32, linear_range_size_min: i32) -> Self {
         Self { min_mapq_uni, max_circle, min_circle, linear_range_size_min }
     }
 
-    /// Entry point for Scan 1. Automatically detects file format and executes the appropriate runner.
     pub fn run(&mut self, sam_file: &str, out_prefix: &str, fasta_map: &HashMap<String, String>, annotation: &Annotation) -> Result<HashSet<String>> {
         use crate::sam_bam::{detect_format, InputFormat};
         let format = detect_format(sam_file)?;
@@ -67,7 +65,6 @@ impl Scan1 {
         }
     }
 
-    /// Parallel runner for SAM files using Mmap.
     pub fn run_sam(&mut self, sam_file: &str, out_prefix: &str, fasta_map: &HashMap<String, String>, annotation: &Annotation) -> Result<HashSet<String>> {
         let file = File::open(sam_file)?;
         let mmap = unsafe { Mmap::map(&file)? };
@@ -75,186 +72,58 @@ impl Scan1 {
         let num_threads = rayon::current_num_threads().max(1);
         let shard_size = file_size / num_threads;
 
+        unsafe { libc::madvise(mmap.as_ptr() as *mut libc::c_void, file_size, libc::MADV_SEQUENTIAL); }
+
         let pb = ProgressBar::new(file_size as u64);
         pb.set_style(ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")?
             .progress_chars("#>-"));
         pb.set_message("Scan 1: Identifying BSJ candidates");
 
-        let shard_results: Vec<Vec<(String, String)>> = (0..num_threads).into_par_iter().map(|i| {
+        (0..num_threads).into_par_iter().for_each(|i| {
             let start = i * shard_size;
             let end = if i == num_threads - 1 { file_size } else { (i + 1) * shard_size };
-            self.process_shard_robust(&mmap, start, end, fasta_map, annotation, &pb).unwrap_or_default()
-        }).collect();
+            let shard_out = format!("{}.BSJ1.shard_{}", out_prefix, i);
+            let _ = self.process_shard_robust_to_file(&mmap, start, end, fasta_map, annotation, &pb, &shard_out);
+        });
 
         pb.finish_with_message("Scan 1: Completed");
-
-        let bsj1_path = format!("{}.BSJ1", out_prefix);
-        let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(&bsj1_path)?);
-        let mut scan1_id_map = HashSet::new();
-        for shard in shard_results {
-            for (id, line) in shard {
-                writeln!(writer, "{}", line)?;
-                scan1_id_map.insert(id);
-            }
-        }
-        writer.flush()?;
-        Ok(scan1_id_map)
+        self.merge_and_collect_ids(out_prefix, num_threads)
     }
 
-    /// Parallel runner for BAM files using noodles-bam.
-    pub fn run_bam(&mut self, bam_file: &str, out_prefix: &str, fasta_map: &HashMap<String, String>, annotation: &Annotation) -> Result<HashSet<String>> {
-        use noodles::bam;
-        let file = File::open(bam_file)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        let file_size = mmap.len();
-        
-        let mut header_reader = bam::io::Reader::new(&mmap[..]);
-        let header = header_reader.read_header()?;
-        
-        let num_threads = rayon::current_num_threads().max(1);
-        let shard_size = file_size / num_threads;
-
-        let pb = ProgressBar::new(file_size as u64);
-        pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")?
-            .progress_chars("#>-"));
-        pb.set_message("Scan 1: Identifying BSJ candidates (BAM)");
-
-        let shard_results: Vec<Vec<(String, String)>> = (0..num_threads).into_par_iter().map(|i| {
-            let start = i * shard_size;
-            let end = if i == num_threads - 1 { file_size } else { (i + 1) * shard_size };
-            self.process_bam_shard(&mmap, start, end, &header, fasta_map, annotation, &pb).unwrap_or_default()
-        }).collect();
-
-        pb.finish_with_message("Scan 1: Completed");
-
+    fn merge_and_collect_ids(&self, out_prefix: &str, num_threads: usize) -> Result<HashSet<String>> {
         let bsj1_path = format!("{}.BSJ1", out_prefix);
-        let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(&bsj1_path)?);
+        let mut final_writer = BufWriter::with_capacity(1024 * 1024, File::create(&bsj1_path)?);
         let mut scan1_id_map = HashSet::new();
-        for shard in shard_results {
-            for (id, line) in shard {
-                writeln!(writer, "{}", line)?;
-                scan1_id_map.insert(id);
-            }
-        }
-        writer.flush()?;
-        Ok(scan1_id_map)
-    }
 
-    /// Processes a single shard of a BAM file.
-    fn process_bam_shard(&self, mmap: &[u8], start: usize, end: usize, header: &sam::Header, fasta_map: &HashMap<String, String>, annotation: &Annotation, pb: &ProgressBar) -> Result<Vec<(String, String)>> {
-        use noodles::bam;
-        let mut results = Vec::new();
-        let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
-        
-        // Find the first BGZF block start in this shard.
-        let pos = if start == 0 { 0 } else {
-            let mut found = None;
-            for i in start..end {
-                if i + 3 < mmap.len() && &mmap[i..i+4] == b"\x1f\x8b\x08\x04" {
-                    found = Some(i);
-                    break;
-                }
-            }
-            found.unwrap_or(mmap.len())
-        };
-        if pos >= mmap.len() { return Ok(results); }
-
-        let mut reader = bam::io::Reader::new(&mmap[pos..]);
-        let mut record = bam::Record::default();
-        
-        let mut current_id: Vec<u8> = Vec::new();
-        let mut group: [Vec<AlignmentRecord>; 2] = [Vec::with_capacity(8), Vec::with_capacity(8)];
-        let mut first_id_skipped = start == 0;
-        let mut last_compressed_pos = 0;
-
-        while reader.read_record(&mut record)? != 0 {
-            let current_compressed_pos = reader.get_ref().virtual_position().compressed() as usize;
-            pb.inc((current_compressed_pos - last_compressed_pos) as u64);
-            last_compressed_pos = current_compressed_pos;
-
-            let read_id = record.name().ok_or_else(|| anyhow::anyhow!("Missing read name"))?;
-            
-            // Shard synchronization: Skip the first ID group if we're not at the very beginning.
-            if !first_id_skipped {
-                if current_id.is_empty() {
-                    current_id = read_id.to_vec();
-                    continue;
-                }
-                if read_id.to_vec() != current_id {
-                    first_id_skipped = true;
-                    current_id = read_id.to_vec();
-                } else {
-                    continue;
-                }
-            }
-
-            if read_id.to_vec() != current_id {
-                if !current_id.is_empty() {
-                    let id_str = String::from_utf8_lossy(&current_id);
-                    if let Some(res) = self.process_group_view(&id_str, &group, fasta_map, annotation, &mut validator) { results.push(res); }
-                    
-                    // Stop condition: Passed shard end and finished the current Read ID group.
-                    if pos + current_compressed_pos > end {
-                        current_id.clear(); 
-                        break;
+        for i in 0..num_threads {
+            let shard_path = format!("{}.BSJ1.shard_{}", out_prefix, i);
+            if let Ok(shard_file) = File::open(&shard_path) {
+                let reader = BufReader::new(shard_file);
+                for line_res in reader.lines() {
+                    let line = line_res?;
+                    let id = line.split('\t').next().unwrap_or("").to_string();
+                    if !id.is_empty() {
+                        writeln!(final_writer, "{}", line)?;
+                        scan1_id_map.insert(id);
                     }
                 }
-                current_id = read_id.to_vec();
-                group[0].clear(); group[1].clear();
             }
-
-            let chrom = match record.reference_sequence(header) {
-                Some(Ok((name, _))) => String::from_utf8_lossy(name).to_string(),
-                _ => "*".to_string(),
-            };
-            
-            let flag = i32::from(u16::from(record.flags()));
-            let start_pos = record.alignment_start().transpose()?.map(|p| p.get() as i32).unwrap_or(0);
-            let mapq = record.mapping_quality().map(u8::from).unwrap_or(0) as i32;
-            
-            let mut cigar = String::new();
-            for result in record.cigar().iter() {
-                let op = result?;
-                use noodles::sam::alignment::record::cigar::op::Kind;
-                let op_char = match op.kind() {
-                    Kind::Match => 'M', Kind::Insertion => 'I', Kind::Deletion => 'D',
-                    Kind::Skip => 'N', Kind::SoftClip => 'S', Kind::HardClip => 'H',
-                    Kind::Pad => 'P', Kind::SequenceMatch => '=', Kind::SequenceMismatch => 'X',
-                };
-                cigar.push_str(&format!("{}{}", op.len(), op_char));
-            }
-            
-            let mut seq = String::new();
-            for b in record.sequence().iter() { seq.push(char::from(b)); }
-
-            group[if flag & 0x40 != 0 { 0 } else { 1 }].push(AlignmentRecord { 
-                flag, chrom: Cow::Owned(chrom), pos: start_pos, mapq, cigar: Cow::Owned(cigar), seq: Cow::Owned(seq) 
-            });
+            let _ = std::fs::remove_file(shard_path);
         }
-        
-        if !current_id.is_empty() {
-            let id_str = String::from_utf8_lossy(&current_id);
-            if let Some(res) = self.process_group_view(&id_str, &group, fasta_map, annotation, &mut validator) { results.push(res); }
-        }
-
-        Ok(results)
+        final_writer.flush()?;
+        Ok(scan1_id_map)
     }
 
-    /// Processes a single shard of a SAM file with robust boundary synchronization.
-    fn process_shard_robust<'a>(&self, mmap: &'a [u8], start: usize, end: usize, fasta_map: &HashMap<String, String>, annotation: &Annotation, pb: &ProgressBar) -> Result<Vec<(String, String)>> {
-        let mut results = Vec::new();
+    fn process_shard_robust_to_file<'a>(&self, mmap: &'a Mmap, start: usize, end: usize, fasta_map: &HashMap<String, String>, annotation: &Annotation, pb: &ProgressBar, out_path: &str) -> Result<()> {
+        let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
         let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
         
-        // 1. Shard Synchronization: Find the actual start line.
         let mut pos = if start == 0 { 0 } else { 
             let mut next_line = memchr(b'\n', &mmap[start..]).map(|p| start + p + 1).unwrap_or(mmap.len());
-            if next_line >= mmap.len() { return Ok(results); }
-            
+            if next_line >= mmap.len() { return Ok(()); }
             let first_tab = memchr(b'\t', &mmap[next_line..]).map(|p| next_line + p).unwrap_or(mmap.len());
             let first_id = &mmap[next_line..first_tab];
-            
             while next_line < mmap.len() {
                 let line_end = memchr(b'\n', &mmap[next_line..]).map(|p| next_line + p).unwrap_or(mmap.len());
                 let line_tab = memchr(b'\t', &mmap[next_line..line_end]).map(|p| next_line + p).unwrap_or(line_end);
@@ -266,20 +135,20 @@ impl Scan1 {
 
         let mut current_id: &[u8] = &[];
         let mut group: [Vec<AlignmentRecord<'a>>; 2] = [Vec::with_capacity(8), Vec::with_capacity(8)];
+        let mut last_evicted_pos = pos;
+        let eviction_threshold = 512 * 1024 * 1024;
 
         while pos < mmap.len() {
             let line_end = memchr(b'\n', &mmap[pos..]).map(|p| pos + p).unwrap_or(mmap.len());
             let line = &mmap[pos..line_end];
-            if line.is_empty() { 
-                pb.inc(1);
-                pos = line_end + 1; 
-                continue; 
+            if line.is_empty() { pb.inc(1); pos = line_end + 1; continue; }
+            
+            if pos - last_evicted_pos > eviction_threshold {
+                advise_dontneed(mmap, last_evicted_pos, pos - last_evicted_pos);
+                last_evicted_pos = pos;
             }
-            if line[0] == b'@' { 
-                pb.inc((line_end - pos + 1) as u64);
-                pos = line_end + 1; 
-                continue; 
-            }
+
+            if line[0] == b'@' { pb.inc((line_end - pos + 1) as u64); pos = line_end + 1; continue; }
 
             let mut cols = line.split(|&b| b == b'\t');
             let read_id = cols.next().unwrap();
@@ -287,7 +156,9 @@ impl Scan1 {
             if read_id != current_id {
                 if !current_id.is_empty() {
                     let id_str = unsafe { std::str::from_utf8_unchecked(current_id) };
-                    if let Some(res) = self.process_group_view(id_str, &group, fasta_map, annotation, &mut validator) { results.push(res); }
+                    if let Some((_, res_line)) = self.process_group_view(id_str, &group, fasta_map, annotation, &mut validator) {
+                        writeln!(writer, "{}", res_line)?;
+                    }
                     if pos > end { break; }
                 }
                 current_id = read_id;
@@ -311,13 +182,120 @@ impl Scan1 {
         
         if !current_id.is_empty() && pos >= mmap.len() {
             let id_str = unsafe { std::str::from_utf8_unchecked(current_id) };
-            if let Some(res) = self.process_group_view(id_str, &group, fasta_map, annotation, &mut validator) { results.push(res); }
+            if let Some((_, res_line)) = self.process_group_view(id_str, &group, fasta_map, annotation, &mut validator) {
+                writeln!(writer, "{}", res_line)?;
+            }
         }
-
-        Ok(results)
+        writer.flush()?;
+        Ok(())
     }
 
-    /// Core identification logic for a group of alignments belonging to the same Read ID.
+    pub fn run_bam(&mut self, bam_file: &str, out_prefix: &str, fasta_map: &HashMap<String, String>, annotation: &Annotation) -> Result<HashSet<String>> {
+        use noodles::bam;
+        let file = File::open(bam_file)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let mut header_reader = bam::io::Reader::new(&mmap[..]);
+        let header = header_reader.read_header()?;
+        let num_threads = rayon::current_num_threads().max(1);
+        let shard_size = mmap.len() / num_threads;
+
+        let pb = ProgressBar::new(mmap.len() as u64);
+        pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")?.progress_chars("#>-"));
+        pb.set_message("Scan 1: Identifying BSJ candidates (BAM)");
+
+        (0..num_threads).into_par_iter().for_each(|i| {
+            let start = i * shard_size;
+            let end = if i == num_threads - 1 { mmap.len() } else { (i + 1) * shard_size };
+            let shard_out = format!("{}.BSJ1.shard_{}", out_prefix, i);
+            let _ = self.process_bam_shard_to_file(&mmap, start, end, &header, fasta_map, annotation, &pb, &shard_out);
+        });
+
+        pb.finish_with_message("Scan 1: Completed");
+        self.merge_and_collect_ids(out_prefix, num_threads)
+    }
+
+    fn process_bam_shard_to_file(&self, mmap: &Mmap, start: usize, end: usize, header: &sam::Header, fasta_map: &HashMap<String, String>, annotation: &Annotation, pb: &ProgressBar, out_path: &str) -> Result<()> {
+        use noodles::bam;
+        let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
+        let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
+        let pos = if start == 0 { 0 } else {
+            let mut found = None;
+            for i in start..mmap.len() { 
+                if i + 3 < mmap.len() && &mmap[i..i+4] == b"\x1f\x8b\x08\x04" { 
+                    found = Some(i); break; 
+                } 
+            }
+            found.unwrap_or(mmap.len())
+        };
+        if pos >= mmap.len() { return Ok(()); }
+
+        let mut reader = bam::io::Reader::new(&mmap[pos..]);
+        let mut record = bam::Record::default();
+        let mut current_id: Vec<u8> = Vec::new();
+        let mut group: [Vec<AlignmentRecord>; 2] = [Vec::with_capacity(8), Vec::with_capacity(8)];
+        let mut first_id_skipped = start == 0;
+        let mut last_compressed_pos = 0;
+        let mut last_evicted_pos = pos;
+        let eviction_threshold = 512 * 1024 * 1024;
+
+        while reader.read_record(&mut record)? != 0 {
+            let curr_c_pos = reader.get_ref().virtual_position().compressed() as usize;
+            pb.inc((curr_c_pos - last_compressed_pos) as u64);
+            last_compressed_pos = curr_c_pos;
+
+            if curr_c_pos - (last_evicted_pos - pos) > eviction_threshold {
+                advise_dontneed(mmap, last_evicted_pos, curr_c_pos - (last_evicted_pos - pos));
+                last_evicted_pos = pos + curr_c_pos;
+            }
+
+            let read_id = record.name().ok_or_else(|| anyhow::anyhow!("Missing read name"))?;
+            if !first_id_skipped {
+                if current_id.is_empty() { current_id = read_id.to_vec(); continue; }
+                if read_id.to_vec() != current_id { first_id_skipped = true; current_id = read_id.to_vec(); } else { continue; }
+            }
+
+            if read_id.to_vec() != current_id {
+                if !current_id.is_empty() {
+                    let id_str = String::from_utf8_lossy(&current_id);
+                    if let Some((_, res_line)) = self.process_group_view(&id_str, &group, fasta_map, annotation, &mut validator) {
+                        writeln!(writer, "{}", res_line)?;
+                    }
+                    if pos + curr_c_pos > end { current_id.clear(); break; }
+                }
+                current_id = read_id.to_vec(); group[0].clear(); group[1].clear();
+            }
+
+            let chrom = match record.reference_sequence(header) {
+                Some(Ok((name, _))) => String::from_utf8_lossy(name).to_string(),
+                _ => "*".to_string(),
+            };
+            let flag = i32::from(u16::from(record.flags()));
+            let start_pos = record.alignment_start().transpose()?.map(|p| p.get() as i32).unwrap_or(0);
+            let mapq = record.mapping_quality().map(u8::from).unwrap_or(0) as i32;
+            let mut cigar = String::new();
+            for result in record.cigar().iter() {
+                let op = result?; use noodles::sam::alignment::record::cigar::op::Kind;
+                let op_char = match op.kind() {
+                    Kind::Match => 'M', Kind::Insertion => 'I', Kind::Deletion => 'D',
+                    Kind::Skip => 'N', Kind::SoftClip => 'S', Kind::HardClip => 'H',
+                    Kind::Pad => 'P', Kind::SequenceMatch => '=', Kind::SequenceMismatch => 'X',
+                };
+                cigar.push_str(&format!("{}{}", op.len(), op_char));
+            }
+            let mut seq = String::new(); for b in record.sequence().iter() { seq.push(char::from(b)); }
+            group[if flag & 0x40 != 0 { 0 } else { 1 }].push(AlignmentRecord { flag, chrom: Cow::Owned(chrom), pos: start_pos, mapq, cigar: Cow::Owned(cigar), seq: Cow::Owned(seq) });
+        }
+        
+        if !current_id.is_empty() {
+            let id_str = String::from_utf8_lossy(&current_id);
+            if let Some((_, res_line)) = self.process_group_view(&id_str, &group, fasta_map, annotation, &mut validator) {
+                writeln!(writer, "{}", res_line)?;
+            }
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
     fn process_group_view(&self, read_id: &str, group: &[Vec<AlignmentRecord>; 2], fasta_map: &HashMap<String, String>, annotation: &Annotation, validator: &mut IsBSJHg2) -> Option<(String, String)> {
         let mut candidates: Vec<BSJCandidate> = Vec::new();
         let [pair1, pair2] = group;
