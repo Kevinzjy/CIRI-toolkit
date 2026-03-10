@@ -27,18 +27,16 @@ pub struct Scan2 {
     pub index2: HashMap<String, Vec<CandidateBreakpoint>>,
     /// Map to store Forward Spliced Junction (FSJ) counts.
     pub fsj_map: HashMap<String, i32>,
+    /// Memory limit per thread for Page Cache eviction.
+    pub mem_limit: u64,
 }
 
-/// Stores a potential breakpoint site and its associated Scan 1 metadata.
 #[derive(Clone)]
 pub struct CandidateBreakpoint {
-    /// Genomic coordinate of the breakpoint.
     pub site: i32,
-    /// Full tab-separated metadata from BSJ1 file.
     pub data: Vec<String>,
 }
 
-/// Fast integer parser from bytes.
 #[inline]
 fn fast_parse_i32(bytes: &[u8]) -> i32 {
     let mut res = 0;
@@ -56,9 +54,21 @@ fn advise_dontneed(mmap: &Mmap, offset: usize, len: usize) {
 }
 
 impl Scan2 {
-    /// Creates a new `Scan2` instance with specified thresholds.
+    /// Creates a new `Scan2` instance.
     pub fn new(min_mapq_uni: i32, linear_range_size_min: i32, _seq_len: i32) -> Self {
-        Self { min_mapq_uni, linear_range_size_min, index1: HashMap::new(), index2: HashMap::new(), fsj_map: HashMap::new() }
+        Self { 
+            min_mapq_uni, 
+            linear_range_size_min, 
+            index1: HashMap::new(), 
+            index2: HashMap::new(), 
+            fsj_map: HashMap::new(),
+            mem_limit: 2 * 1024 * 1024 * 1024,
+        }
+    }
+
+    /// Sets the per-thread memory limit.
+    pub fn set_mem_limit(&mut self, limit: u64) {
+        self.mem_limit = limit;
     }
 
     /// Loads BSJ1 candidates and initializes the FSJ map.
@@ -77,18 +87,16 @@ impl Scan2 {
         Ok(())
     }
 
-    /// Entry point for Scan 2. Automatically detects file format.
+    /// Entry point for Scan 2.
     pub fn run(&mut self, sam_file: &str, output_bsj2: &str, chr_tcga_map: &HashMap<String, String>) -> Result<()> {
         use crate::sam_bam::{detect_format, InputFormat};
         let format = detect_format(sam_file)?;
-        
         match format {
             InputFormat::Sam => self.run_sam(sam_file, output_bsj2, chr_tcga_map),
             InputFormat::Bam => self.run_bam(sam_file, output_bsj2, chr_tcga_map),
         }
     }
 
-    /// Parallel runner for SAM files using Mmap.
     pub fn run_sam(&mut self, sam_file: &str, output_bsj2: &str, chr_tcga_map: &HashMap<String, String>) -> Result<()> {
         let file = File::open(sam_file)?;
         let mmap = unsafe { Mmap::map(&file)? };
@@ -129,9 +137,7 @@ impl Scan2 {
             let _ = std::fs::remove_file(shard_path);
         }
         for partial_fsj in shard_fsjs {
-            for (key, count) in partial_fsj {
-                *self.fsj_map.entry(key).or_insert(0) += count;
-            }
+            for (key, count) in partial_fsj { *self.fsj_map.entry(key).or_insert(0) += count; }
         }
         writer.flush()?;
         Ok(())
@@ -182,7 +188,7 @@ impl Scan2 {
         let mut first_id_skipped = start == 0;
         let mut last_compressed_pos = 0;
         let mut last_evicted_pos = pos;
-        let eviction_threshold = 512 * 1024 * 1024;
+        let eviction_threshold = (self.mem_limit as f64 * 0.8) as usize;
 
         while reader.read_record(&mut record)? != 0 {
             let curr_c_pos = reader.get_ref().virtual_position().compressed() as usize;
@@ -216,14 +222,10 @@ impl Scan2 {
             let start_pos = record.alignment_start().transpose()?.map(|p| p.get() as i32).unwrap_or(0);
             let mapq = record.mapping_quality().map(u8::from).unwrap_or(0) as i32;
             let mut cigar = String::new();
-            for res in record.cigar().iter() {
-                let op = res?; use noodles::sam::alignment::record::cigar::op::Kind;
-                let op_c = match op.kind() {
-                    Kind::Match => 'M', Kind::Insertion => 'I', Kind::Deletion => 'D',
-                    Kind::Skip => 'N', Kind::SoftClip => 'S', Kind::HardClip => 'H',
-                    Kind::Pad => 'P', Kind::SequenceMatch => '=', Kind::SequenceMismatch => 'X',
-                };
-                cigar.push_str(&format!("{}{}", op.len(), op_c));
+            for result in record.cigar().iter() {
+                let op = result?; use noodles::sam::alignment::record::cigar::op::Kind;
+                let op_char = match op.kind() { Kind::Match => 'M', Kind::Insertion => 'I', Kind::Deletion => 'D', Kind::Skip => 'N', Kind::SoftClip => 'S', Kind::HardClip => 'H', Kind::Pad => 'P', Kind::SequenceMatch => '=', Kind::SequenceMismatch => 'X', };
+                cigar.push_str(&format!("{}{}", op.len(), op_char));
             }
             let mut seq = String::new(); for b in record.sequence().iter() { seq.push(char::from(b)); }
             if !seq.is_empty() && seq != "*" {
@@ -255,7 +257,7 @@ impl Scan2 {
         let mut alignments: Vec<AlignmentRecord<'a>> = Vec::with_capacity(16);
         let mut stand_map: HashMap<i32, (char, Cow<'a, str>)> = HashMap::with_capacity(4);
         let mut last_evicted_pos = pos;
-        let eviction_threshold = 512 * 1024 * 1024;
+        let eviction_threshold = (self.mem_limit as f64 * 0.8) as usize;
 
         while pos < mmap.len() {
             let line_end = memchr(b'\n', &mmap[pos..]).map(|p| pos + p).unwrap_or(mmap.len());

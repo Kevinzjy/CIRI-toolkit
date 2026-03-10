@@ -12,12 +12,13 @@ use ciri_toolkit::scan1::Scan1;
 use ciri_toolkit::scan2::Scan2;
 use ciri_toolkit::summary::Summary;
 use ciri_toolkit::sam_bam::{detect_format, check_bam_sorting, InputFormat};
+use ciri_toolkit::utils::parse_mem_str;
 
 /// CIRI-toolkit: High-performance circular RNA identification.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Path to the input SAM file
+    /// Path to the input SAM/BAM file
     #[arg(short = 'i', long = "in")]
     in_sam: String,
     
@@ -44,6 +45,10 @@ struct Args {
     /// Number of threads to use (default: auto)
     #[arg(short = 't', long = "threads", default_value_t = 0)]
     threads: usize,
+
+    /// Maximum memory per thread (e.g., 2G, 512M)
+    #[arg(short = 'M', long = "mem-per-thread", default_value = "2G")]
+    mem_per_thread: String,
 }
 
 /// Formatted logging with aligned labels and timestamps.
@@ -54,12 +59,12 @@ fn log_info(label: &str, msg: &str) {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let mem_limit = parse_mem_str(&args.mem_per_thread);
 
     if args.threads > 0 {
         rayon::ThreadPoolBuilder::new().num_threads(args.threads).build_global()?;
     }
 
-    // 1. Reference Loading
     log_info("Reference FASTA", &args.ref_fasta);
     let mut fasta = FastaReader::new();
     fasta.read_fasta(&args.ref_fasta)?;
@@ -70,7 +75,6 @@ fn main() -> Result<()> {
         annotation.read_gtf(gtf_path)?;
     }
 
-    // 2. Format Discovery
     let format = detect_format(&args.in_sam)?;
     let format_str = match format {
         InputFormat::Bam => {
@@ -85,18 +89,20 @@ fn main() -> Result<()> {
     log_info("Processing Scan 1", "Identifying Back-Spliced Junctions...");
     let bsj1_output = format!("{}.BSJ1", args.out_prefix);
     let mut scan1 = Scan1::new(args.min_mapq, 140, 200000, 5);
+    scan1.set_mem_limit(mem_limit);
     scan1.run(&args.in_sam, &args.out_prefix, &fasta.chr_tcga_map, &annotation)?;
-    println!(); // Clear line after progress bar
+    println!();
 
     // 4. Indexing
     log_info("Index Mapping", "Constructing candidate site lookup...");
     let mut scan2 = Scan2::new(args.min_mapq, 5, 100);
+    scan2.set_mem_limit(mem_limit);
     scan2.build_index(&bsj1_output)?;
 
     // 5. Scan 2
     log_info("Processing Scan 2", "Rescuing signals & quantifying FSJ...");
     scan2.run(&args.in_sam, &bsj1_output, &fasta.chr_tcga_map)?;
-    println!(); // Clear line after progress bar
+    println!();
 
     // 6. Finalization
     log_info("Summarizing", "Clustering sites and filtering results...");

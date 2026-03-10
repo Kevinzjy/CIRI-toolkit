@@ -22,16 +22,12 @@ pub struct Scan1 {
     pub max_circle: i32,
     pub min_circle: i32,
     pub linear_range_size_min: i32,
+    pub mem_limit: u64,
 }
 
 #[derive(Debug, Clone)]
 struct BSJCandidate {
-    result_str: String,
-    tag: i32,
-    sum_q: i32,
-    total_mq: i32,
-    total_m_len: i32,
-    cigar_pair: String,
+    result_str: String, tag: i32, sum_q: i32, total_mq: i32, total_m_len: i32, cigar_pair: String,
 }
 
 #[inline]
@@ -41,7 +37,6 @@ fn fast_parse_i32(bytes: &[u8]) -> i32 {
     res
 }
 
-/// Advisory eviction: Tells the kernel we no longer need these memory pages.
 fn advise_dontneed(mmap: &Mmap, offset: usize, len: usize) {
     if len == 0 { return; }
     unsafe {
@@ -52,13 +47,16 @@ fn advise_dontneed(mmap: &Mmap, offset: usize, len: usize) {
 
 impl Scan1 {
     pub fn new(min_mapq_uni: i32, min_circle: i32, max_circle: i32, linear_range_size_min: i32) -> Self {
-        Self { min_mapq_uni, max_circle, min_circle, linear_range_size_min }
+        Self { min_mapq_uni, max_circle, min_circle, linear_range_size_min, mem_limit: 2 * 1024 * 1024 * 1024 }
+    }
+
+    pub fn set_mem_limit(&mut self, limit: u64) {
+        self.mem_limit = limit;
     }
 
     pub fn run(&mut self, sam_file: &str, out_prefix: &str, fasta_map: &HashMap<String, String>, annotation: &Annotation) -> Result<HashSet<String>> {
         use crate::sam_bam::{detect_format, InputFormat};
         let format = detect_format(sam_file)?;
-        
         match format {
             InputFormat::Sam => self.run_sam(sam_file, out_prefix, fasta_map, annotation),
             InputFormat::Bam => self.run_bam(sam_file, out_prefix, fasta_map, annotation),
@@ -75,9 +73,7 @@ impl Scan1 {
         unsafe { libc::madvise(mmap.as_ptr() as *mut libc::c_void, file_size, libc::MADV_SEQUENTIAL); }
 
         let pb = ProgressBar::new(file_size as u64);
-        pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")?
-            .progress_chars("#>-"));
+        pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")?.progress_chars("#>-"));
         pb.set_message("Scan 1: Identifying BSJ candidates");
 
         (0..num_threads).into_par_iter().for_each(|i| {
@@ -95,7 +91,6 @@ impl Scan1 {
         let bsj1_path = format!("{}.BSJ1", out_prefix);
         let mut final_writer = BufWriter::with_capacity(1024 * 1024, File::create(&bsj1_path)?);
         let mut scan1_id_map = HashSet::new();
-
         for i in 0..num_threads {
             let shard_path = format!("{}.BSJ1.shard_{}", out_prefix, i);
             if let Ok(shard_file) = File::open(&shard_path) {
@@ -118,7 +113,6 @@ impl Scan1 {
     fn process_shard_robust_to_file<'a>(&self, mmap: &'a Mmap, start: usize, end: usize, fasta_map: &HashMap<String, String>, annotation: &Annotation, pb: &ProgressBar, out_path: &str) -> Result<()> {
         let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
         let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
-        
         let mut pos = if start == 0 { 0 } else { 
             let mut next_line = memchr(b'\n', &mmap[start..]).map(|p| start + p + 1).unwrap_or(mmap.len());
             if next_line >= mmap.len() { return Ok(()); }
@@ -136,23 +130,20 @@ impl Scan1 {
         let mut current_id: &[u8] = &[];
         let mut group: [Vec<AlignmentRecord<'a>>; 2] = [Vec::with_capacity(8), Vec::with_capacity(8)];
         let mut last_evicted_pos = pos;
-        let eviction_threshold = 512 * 1024 * 1024;
+        // Eviction threshold: 80% of the per-thread memory limit to be safe
+        let eviction_threshold = (self.mem_limit as f64 * 0.8) as usize;
 
         while pos < mmap.len() {
             let line_end = memchr(b'\n', &mmap[pos..]).map(|p| pos + p).unwrap_or(mmap.len());
             let line = &mmap[pos..line_end];
             if line.is_empty() { pb.inc(1); pos = line_end + 1; continue; }
-            
             if pos - last_evicted_pos > eviction_threshold {
                 advise_dontneed(mmap, last_evicted_pos, pos - last_evicted_pos);
                 last_evicted_pos = pos;
             }
-
             if line[0] == b'@' { pb.inc((line_end - pos + 1) as u64); pos = line_end + 1; continue; }
-
             let mut cols = line.split(|&b| b == b'\t');
             let read_id = cols.next().unwrap();
-            
             if read_id != current_id {
                 if !current_id.is_empty() {
                     let id_str = unsafe { std::str::from_utf8_unchecked(current_id) };
@@ -161,10 +152,8 @@ impl Scan1 {
                     }
                     if pos > end { break; }
                 }
-                current_id = read_id;
-                group[0].clear(); group[1].clear();
+                current_id = read_id; group[0].clear(); group[1].clear();
             }
-
             let flag = fast_parse_i32(cols.next().unwrap_or(b"0"));
             let chrom = unsafe { std::str::from_utf8_unchecked(cols.next().unwrap_or(b"*")) };
             let start_pos = fast_parse_i32(cols.next().unwrap_or(b"0"));
@@ -172,19 +161,13 @@ impl Scan1 {
             let cigar = unsafe { std::str::from_utf8_unchecked(cols.next().unwrap_or(b"*")) };
             cols.next(); cols.next(); cols.next();
             let seq = unsafe { std::str::from_utf8_unchecked(cols.next().unwrap_or(b"*")).trim() };
-
-            group[if flag & 0x40 != 0 { 0 } else { 1 }].push(AlignmentRecord { 
-                flag, chrom: Cow::Borrowed(chrom), pos: start_pos, mapq, cigar: Cow::Borrowed(cigar), seq: Cow::Borrowed(seq) 
-            });
+            group[if flag & 0x40 != 0 { 0 } else { 1 }].push(AlignmentRecord { flag, chrom: Cow::Borrowed(chrom), pos: start_pos, mapq, cigar: Cow::Borrowed(cigar), seq: Cow::Borrowed(seq) });
             pb.inc((line_end - pos + 1) as u64);
             pos = line_end + 1;
         }
-        
         if !current_id.is_empty() && pos >= mmap.len() {
             let id_str = unsafe { std::str::from_utf8_unchecked(current_id) };
-            if let Some((_, res_line)) = self.process_group_view(id_str, &group, fasta_map, annotation, &mut validator) {
-                writeln!(writer, "{}", res_line)?;
-            }
+            if let Some((_, res_line)) = self.process_group_view(id_str, &group, fasta_map, annotation, &mut validator) { writeln!(writer, "{}", res_line)?; }
         }
         writer.flush()?;
         Ok(())
@@ -198,18 +181,15 @@ impl Scan1 {
         let header = header_reader.read_header()?;
         let num_threads = rayon::current_num_threads().max(1);
         let shard_size = mmap.len() / num_threads;
-
         let pb = ProgressBar::new(mmap.len() as u64);
         pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")?.progress_chars("#>-"));
         pb.set_message("Scan 1: Identifying BSJ candidates (BAM)");
-
         (0..num_threads).into_par_iter().for_each(|i| {
             let start = i * shard_size;
             let end = if i == num_threads - 1 { mmap.len() } else { (i + 1) * shard_size };
             let shard_out = format!("{}.BSJ1.shard_{}", out_prefix, i);
             let _ = self.process_bam_shard_to_file(&mmap, start, end, &header, fasta_map, annotation, &pb, &shard_out);
         });
-
         pb.finish_with_message("Scan 1: Completed");
         self.merge_and_collect_ids(out_prefix, num_threads)
     }
@@ -220,15 +200,10 @@ impl Scan1 {
         let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
         let pos = if start == 0 { 0 } else {
             let mut found = None;
-            for i in start..mmap.len() { 
-                if i + 3 < mmap.len() && &mmap[i..i+4] == b"\x1f\x8b\x08\x04" { 
-                    found = Some(i); break; 
-                } 
-            }
+            for i in start..mmap.len() { if i + 3 < mmap.len() && &mmap[i..i+4] == b"\x1f\x8b\x08\x04" { found = Some(i); break; } }
             found.unwrap_or(mmap.len())
         };
         if pos >= mmap.len() { return Ok(()); }
-
         let mut reader = bam::io::Reader::new(&mmap[pos..]);
         let mut record = bam::Record::default();
         let mut current_id: Vec<u8> = Vec::new();
@@ -236,61 +211,44 @@ impl Scan1 {
         let mut first_id_skipped = start == 0;
         let mut last_compressed_pos = 0;
         let mut last_evicted_pos = pos;
-        let eviction_threshold = 512 * 1024 * 1024;
-
+        let eviction_threshold = (self.mem_limit as f64 * 0.8) as usize;
         while reader.read_record(&mut record)? != 0 {
             let curr_c_pos = reader.get_ref().virtual_position().compressed() as usize;
             pb.inc((curr_c_pos - last_compressed_pos) as u64);
             last_compressed_pos = curr_c_pos;
-
             if curr_c_pos - (last_evicted_pos - pos) > eviction_threshold {
                 advise_dontneed(mmap, last_evicted_pos, curr_c_pos - (last_evicted_pos - pos));
                 last_evicted_pos = pos + curr_c_pos;
             }
-
             let read_id = record.name().ok_or_else(|| anyhow::anyhow!("Missing read name"))?;
             if !first_id_skipped {
                 if current_id.is_empty() { current_id = read_id.to_vec(); continue; }
                 if read_id.to_vec() != current_id { first_id_skipped = true; current_id = read_id.to_vec(); } else { continue; }
             }
-
             if read_id.to_vec() != current_id {
                 if !current_id.is_empty() {
                     let id_str = String::from_utf8_lossy(&current_id);
-                    if let Some((_, res_line)) = self.process_group_view(&id_str, &group, fasta_map, annotation, &mut validator) {
-                        writeln!(writer, "{}", res_line)?;
-                    }
+                    if let Some((_, res_line)) = self.process_group_view(&id_str, &group, fasta_map, annotation, &mut validator) { writeln!(writer, "{}", res_line)?; }
                     if pos + curr_c_pos > end { current_id.clear(); break; }
                 }
                 current_id = read_id.to_vec(); group[0].clear(); group[1].clear();
             }
-
-            let chrom = match record.reference_sequence(header) {
-                Some(Ok((name, _))) => String::from_utf8_lossy(name).to_string(),
-                _ => "*".to_string(),
-            };
+            let chrom = match record.reference_sequence(header) { Some(Ok((name, _))) => String::from_utf8_lossy(name).to_string(), _ => "*".to_string() };
             let flag = i32::from(u16::from(record.flags()));
             let start_pos = record.alignment_start().transpose()?.map(|p| p.get() as i32).unwrap_or(0);
             let mapq = record.mapping_quality().map(u8::from).unwrap_or(0) as i32;
             let mut cigar = String::new();
             for result in record.cigar().iter() {
                 let op = result?; use noodles::sam::alignment::record::cigar::op::Kind;
-                let op_char = match op.kind() {
-                    Kind::Match => 'M', Kind::Insertion => 'I', Kind::Deletion => 'D',
-                    Kind::Skip => 'N', Kind::SoftClip => 'S', Kind::HardClip => 'H',
-                    Kind::Pad => 'P', Kind::SequenceMatch => '=', Kind::SequenceMismatch => 'X',
-                };
+                let op_char = match op.kind() { Kind::Match => 'M', Kind::Insertion => 'I', Kind::Deletion => 'D', Kind::Skip => 'N', Kind::SoftClip => 'S', Kind::HardClip => 'H', Kind::Pad => 'P', Kind::SequenceMatch => '=', Kind::SequenceMismatch => 'X', };
                 cigar.push_str(&format!("{}{}", op.len(), op_char));
             }
             let mut seq = String::new(); for b in record.sequence().iter() { seq.push(char::from(b)); }
             group[if flag & 0x40 != 0 { 0 } else { 1 }].push(AlignmentRecord { flag, chrom: Cow::Owned(chrom), pos: start_pos, mapq, cigar: Cow::Owned(cigar), seq: Cow::Owned(seq) });
         }
-        
         if !current_id.is_empty() {
             let id_str = String::from_utf8_lossy(&current_id);
-            if let Some((_, res_line)) = self.process_group_view(&id_str, &group, fasta_map, annotation, &mut validator) {
-                writeln!(writer, "{}", res_line)?;
-            }
+            if let Some((_, res_line)) = self.process_group_view(&id_str, &group, fasta_map, annotation, &mut validator) { writeln!(writer, "{}", res_line)?; }
         }
         writer.flush()?;
         Ok(())
