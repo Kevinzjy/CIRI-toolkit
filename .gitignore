@@ -1,0 +1,39 @@
+# --- Rust ---
+/target
+# For binary applications, Cargo.lock is usually committed. 
+# Remove the following line if you wish to track dependencies strictly.
+# Cargo.lock 
+
+# --- OS / IDE ---
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Project Specific (Test Outputs) ---
+# Ignore intermediate back-spliced junction (BSJ) files
+tests/*.BSJ1
+vendor/*.BSJ1
+
+# Ignore final identification results and logs
+tests/*.result
+tests/*.log
+vendor/*.result
+
+# Ignore specific test run artifacts and ID lists
+tests/rust_final*
+tests/perf_test*
+tests/CIRI-rs_result.txt.result
+tests/java_final_ids.txt
+tests/rust_final_ids.txt
+tests/missed_reads_sample.txt
+tests/chr1*
+tests/test*
+
+# --- Backup and Temporary Files ---
+*.rs.bk
+node_modules/
+.npm/
+
+vendor/

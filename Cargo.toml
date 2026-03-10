@@ -1,0 +1,26 @@
+[package]
+name = "ciri-toolkit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Bioinformatic file parsing
+noodles = { version = "0.85", features = ["sam", "bam", "gtf", "fasta"] }
+needletail = "0.5"
+
+# CLI and Utilities
+clap = { version = "4.4", features = ["derive"] }
+anyhow = "1.0"
+itertools = "0.12"
+regex = "1.10"
+
+# Parallel processing
+rayon = "1.8"
+dashmap = "5.5"
+memmap2 = "0.9.10"
+memchr = "2.8.0"
+mimalloc = "0.1.48"
+
+[dev-dependencies]
+pretty_assertions = "1.4"
+tempfile = "3.8"
