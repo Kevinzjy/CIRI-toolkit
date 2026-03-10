@@ -1,5 +1,8 @@
-/// Summary module: Implements 1:1 pixel-level logic with global Read-ID uniqueness.
-/// Ensures each read is assigned to exactly one circRNA based on a rigorous priority hierarchy.
+//! Summary module: Clusters candidate sites and filters circRNAs based on stringency.
+//!
+//! This module aggregates all BSJ evidence, resolves alignment ambiguities by 
+//! assigning each read to a single best candidate, clusters nearby sites,
+//! and applies final stringency filters to produce the final report.
 
 use std::collections::{HashMap, HashSet, BTreeMap};
 use std::fs::File;
@@ -7,15 +10,19 @@ use std::io::{BufRead, BufReader, Write, BufWriter};
 use anyhow::Result;
 use crate::annotation::Annotation;
 
+/// Core logic for final result aggregation and filtering.
 pub struct Summary {
+    /// Stringency level (0, 1, or 2).
     pub stringency: i32,
 }
 
+/// Helper struct for sorting final results by start site.
 struct CircSortItem {
     start_site: i32,
     data: CircOutputData,
 }
 
+/// Final output metadata for a circRNA candidate.
 #[derive(Clone)]
 struct CircOutputData {
     id: String,
@@ -33,7 +40,7 @@ struct CircOutputData {
     tag_val: i32,
 }
 
-/// Internal structure to rank multiple evidences for the same Read ID
+/// Internal structure to rank multiple evidences for the same Read ID.
 #[derive(Debug, Clone)]
 struct ReadEvidence {
     line: String,
@@ -45,16 +52,20 @@ struct ReadEvidence {
 }
 
 impl Summary {
+    /// Creates a new `Summary` instance with specified stringency.
     pub fn new(stringency: i32) -> Self {
         Self {
             stringency,
         }
     }
 
+    /// Entry point for the summary pass. 
+    ///
+    /// Resolves ambiguity, calculates statistics, and writes the 13-column result file.
     pub fn run(&mut self, bsj1_file: &str, out_prefix: &str, fsj_map: &HashMap<String, i32>, _chr_tcga_map: &HashMap<String, String>, annotation: &Annotation) -> Result<()> {
         let mut read_evidences: HashMap<String, Vec<ReadEvidence>> = HashMap::new();
 
-        // 1. Load all evidence and group by Read ID
+        // 1. Load all evidence and group by Read ID.
         let file = File::open(bsj1_file)?;
         let reader = BufReader::new(file);
         for line_res in reader.lines() {
@@ -65,15 +76,10 @@ impl Summary {
             let read_id = p[0].to_string();
             let site_key = format!("{}\t{}\t{}", p[3], p[4], p[5]);
             let tag_type = p[2].parse::<i32>().unwrap_or(0);
-            
-            // For Scan1 (tag_type 1), sumQ is in p[10] if available, otherwise default to 0.
-            // For Scan2 (tag_type 3), sumQ is not explicitly passed in BSJ1, default to 0.
             let sum_q = if p.len() > 10 { p[10].parse::<i32>().unwrap_or(0) } else { 0 };
-            
-            // signal_type is in p[9]
             let signal_type = p[9].parse::<i32>().unwrap_or(0);
             
-            // Calculate total M length as a tie-breaker
+            // Tie-breaker: total length of M operations.
             let m_len: i32 = p[1].chars().filter(|c| c.is_digit(10)).collect::<String>().parse().unwrap_or(0); 
 
             read_evidences.entry(read_id).or_insert_with(Vec::new).push(ReadEvidence {
@@ -81,10 +87,14 @@ impl Summary {
             });
         }
 
-        // 2. Resolve Ambiguity: Each Read ID gets only ONE "Best" candidate site
+        // 2. Resolve Ambiguity: Each Read ID gets only ONE "Best" candidate site.
         let mut unique_bsj_lines: Vec<String> = Vec::new();
         for (_, mut evs) in read_evidences {
-            // Rank: 1. Scan1 > Scan2, 2. Signal AG/GT > CT/AC, 3. SumQ=1 > 0, 4. Longer M
+            // Ranking Priority:
+            // 1. Scan 1 (Direct) > Scan 2 (Rescue)
+            // 2. Signal AG/GT (Tag 1) > CT/AC (Tag 2)
+            // 3. Mapping Quality (SumQ=1) > SumQ=0
+            // 4. Alignment Length (Longer M sum)
             evs.sort_by(|a, b| {
                 let a_type_score = if a.tag_type == 1 { 2 } else { 1 };
                 let b_type_score = if b.tag_type == 1 { 2 } else { 1 };
@@ -97,7 +107,7 @@ impl Summary {
             unique_bsj_lines.push(evs[0].line.clone());
         }
 
-        // 3. Populate statistics based on uniquely assigned reads
+        // 3. Populate statistics based on uniquely assigned reads.
         let mut circ_map: HashMap<String, HashSet<String>> = HashMap::new();
         for line in unique_bsj_lines {
             let p: Vec<&str> = line.split('\t').collect();
@@ -105,7 +115,7 @@ impl Summary {
             circ_map.entry(site_key).or_insert_with(HashSet::new).insert(line);
         }
 
-        // 4. Final Filtering (Mirroring Summary.java logic)
+        // 4. Final Filtering (Mirroring the complex Summary.java logic chain).
         let mut final_results: BTreeMap<String, Vec<CircSortItem>> = BTreeMap::new();
         for (chr_start_end, lines) in &circ_map {
             let p_key: Vec<&str> = chr_start_end.split('\t').collect();
@@ -127,12 +137,12 @@ impl Summary {
                 let tag_type = p[2];
                 let rescue_flag = p[9];
                 
-                if tag_type == "1" { // Scan1 TP
+                if tag_type == "1" { // Scan 1 TP
                     circ_id_set.insert(p[0].to_string());
                     circ_id_set_3.insert(p[0].to_string());
                     for c in p[1].split(';') { cigar_set.insert(c.to_string()); cigar_set_3.insert(c.to_string()); }
                     if rescue_flag == "1" { tag += 1; }
-                } else if tag_type == "3" { // Scan2 Rescue TP
+                } else if tag_type == "3" { // Scan 2 Rescue TP
                     circ_id_set_3.insert(p[0].to_string());
                     cigar_set_3.insert(p[1].to_string());
                     if rescue_flag == "1" { tag += 1; }
@@ -150,6 +160,7 @@ impl Summary {
             let tp_reads = circ_id_set.len() as i32;
             let tp_reads_3 = circ_id_set_3.len() as i32;
             
+            // Mirroring the exact Boolean logic chain in Summary.java.
             let passed = match self.stringency {
                 2 => ((tp_reads > 19 * fp_reads || fp_reads <= 1) && tp_reads > (non_reads + fp_reads) && cigar_set.len() >= 3 && tp_reads >= 2) ||
                      (tag > 0 && false_cigar_set_3.is_empty() && cigar_set_3.len() >= 3 && tp_reads_3 >= 2),
@@ -188,9 +199,9 @@ impl Summary {
             }
         }
 
-        // 5. Final Output
+        // 5. Final Output.
         let out_file = File::create(format!("{}.result", out_prefix))?;
-        let mut writer = BufWriter::new(out_file);
+        let mut writer = BufWriter::with_capacity(1024 * 1024, out_file);
         writeln!(writer, "circRNA_ID\tchr\tcircRNA_start\tcircRNA_end\t#junction_reads\tSM_MS_SMS\t#non_junction_reads\tjunction_reads_ratio\tcircRNA_type\tgene_id\tstrand\tjunction_reads_ID\tScore")?;
         for items in final_results.values_mut() {
             items.sort_by_key(|it| it.start_site);
@@ -202,6 +213,7 @@ impl Summary {
         Ok(())
     }
 
+    /// Updates counts for SM, MS, and SMS CIGAR types.
     fn update_cigar_counts(&self, cigar: &str, counts: &mut [i32; 3]) {
         let t: String = cigar.chars().filter(|x| x.is_alphabetic()).collect();
         if t == "M" { return; }

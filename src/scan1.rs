@@ -1,5 +1,8 @@
-/// Scan 1 module: Ultra-high performance Mmap implementation with TB-scale scalability.
-/// Implements robust shard synchronization to handle Read IDs spanning shard boundaries.
+//! Scan 1 module: Ultra-high performance multi-format BSJ identification.
+//!
+//! This module implements the first pass of circular RNA identification. It supports
+//! parallel processing of both SAM and BAM files using Mmap-based streaming and
+//! BGZF decompression.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -9,24 +12,36 @@ use anyhow::Result;
 use rayon::prelude::*;
 use memmap2::Mmap;
 use memchr::memchr;
-use noodles::sam;
+use noodles::sam::{self, alignment::Record as _};
 use crate::misd::misd;
 use crate::is_bsj_hg2::{IsBSJHg2, java_substring};
 use crate::annotation::Annotation;
 use crate::utils::AlignmentRecord;
 
+/// Core logic for the first scan pass.
 pub struct Scan1 {
+    /// Minimum mapping quality for a read to be considered.
     pub min_mapq_uni: i32,
+    /// Maximum allowed circle size (bp).
     pub max_circle: i32,
+    /// Minimum allowed circle size (bp).
     pub min_circle: i32,
+    /// Minimum linear range size for competition check.
     pub linear_range_size_min: i32,
 }
 
+/// Internal struct to store candidate BSJ information before ranking.
 #[derive(Debug, Clone)]
 struct BSJCandidate {
-    result_str: String, tag: i32, sum_q: i32, total_mq: i32, total_m_len: i32, cigar_pair: String,
+    result_str: String,
+    tag: i32,
+    sum_q: i32,
+    total_mq: i32,
+    total_m_len: i32,
+    cigar_pair: String,
 }
 
+/// Fast integer parser from bytes.
 #[inline]
 fn fast_parse_i32(bytes: &[u8]) -> i32 {
     let mut res = 0;
@@ -35,10 +50,12 @@ fn fast_parse_i32(bytes: &[u8]) -> i32 {
 }
 
 impl Scan1 {
+    /// Creates a new `Scan1` instance with specified thresholds.
     pub fn new(min_mapq_uni: i32, min_circle: i32, max_circle: i32, linear_range_size_min: i32) -> Self {
         Self { min_mapq_uni, max_circle, min_circle, linear_range_size_min }
     }
 
+    /// Entry point for Scan 1. Automatically detects file format and executes the appropriate runner.
     pub fn run(&mut self, sam_file: &str, out_prefix: &str, fasta_map: &HashMap<String, String>, annotation: &Annotation) -> Result<HashSet<String>> {
         use crate::sam_bam::{detect_format, InputFormat};
         let format = detect_format(sam_file)?;
@@ -49,6 +66,7 @@ impl Scan1 {
         }
     }
 
+    /// Parallel runner for SAM files using Mmap.
     pub fn run_sam(&mut self, sam_file: &str, out_prefix: &str, fasta_map: &HashMap<String, String>, annotation: &Annotation) -> Result<HashSet<String>> {
         let file = File::open(sam_file)?;
         let mmap = unsafe { Mmap::map(&file)? };
@@ -75,6 +93,7 @@ impl Scan1 {
         Ok(scan1_id_map)
     }
 
+    /// Parallel runner for BAM files using noodles-bam.
     pub fn run_bam(&mut self, bam_file: &str, out_prefix: &str, fasta_map: &HashMap<String, String>, annotation: &Annotation) -> Result<HashSet<String>> {
         use noodles::bam;
         let file = File::open(bam_file)?;
@@ -106,13 +125,13 @@ impl Scan1 {
         Ok(scan1_id_map)
     }
 
+    /// Processes a single shard of a BAM file.
     fn process_bam_shard(&self, mmap: &[u8], start: usize, end: usize, header: &sam::Header, fasta_map: &HashMap<String, String>, annotation: &Annotation) -> Result<Vec<(String, String)>> {
         use noodles::bam;
-        use noodles::sam::alignment::Record;
         let mut results = Vec::new();
         let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
         
-        // 1. Find the first BGZF block start in this shard
+        // Find the first BGZF block start in this shard.
         let pos = if start == 0 { 0 } else {
             let mut found = None;
             for i in start..end {
@@ -135,6 +154,7 @@ impl Scan1 {
         while reader.read_record(&mut record)? != 0 {
             let read_id = record.name().ok_or_else(|| anyhow::anyhow!("Missing read name"))?;
             
+            // Shard synchronization: Skip the first ID group if we're not at the very beginning.
             if !first_id_skipped {
                 if current_id.is_empty() {
                     current_id = read_id.to_vec();
@@ -153,7 +173,7 @@ impl Scan1 {
                     let id_str = String::from_utf8_lossy(&current_id);
                     if let Some(res) = self.process_group_view(&id_str, &group, fasta_map, annotation, &mut validator) { results.push(res); }
                     
-                    // Stop condition: We've passed the physical shard end AND finished the current Read ID group.
+                    // Stop condition: Passed shard end and finished the current Read ID group.
                     let current_compressed_pos = pos + reader.get_ref().virtual_position().compressed() as usize;
                     if current_compressed_pos > end {
                         current_id.clear(); 
@@ -164,9 +184,8 @@ impl Scan1 {
                 group[0].clear(); group[1].clear();
             }
 
-            // Convert BAM record to AlignmentRecord
             let chrom = match record.reference_sequence(header) {
-                Some(Ok((name, _))) => String::from_utf8_lossy(name.as_ref()).to_string(),
+                Some(Ok((name, _))) => String::from_utf8_lossy(name).to_string(),
                 _ => "*".to_string(),
             };
             
@@ -179,64 +198,45 @@ impl Scan1 {
                 let op = result?;
                 use noodles::sam::alignment::record::cigar::op::Kind;
                 let op_char = match op.kind() {
-                    Kind::Match => 'M',
-                    Kind::Insertion => 'I',
-                    Kind::Deletion => 'D',
-                    Kind::Skip => 'N',
-                    Kind::SoftClip => 'S',
-                    Kind::HardClip => 'H',
-                    Kind::Pad => 'P',
-                    Kind::SequenceMatch => '=',
-                    Kind::SequenceMismatch => 'X',
+                    Kind::Match => 'M', Kind::Insertion => 'I', Kind::Deletion => 'D',
+                    Kind::Skip => 'N', Kind::SoftClip => 'S', Kind::HardClip => 'H',
+                    Kind::Pad => 'P', Kind::SequenceMatch => '=', Kind::SequenceMismatch => 'X',
                 };
                 cigar.push_str(&format!("{}{}", op.len(), op_char));
             }
             
             let mut seq = String::new();
-            for b in record.sequence().iter() {
-                seq.push(char::from(b));
-            }
+            for b in record.sequence().iter() { seq.push(char::from(b)); }
 
             group[if flag & 0x40 != 0 { 0 } else { 1 }].push(AlignmentRecord { 
-                flag, 
-                chrom: Cow::Owned(chrom), 
-                pos: start_pos, 
-                mapq, 
-                cigar: Cow::Owned(cigar), 
-                seq: Cow::Owned(seq) 
+                flag, chrom: Cow::Owned(chrom), pos: start_pos, mapq, cigar: Cow::Owned(cigar), seq: Cow::Owned(seq) 
             });
         }
         
-        // Final flush
         if !current_id.is_empty() {
             let id_str = String::from_utf8_lossy(&current_id);
             if let Some(res) = self.process_group_view(&id_str, &group, fasta_map, annotation, &mut validator) { results.push(res); }
         }
-
         Ok(results)
     }
 
+    /// Processes a single shard of a SAM file with robust boundary synchronization.
     fn process_shard_robust<'a>(&self, mmap: &'a [u8], start: usize, end: usize, fasta_map: &HashMap<String, String>, annotation: &Annotation) -> Result<Vec<(String, String)>> {
         let mut results = Vec::new();
         let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
         
-        // 1. Shard Synchronization: Find the actual start line
+        // 1. Shard Synchronization: Find the actual start line.
         let mut pos = if start == 0 { 0 } else { 
-            // Skip the first partial line
             let mut next_line = memchr(b'\n', &mmap[start..]).map(|p| start + p + 1).unwrap_or(mmap.len());
             if next_line >= mmap.len() { return Ok(results); }
             
-            // Critical: If we start in the middle, we must skip ALL records of the first Read ID 
-            // because they are being handled by the tail of the previous shard.
             let first_tab = memchr(b'\t', &mmap[next_line..]).map(|p| next_line + p).unwrap_or(mmap.len());
             let first_id = &mmap[next_line..first_tab];
             
             while next_line < mmap.len() {
                 let line_end = memchr(b'\n', &mmap[next_line..]).map(|p| next_line + p).unwrap_or(mmap.len());
                 let line_tab = memchr(b'\t', &mmap[next_line..line_end]).map(|p| next_line + p).unwrap_or(line_end);
-                if &mmap[next_line..line_tab] != first_id {
-                    break; // Found the next ID group
-                }
+                if &mmap[next_line..line_tab] != first_id { break; }
                 next_line = line_end + 1;
             }
             next_line
@@ -258,15 +258,13 @@ impl Scan1 {
                 if !current_id.is_empty() {
                     let id_str = unsafe { std::str::from_utf8_unchecked(current_id) };
                     if let Some(res) = self.process_group_view(id_str, &group, fasta_map, annotation, &mut validator) { results.push(res); }
-                    // Stop condition: We've passed the physical shard end AND finished the current Read ID group.
                     if pos > end { break; }
                 }
                 current_id = read_id;
                 group[0].clear(); group[1].clear();
             }
 
-            let flag_bytes = cols.next().unwrap_or(b"0");
-            let flag = fast_parse_i32(flag_bytes);
+            let flag = fast_parse_i32(cols.next().unwrap_or(b"0"));
             let chrom = unsafe { std::str::from_utf8_unchecked(cols.next().unwrap_or(b"*")) };
             let start_pos = fast_parse_i32(cols.next().unwrap_or(b"0"));
             let mapq = fast_parse_i32(cols.next().unwrap_or(b"0"));
@@ -275,25 +273,19 @@ impl Scan1 {
             let seq = unsafe { std::str::from_utf8_unchecked(cols.next().unwrap_or(b"*")).trim() };
 
             group[if flag & 0x40 != 0 { 0 } else { 1 }].push(AlignmentRecord { 
-                flag, 
-                chrom: Cow::Borrowed(chrom), 
-                pos: start_pos, 
-                mapq, 
-                cigar: Cow::Borrowed(cigar), 
-                seq: Cow::Borrowed(seq) 
+                flag, chrom: Cow::Borrowed(chrom), pos: start_pos, mapq, cigar: Cow::Borrowed(cigar), seq: Cow::Borrowed(seq) 
             });
             pos = line_end + 1;
         }
         
-        // Final flush for the last ID in the shard
         if !current_id.is_empty() && pos >= mmap.len() {
             let id_str = unsafe { std::str::from_utf8_unchecked(current_id) };
             if let Some(res) = self.process_group_view(id_str, &group, fasta_map, annotation, &mut validator) { results.push(res); }
         }
-
         Ok(results)
     }
 
+    /// Core identification logic for a group of alignments belonging to the same Read ID.
     fn process_group_view(&self, read_id: &str, group: &[Vec<AlignmentRecord>; 2], fasta_map: &HashMap<String, String>, annotation: &Annotation, validator: &mut IsBSJHg2) -> Option<(String, String)> {
         let mut candidates: Vec<BSJCandidate> = Vec::new();
         let [pair1, pair2] = group;

@@ -1,16 +1,22 @@
-/// FASTA module: High-speed sequence loading with Needletail.
-/// Handles multi-line FASTA and produces a global reference map.
+//! FASTA module: High-speed sequence loading with Needletail.
+//!
+//! This module provides the `FastaReader` struct for loading reference genome sequences
+//! into memory for rapid retrieval during junction validation.
 
 use std::collections::HashMap;
 use anyhow::Result;
 use needletail::parse_fastx_file;
 
+/// FASTA Reader for loading and storing chromosome sequences.
 pub struct FastaReader {
+    /// Maps from chromosome name to its sequence length.
     pub chr_len_map: HashMap<String, usize>,
+    /// Maps from chromosome name (e.g., "chr1") to its full uppercase sequence string.
     pub chr_tcga_map: HashMap<String, String>,
 }
 
 impl FastaReader {
+    /// Initializes an empty `FastaReader`.
     pub fn new() -> Self {
         Self {
             chr_len_map: HashMap::new(),
@@ -18,14 +24,21 @@ impl FastaReader {
         }
     }
 
+    /// Reads reference sequences from a FASTA file.
+    ///
+    /// Uses the `needletail` library for high-performance parsing of multi-gigabyte reference files.
+    /// Sequences are automatically converted to uppercase for uniform comparison.
+    ///
+    /// # Arguments
+    /// * `fasta_file` - Path to the reference genome FASTA file.
     pub fn read_fasta(&mut self, fasta_file: &str) -> Result<()> {
         let mut reader = parse_fastx_file(fasta_file)?;
         while let Some(record) = reader.next() {
             let seq_record = record?;
+            // Use the first whitespace-separated part of the ID as the chromosome name.
             let chr_name = String::from_utf8_lossy(seq_record.id().split(|&b| b == b' ').next().unwrap_or(b"*")).to_string();
             let seq = String::from_utf8_lossy(seq_record.seq().as_ref()).to_string().to_uppercase();
             
-            // Store the sequence and its length.
             self.chr_len_map.insert(chr_name.clone(), seq.len());
             self.chr_tcga_map.insert(chr_name, seq);
         }

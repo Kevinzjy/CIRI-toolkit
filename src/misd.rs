@@ -1,10 +1,24 @@
-/// Port of CIRI3 Misd.java
-/// Parses CIGAR strings using efficient manual parsing instead of Regex.
+//! Port of CIRI3 Misd.java
+//!
+//! This module parses CIGAR strings using an efficient manual state machine
+//! instead of regex to determine the alignment type (SM, MS, SMS) and mapped length.
 
+/// Parses a CIGAR string and returns classification metadata.
+///
+/// # Arguments
+/// * `old_cigar` - The CIGAR string from a SAM/BAM record.
+/// * `seq_length` - The total length of the read sequence.
+///
+/// # Returns
+/// An array of 4 integers:
+/// 0: Type indicator (-1 for SM, 1 for MS, 10 for SMS, 0 for pure M).
+/// 1: Soft-clip length at the start (for SM/SMS) or match length (for MS).
+/// 2: Relative position index.
+/// 3: Total mapped length (sum of M and D operations).
 pub fn misd(old_cigar: &str, seq_length: i32) -> [i32; 4] {
     let mut cigar_ite = [0, 0, 0, 0];
     
-    // Standardize: Replace H with S
+    // Standardize: Replace H (Hard clip) with S (Soft clip) conceptually for length.
     let mut counts = Vec::with_capacity(4);
     let mut ops = Vec::with_capacity(4);
     
@@ -77,42 +91,36 @@ mod tests {
 
     #[test]
     fn test_misd_match() {
-        // 100M
         let res = misd("100M", 100);
         assert_eq!(res, [0, 0, 0, 100]);
     }
 
     #[test]
     fn test_misd_soft_clip_start() {
-        // 20S80M
         let res = misd("20S80M", 100);
         assert_eq!(res, [-1, 20, 0, 80]);
     }
 
     #[test]
     fn test_misd_soft_clip_end() {
-        // 80M20S
         let res = misd("80M20S", 100);
         assert_eq!(res, [1, 80, 79, 80]);
     }
 
     #[test]
     fn test_misd_insertion() {
-        // 40M2I58M
         let res = misd("40M2I58M", 100);
         assert_eq!(res, [0, 0, 0, 98]);
     }
 
     #[test]
     fn test_misd_deletion() {
-        // 40M2D58M
         let res = misd("40M2D58M", 98);
         assert_eq!(res, [0, 0, 0, 100]);
     }
 
     #[test]
     fn test_misd_complex() {
-        // 10S30M2I40M20S
         let res = misd("10S30M2I40M20S", 102);
         assert_eq!(res, [10, 10, 20, 70]);
     }

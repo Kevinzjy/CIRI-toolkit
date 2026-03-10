@@ -1,5 +1,7 @@
-/// Validator module: Reproduces the core validation logic of Java CIRI3.
-/// This module includes comprehensive sequence validation and linear competition checks.
+//! Validator module: Reproduces the core validation logic of Java CIRI3.
+//!
+//! This module includes comprehensive sequence validation, canonical splice signal 
+//! identification, and linear competition checks to distinguish BSJs from linear splicing noise.
 
 use crate::index_compare::IndexCompare;
 use std::collections::HashMap;
@@ -10,14 +12,14 @@ pub struct SmithWaterman {
     pub mismatch_penalty: i32,
     pub gap_penalty: i32,
     pub score: i32,
-    /// Number of steps in the traceback, equivalent to alignment[1].length() in Java.
+    /// Number of steps in the traceback, equivalent to `alignment[1].length()` in Java.
     pub aligned_len: i32,
     seq1: String,
     seq2: String,
 }
 
 impl SmithWaterman {
-    /// Initializes a new SmithWaterman aligner.
+    /// Initializes a new SmithWaterman aligner with given scoring parameters.
     pub fn new(m: i32, mis: i32, gap: i32) -> Self {
         Self { 
             match_score: m, 
@@ -30,12 +32,13 @@ impl SmithWaterman {
         }
     }
 
+    /// Sets the sequences to be aligned.
     pub fn set_seq(&mut self, s1: &str, s2: &str) {
         self.seq1 = s1.to_uppercase();
         self.seq2 = s2.to_uppercase();
     }
 
-    /// Performs local alignment and traceback to calculate score and aligned length.
+    /// Performs local alignment and traceback to calculate the optimal score and aligned length.
     pub fn align(&mut self) {
         let n = self.seq1.len();
         let m = self.seq2.len();
@@ -84,6 +87,7 @@ impl SmithWaterman {
     }
 }
 
+/// Main validator struct for BSJ candidate verification.
 pub struct IsBSJHg2 {
     pub linear_range_size_min: i32,
     pub min_mapq_uni: i32,
@@ -92,6 +96,7 @@ pub struct IsBSJHg2 {
     window_unit: [i32; 5],
 }
 
+/// Helper function to mirror Java's `String.substring` behavior (end-exclusive, safe bounds).
 pub fn java_substring(s: &str, start: i32, end: i32) -> &str {
     let len = s.len() as i32;
     let s_idx = start.max(0).min(len);
@@ -101,6 +106,7 @@ pub fn java_substring(s: &str, start: i32, end: i32) -> &str {
 }
 
 impl IsBSJHg2 {
+    /// Creates a new `IsBSJHg2` validator.
     pub fn new(linear_range_size_min: i32, min_mapq_uni: i32) -> Self {
         Self {
             linear_range_size_min,
@@ -111,6 +117,7 @@ impl IsBSJHg2 {
         }
     }
 
+    /// Internal distance check for window-based sequence mapping.
     fn distance_loci(&self, locus_list: &[i32], locus2_list: &[i32], window_step: i32) -> i32 {
         if locus_list.len() < 2 && locus2_list.len() < 2 { return 0; }
         let mut locus_sum = 0;
@@ -120,6 +127,7 @@ impl IsBSJHg2 {
         if locus_sum <= window_step * locus_list.len() as i32 && locus_sum * 20 < locus2_sum { 1 } else { 0 }
     }
 
+    /// Linear competition check (Phase 1.1).
     pub fn is_in_circ_rna_1_1(&self, len_str: i32, str_val: &str, circ_range_seq: &str, linear_range: &str) -> i32 {
         for &step in &self.window_unit {
             if len_str < step * 2 { continue; }
@@ -151,6 +159,7 @@ impl IsBSJHg2 {
         0
     }
 
+    /// Linear competition check (Phase 1.2).
     pub fn is_in_circ_rna_1_2(&self, len_str: i32, str_val: &str, circ_range_seq: &str, linear_range: &str) -> i32 {
         for &step in &self.window_unit {
             if len_str < step * 2 { continue; }
@@ -182,6 +191,7 @@ impl IsBSJHg2 {
         0
     }
 
+    /// Validates sequence mapping for unmapped segments (Phase 2).
     pub fn is_in_circ_rna_2(&self, unmap_seq: &str, circ_range_seq: &str) -> i32 {
         let seq_len = unmap_seq.len() as i32;
         let window_step = 5; let window_size = 10;
@@ -196,6 +206,7 @@ impl IsBSJHg2 {
         1
     }
 
+    /// Validates sequence mapping for mate reads (Phase 3).
     pub fn is_in_circ_rna_3(&self, ano_read: &str, pre_judge: &str, circ_range_seq: &str, pem_null_range_seq: &str) -> i32 {
         let ano_read_len = ano_read.len() as i32;
         let window_step = 5; let window_size = 10;
@@ -222,6 +233,7 @@ impl IsBSJHg2 {
         1
     }
 
+    /// High-level BSJ identification from Scan 1 metadata.
     pub fn is_bsj_hg1(&mut self, circ_line_arr: &mut [String], chr_taga: &str, sum_q: i32, mitochondrion: &str, sp_label: bool, chr_exon_start_map: &HashMap<String, String>, chr_exon_end_map: &HashMap<String, String>) -> Option<String> {
         let site1 = circ_line_arr[9].parse::<i32>().unwrap_or(0);
         let site2 = circ_line_arr[10].parse::<i32>().unwrap_or(0);
@@ -313,6 +325,7 @@ impl IsBSJHg2 {
         None
     }
 
+    /// Low-level BSJ identification from rescue metadata (Scan 2).
     pub fn is_bsj_hg2(&mut self, circ_line_arr: &[String], chr_taga: &str) -> String {
         let mut judge_tag = "3".to_string();
         let start_site = circ_line_arr[3].parse::<i32>().unwrap_or(0);
@@ -402,6 +415,7 @@ mod tests {
     fn test_java_substring() {
         assert_eq!(java_substring("ABCDE", 1, 3), "BC");
         assert_eq!(java_substring("ABCDE", 0, 5), "ABCDE");
+        assert_eq!(java_substring("ABCDE", -1, 10), "ABCDE");
     }
 
     #[test]
@@ -410,6 +424,7 @@ mod tests {
         sw.set_seq("ATGC", "ATGC");
         sw.align();
         assert_eq!(sw.score, 4);
+        assert_eq!(sw.aligned_len, 4);
     }
 
     #[test]
