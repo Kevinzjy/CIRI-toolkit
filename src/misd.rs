@@ -70,3 +70,50 @@ pub fn misd(old_cigar: &str, seq_length: i32) -> [i32; 4] {
     
     cigar_ite
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_misd_match() {
+        // 100M
+        let res = misd("100M", 100);
+        assert_eq!(res, [0, 0, 0, 100]);
+    }
+
+    #[test]
+    fn test_misd_soft_clip_start() {
+        // 20S80M
+        let res = misd("20S80M", 100);
+        assert_eq!(res, [-1, 20, 0, 80]);
+    }
+
+    #[test]
+    fn test_misd_soft_clip_end() {
+        // 80M20S
+        let res = misd("80M20S", 100);
+        assert_eq!(res, [1, 80, 79, 80]);
+    }
+
+    #[test]
+    fn test_misd_insertion() {
+        // 40M2I58M
+        let res = misd("40M2I58M", 100);
+        assert_eq!(res, [0, 0, 0, 98]);
+    }
+
+    #[test]
+    fn test_misd_deletion() {
+        // 40M2D58M
+        let res = misd("40M2D58M", 98);
+        assert_eq!(res, [0, 0, 0, 100]);
+    }
+
+    #[test]
+    fn test_misd_complex() {
+        // 10S30M2I40M20S
+        let res = misd("10S30M2I40M20S", 102);
+        assert_eq!(res, [10, 10, 20, 70]);
+    }
+}

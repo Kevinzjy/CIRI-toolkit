@@ -33,6 +33,12 @@ CIRI-toolkit identifies circular RNA back-spliced junction (BSJ) reads from SAM 
 - [x] **Global Unique Read Assignment**: Resolves alignment ambiguity via priority ranking.
 - [x] Stringency-based filtering (Levels 0, 1, 2).
 
+## Phase 5: High-Performance BAM Support [DONE]
+- [x] **Automatic Format Detection**: Detect SAM/BAM based on file signature (magic bytes) including BGZF detection.
+- [x] **Parallel BAM Parsing**: Implementation of multi-threaded BGZF decompression using `noodles-bam` and `rayon`.
+- [x] **BAM Shard Synchronization**: Ported the "Read ID grouping" logic to BAM block offsets to maintain 100% logic parity with the SAM version.
+- [x] **Coordinate-Sorted Guard**: Explicitly detect and error on Coordinate-sorted BAM to prevent silent logic failure. Verified with `tests/test.bam`.
+
 ## 3. Key Parity Lessons (The "CIRI3 Parity Manifesto")
 
 Achieving behavioral parity with Java CIRI3 required overcoming several non-trivial challenges:

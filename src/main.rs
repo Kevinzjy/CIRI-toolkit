@@ -5,21 +5,12 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-mod misd;
-mod utils;
-mod fasta;
-mod annotation;
-mod index_compare;
-mod scan1;
-mod scan2;
-mod summary;
-mod is_bsj_hg2;
-
-use fasta::FastaReader;
-use annotation::Annotation;
-use scan1::Scan1;
-use scan2::Scan2;
-use summary::Summary;
+use ciri_toolkit::fasta::FastaReader;
+use ciri_toolkit::annotation::Annotation;
+use ciri_toolkit::scan1::Scan1;
+use ciri_toolkit::scan2::Scan2;
+use ciri_toolkit::summary::Summary;
+use ciri_toolkit::sam_bam::{detect_format, check_bam_sorting, InputFormat};
 
 /// CIRI-toolkit: High-performance circular RNA identification.
 #[derive(Parser, Debug)]
@@ -63,7 +54,7 @@ fn main() -> Result<()> {
 
     println!("Reading FASTA: {}", args.ref_fasta);
     let mut fasta = FastaReader::new();
-    fasta.read_fa(&args.ref_fasta)?;
+    fasta.read_fasta(&args.ref_fasta)?;
 
     println!("Reading GTF: {:?}", args.gtf);
     let mut annotation = Annotation::new();
@@ -72,6 +63,14 @@ fn main() -> Result<()> {
     }
 
     let bsj1_output = format!("{}.BSJ1", args.out_prefix);
+    
+    // 4. Input Format Detection
+    let format = detect_format(&args.in_sam)?;
+    if matches!(format, InputFormat::Bam) {
+        println!("[Input] BAM format detected. Checking sort order...");
+        check_bam_sorting(&args.in_sam)?;
+    }
+
     let mut scan1 = Scan1::new(args.min_mapq, 140, 200000, 5);
     println!("Running Scan 1: {} (Parallel)", args.in_sam);
     scan1.run(&args.in_sam, &args.out_prefix, &fasta.chr_tcga_map, &annotation)?;
