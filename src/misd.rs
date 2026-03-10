@@ -27,11 +27,24 @@ pub fn misd(old_cigar: &str, seq_length: i32) -> [i32; 4] {
         if c.is_digit(10) {
             current_val = current_val * 10 + c.to_digit(10).unwrap() as i32;
         } else {
-            let op = if c == 'H' { 'S' } else { c };
-            counts.push(current_val);
-            ops.push(op);
-            current_val = 0;
+            // Only accept valid CIGAR operations
+            if matches!(c, 'M' | 'I' | 'D' | 'N' | 'S' | 'H' | 'P' | '=' | 'X') {
+                let op = if c == 'H' { 'S' } else { c };
+                counts.push(current_val);
+                ops.push(op);
+                current_val = 0;
+            } else {
+                // Invalid character in CIGAR string (like '*')
+                cigar_ite[3] = -2;
+                return cigar_ite;
+            }
         }
+    }
+
+    // Safety check for empty CIGAR strings
+    if ops.is_empty() {
+        cigar_ite[3] = -2;
+        return cigar_ite;
     }
 
     if ops.len() == 1 {
@@ -93,6 +106,12 @@ mod tests {
     fn test_misd_match() {
         let res = misd("100M", 100);
         assert_eq!(res, [0, 0, 0, 100]);
+    }
+
+    #[test]
+    fn test_misd_invalid() {
+        let res = misd("*", 100);
+        assert_eq!(res[3], -2);
     }
 
     #[test]

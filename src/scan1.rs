@@ -271,13 +271,13 @@ impl Scan1 {
             let line_end = memchr(b'\n', &mmap[pos..]).map(|p| pos + p).unwrap_or(mmap.len());
             let line = &mmap[pos..line_end];
             if line.is_empty() { 
-                pos = line_end + 1; 
                 pb.inc(1);
+                pos = line_end + 1; 
                 continue; 
             }
             if line[0] == b'@' { 
-                pos = line_end + 1; 
                 pb.inc((line_end - pos + 1) as u64);
+                pos = line_end + 1; 
                 continue; 
             }
 
