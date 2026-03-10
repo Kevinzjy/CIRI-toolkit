@@ -35,6 +35,8 @@ cargo build --release
 - `-a, --anno`: (Optional) Path to the GTF annotation file.
 - `-m, --mapq`: Minimum Mapping Quality (default: 10).
 - `-s, --stringency`: Stringency level (0, 1, or 2; default: 1).
+- `-t, --threads`: Number of threads to use (default: auto).
+- `-M, --mem-per-thread`: Maximum memory per thread for Page Cache management (e.g., 2G, 512M; default: 2G).
 
 ## Output Format
 The tool generates a 13-column `.result` file compatible with CIRI3 downstream analysis:

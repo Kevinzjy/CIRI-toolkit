@@ -1,5 +1,5 @@
 //! Scan 1 module: Ultra-high performance multi-format BSJ identification.
-//! Optimized for TB-scale data using sharded I/O and active Page Cache eviction.
+//! Optimized for TB-scale data using sharded I/O and strict Page Cache management.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File};
@@ -16,7 +16,6 @@ use crate::is_bsj_hg2::{IsBSJHg2, java_substring};
 use crate::annotation::Annotation;
 use crate::utils::AlignmentRecord;
 
-/// Core logic for the first scan pass.
 pub struct Scan1 {
     pub min_mapq_uni: i32,
     pub max_circle: i32,
@@ -37,11 +36,17 @@ fn fast_parse_i32(bytes: &[u8]) -> i32 {
     res
 }
 
-fn advise_dontneed(mmap: &Mmap, offset: usize, len: usize) {
+/// Active Page Cache eviction with strict alignment.
+fn advise_dontneed_aligned(mmap: &Mmap, offset: usize, len: usize) {
     if len == 0 { return; }
+    // Page alignment is mandatory for madvise (typically 4096 bytes)
+    let page_size = 4096;
+    let aligned_offset = (offset / page_size) * page_size;
+    let aligned_len = ((offset + len + page_size - 1) / page_size) * page_size - aligned_offset;
+    
     unsafe {
-        let ptr = mmap.as_ptr().add(offset);
-        libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTNEED);
+        let ptr = mmap.as_ptr().add(aligned_offset);
+        libc::madvise(ptr as *mut libc::c_void, aligned_len, libc::MADV_DONTNEED);
     }
 }
 
@@ -130,17 +135,20 @@ impl Scan1 {
         let mut current_id: &[u8] = &[];
         let mut group: [Vec<AlignmentRecord<'a>>; 2] = [Vec::with_capacity(8), Vec::with_capacity(8)];
         let mut last_evicted_pos = pos;
-        // Eviction threshold: 80% of the per-thread memory limit to be safe
-        let eviction_threshold = (self.mem_limit as f64 * 0.8) as usize;
+        
+        // Aggressive eviction: use small fixed windows (e.g. 64MB) to keep RES low
+        let eviction_threshold = 64 * 1024 * 1024; 
 
         while pos < mmap.len() {
             let line_end = memchr(b'\n', &mmap[pos..]).map(|p| pos + p).unwrap_or(mmap.len());
             let line = &mmap[pos..line_end];
             if line.is_empty() { pb.inc(1); pos = line_end + 1; continue; }
+            
             if pos - last_evicted_pos > eviction_threshold {
-                advise_dontneed(mmap, last_evicted_pos, pos - last_evicted_pos);
+                advise_dontneed_aligned(mmap, last_evicted_pos, pos - last_evicted_pos);
                 last_evicted_pos = pos;
             }
+
             if line[0] == b'@' { pb.inc((line_end - pos + 1) as u64); pos = line_end + 1; continue; }
             let mut cols = line.split(|&b| b == b'\t');
             let read_id = cols.next().unwrap();
@@ -211,13 +219,13 @@ impl Scan1 {
         let mut first_id_skipped = start == 0;
         let mut last_compressed_pos = 0;
         let mut last_evicted_pos = pos;
-        let eviction_threshold = (self.mem_limit as f64 * 0.8) as usize;
+        let eviction_threshold = 64 * 1024 * 1024;
         while reader.read_record(&mut record)? != 0 {
             let curr_c_pos = reader.get_ref().virtual_position().compressed() as usize;
             pb.inc((curr_c_pos - last_compressed_pos) as u64);
             last_compressed_pos = curr_c_pos;
             if curr_c_pos - (last_evicted_pos - pos) > eviction_threshold {
-                advise_dontneed(mmap, last_evicted_pos, curr_c_pos - (last_evicted_pos - pos));
+                advise_dontneed_aligned(mmap, last_evicted_pos, curr_c_pos - (last_evicted_pos - pos));
                 last_evicted_pos = pos + curr_c_pos;
             }
             let read_id = record.name().ok_or_else(|| anyhow::anyhow!("Missing read name"))?;

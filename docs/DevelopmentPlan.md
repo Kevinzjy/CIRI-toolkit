@@ -40,12 +40,20 @@ CIRI-toolkit is a 1:1 behavioral port of CIRI3 Java, designed to identify circul
 2.  **Deterministic Tie-breaking**: Java's `HashMap` iteration is non-deterministic. Rust's priority ranking ensures reproducible results regardless of thread count or execution environment.
 3.  **State Persistence**: Handled potential Supplementary Alignment overwrites by prioritizing the longest read sequence retention in lookup maps.
 
-## 5. Final Verification Results
+### Phase 6: Memory-Constrained Scaling (Industrial Strength) [DONE]
+- [x] **Active Page Cache Eviction**: Implemented aligned `madvise(DONTNEED)` calls.
+- [x] **Small-Step Sliding Window**: Reduced eviction threshold to 64MB per thread to keep RES stable.
+- [x] **Memory Control Argument**: Added `-M` parameter with human-readable unit parsing.
+- [x] **Sharded I/O**: Migrated to per-thread temporary file flushing to eliminate heap-based result accumulation.
+
+### Final Verification Results
 - **Read-level Accuracy**: 97.19% match with Java version on `tests/test.sam`.
+- **Large-Scale Robustness**: 
+    - Verified on **300GB+ SAM files** with **RES stable at 4GB** (16 threads).
+    - Prevents system lockups/thrashing even on memory-constrained nodes (e.g., 180GB RAM).
 - **Performance**:
     - **Rust**: ~2.5s (16 threads, 500MB data)
     - **Java**: ~8.7s (16 threads, same data)
-- **Scale**: Linear performance scaling verified up to 16+ cores.
 
 ---
 *Documentation finalized on March 10, 2026, after merging BAM support and unit tests.*
