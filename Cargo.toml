@@ -21,6 +21,7 @@ memmap2 = "0.9.10"
 memchr = "2.8.0"
 mimalloc = "0.1.48"
 indicatif = "0.18.4"
+chrono = "0.4.44"
 
 [dev-dependencies]
 pretty_assertions = "1.4"
