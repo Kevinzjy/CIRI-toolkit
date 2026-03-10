@@ -4,13 +4,15 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write, BufWriter};
+use std::borrow::Cow;
 use anyhow::Result;
 use rayon::prelude::*;
 use memmap2::Mmap;
 use memchr::memchr;
+use noodles::sam;
 use crate::misd::misd;
 use crate::is_bsj_hg2::IsBSJHg2;
-use crate::utils::reverse_complement;
+use crate::utils::{reverse_complement, AlignmentRecord};
 
 pub struct Scan2 {
     pub min_mapq_uni: i32,
@@ -24,11 +26,6 @@ pub struct Scan2 {
 pub struct CandidateBreakpoint {
     pub site: i32,
     pub data: Vec<String>,
-}
-
-#[derive(Clone)]
-struct AlignmentView<'a> {
-    flag: i32, chrom: &'a str, pos: i32, mapq: i32, cigar: &'a str, seq: &'a str,
 }
 
 #[inline]
@@ -59,6 +56,16 @@ impl Scan2 {
     }
 
     pub fn run(&mut self, sam_file: &str, output_bsj2: &str, chr_tcga_map: &HashMap<String, String>) -> Result<()> {
+        use crate::sam_bam::{detect_format, InputFormat};
+        let format = detect_format(sam_file)?;
+        
+        match format {
+            InputFormat::Sam => self.run_sam(sam_file, output_bsj2, chr_tcga_map),
+            InputFormat::Bam => self.run_bam(sam_file, output_bsj2, chr_tcga_map),
+        }
+    }
+
+    pub fn run_sam(&mut self, sam_file: &str, output_bsj2: &str, chr_tcga_map: &HashMap<String, String>) -> Result<()> {
         let file = File::open(sam_file)?;
         let mmap = unsafe { Mmap::map(&file)? };
         let num_threads = rayon::current_num_threads().max(1);
@@ -67,10 +74,10 @@ impl Scan2 {
         let shard_results: Vec<(Vec<String>, HashMap<String, i32>)> = (0..num_threads).into_par_iter().map(|i| {
             let start = i * shard_size;
             let end = if i == num_threads - 1 { mmap.len() } else { (i + 1) * shard_size };
-            self.process_shard_view(&mmap, start, end, chr_tcga_map).unwrap_or_default()
+            self.process_sam_shard(&mmap, start, end, chr_tcga_map).unwrap_or_default()
         }).collect();
 
-        let out_file = std::fs::OpenOptions::new().append(true).open(output_bsj2)?;
+        let out_file = std::fs::OpenOptions::new().create(true).append(true).open(output_bsj2)?;
         let mut writer = BufWriter::with_capacity(1024 * 1024, out_file);
         for (lines, partial_fsj) in shard_results {
             for line in lines { writeln!(writer, "{}", line)?; }
@@ -80,7 +87,148 @@ impl Scan2 {
         Ok(())
     }
 
-    fn process_shard_view(&self, mmap: &[u8], start: usize, end: usize, chr_tcga_map: &HashMap<String, String>) -> Result<(Vec<String>, HashMap<String, i32>)> {
+    pub fn run_bam(&mut self, bam_file: &str, output_bsj2: &str, chr_tcga_map: &HashMap<String, String>) -> Result<()> {
+        use noodles::bam;
+        let file = File::open(bam_file)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        
+        let mut header_reader = bam::io::Reader::new(&mmap[..]);
+        let header = header_reader.read_header()?;
+        
+        let num_threads = rayon::current_num_threads().max(1);
+        let shard_size = mmap.len() / num_threads;
+
+        let shard_results: Vec<(Vec<String>, HashMap<String, i32>)> = (0..num_threads).into_par_iter().map(|i| {
+            let start = i * shard_size;
+            let end = if i == num_threads - 1 { mmap.len() } else { (i + 1) * shard_size };
+            self.process_bam_shard(&mmap, start, end, &header, chr_tcga_map).unwrap_or_default()
+        }).collect();
+
+        let out_file = std::fs::OpenOptions::new().create(true).append(true).open(output_bsj2)?;
+        let mut writer = BufWriter::with_capacity(1024 * 1024, out_file);
+        for (lines, partial_fsj) in shard_results {
+            for line in lines { writeln!(writer, "{}", line)?; }
+            for (key, count) in partial_fsj { *self.fsj_map.entry(key).or_insert(0) += count; }
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn process_bam_shard(&self, mmap: &[u8], start: usize, end: usize, header: &sam::Header, chr_tcga_map: &HashMap<String, String>) -> Result<(Vec<String>, HashMap<String, i32>)> {
+        use noodles::bam;
+        use noodles::sam::alignment::Record;
+        let mut results = Vec::new();
+        let mut local_fsj = HashMap::new();
+        let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
+        
+        // 1. Find the first BGZF block start in this shard
+        let pos = if start == 0 { 0 } else {
+            let mut found = None;
+            for i in start..end {
+                if i + 3 < mmap.len() && &mmap[i..i+4] == b"\x1f\x8b\x08\x04" {
+                    found = Some(i);
+                    break;
+                }
+            }
+            found.unwrap_or(mmap.len())
+        };
+        if pos >= mmap.len() { return Ok((results, local_fsj)); }
+
+        let mut reader = bam::io::Reader::new(&mmap[pos..]);
+        let mut record = bam::Record::default();
+        
+        let mut current_id: Vec<u8> = Vec::new();
+        let mut alignments: Vec<AlignmentRecord> = Vec::with_capacity(16);
+        let mut stand_map: HashMap<i32, (char, Cow<str>)> = HashMap::with_capacity(4);
+        let mut first_id_skipped = start == 0;
+
+        while reader.read_record(&mut record)? != 0 {
+            let read_id = record.name().ok_or_else(|| anyhow::anyhow!("Missing read name"))?;
+            
+            if !first_id_skipped {
+                if current_id.is_empty() {
+                    current_id = read_id.to_vec();
+                    continue;
+                }
+                if read_id.to_vec() != current_id {
+                    first_id_skipped = true;
+                    current_id = read_id.to_vec();
+                } else {
+                    continue;
+                }
+            }
+
+            if read_id.to_vec() != current_id {
+                if !current_id.is_empty() {
+                    let id_str = String::from_utf8_lossy(&current_id);
+                    self.process_group_view(&id_str, &alignments, &stand_map, &mut results, &mut local_fsj, chr_tcga_map, &mut validator)?;
+                    
+                    let current_compressed_pos = pos + reader.get_ref().virtual_position().compressed() as usize;
+                    if current_compressed_pos > end {
+                        current_id.clear();
+                        break;
+                    }
+                }
+                current_id = read_id.to_vec(); alignments.clear(); stand_map.clear();
+            }
+
+            // Convert BAM record
+            let flag = i32::from(u16::from(record.flags()));
+            let chrom = match record.reference_sequence(header) {
+                Some(Ok((name, _))) => String::from_utf8_lossy(name.as_ref()).to_string(),
+                _ => "*".to_string(),
+            };
+            let start_pos = record.alignment_start().transpose()?.map(|p| p.get() as i32).unwrap_or(0);
+            let mapq = record.mapping_quality().map(u8::from).unwrap_or(0) as i32;
+            
+            let mut cigar = String::new();
+            for result in record.cigar().iter() {
+                let op = result?;
+                use noodles::sam::alignment::record::cigar::op::Kind;
+                let op_char = match op.kind() {
+                    Kind::Match => 'M',
+                    Kind::Insertion => 'I',
+                    Kind::Deletion => 'D',
+                    Kind::Skip => 'N',
+                    Kind::SoftClip => 'S',
+                    Kind::HardClip => 'H',
+                    Kind::Pad => 'P',
+                    Kind::SequenceMatch => '=',
+                    Kind::SequenceMismatch => 'X',
+                };
+                cigar.push_str(&format!("{}{}", op.len(), op_char));
+            }
+            
+            let mut seq = String::new();
+            for b in record.sequence().iter() {
+                seq.push(char::from(b));
+            }
+
+            if !seq.is_empty() && seq != "*" {
+                let s_idx = if flag & 0x40 != 0 { 0 } else { 1 };
+                let strand_char = if flag & 0x10 != 0 { '1' } else { '0' };
+                let entry = stand_map.entry(s_idx).or_insert((strand_char, Cow::Owned(seq.clone())));
+                if seq.len() > entry.1.len() { *entry = (strand_char, Cow::Owned(seq.clone())); }
+            }
+            alignments.push(AlignmentRecord { 
+                flag, 
+                chrom: Cow::Owned(chrom), 
+                pos: start_pos, 
+                mapq, 
+                cigar: Cow::Owned(cigar), 
+                seq: Cow::Owned(seq) 
+            });
+        }
+
+        if !current_id.is_empty() {
+            let id_str = String::from_utf8_lossy(&current_id);
+            self.process_group_view(&id_str, &alignments, &stand_map, &mut results, &mut local_fsj, chr_tcga_map, &mut validator)?;
+        }
+
+        Ok((results, local_fsj))
+    }
+
+    fn process_sam_shard<'a>(&self, mmap: &'a [u8], start: usize, end: usize, chr_tcga_map: &HashMap<String, String>) -> Result<(Vec<String>, HashMap<String, i32>)> {
         let mut results = Vec::new();
         let mut local_fsj = HashMap::new();
         let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
@@ -88,8 +236,8 @@ impl Scan2 {
         if pos >= end && start != 0 { return Ok((results, local_fsj)); }
 
         let mut current_id: &[u8] = &[];
-        let mut alignments: Vec<AlignmentView> = Vec::with_capacity(16);
-        let mut stand_map: HashMap<i32, (char, &str)> = HashMap::with_capacity(4);
+        let mut alignments: Vec<AlignmentRecord<'a>> = Vec::with_capacity(16);
+        let mut stand_map: HashMap<i32, (char, Cow<'a, str>)> = HashMap::with_capacity(4);
 
         while pos < end || !current_id.is_empty() {
             let line_end = memchr(b'\n', &mmap[pos..]).map(|p| pos + p).unwrap_or(mmap.len());
@@ -121,32 +269,39 @@ impl Scan2 {
             if seq != "*" {
                 let s_idx = if flag & 0x40 != 0 { 0 } else { 1 };
                 let strand_char = if flag & 0x10 != 0 { '1' } else { '0' };
-                let entry = stand_map.entry(s_idx).or_insert((strand_char, seq));
-                if seq.len() > entry.1.len() { *entry = (strand_char, seq); }
+                let entry = stand_map.entry(s_idx).or_insert((strand_char, Cow::Borrowed(seq)));
+                if seq.len() > entry.1.len() { *entry = (strand_char, Cow::Borrowed(seq)); }
             }
-            alignments.push(AlignmentView { flag, chrom, pos: start_pos, mapq, cigar, seq });
+            alignments.push(AlignmentRecord { 
+                flag, 
+                chrom: Cow::Borrowed(chrom), 
+                pos: start_pos, 
+                mapq, 
+                cigar: Cow::Borrowed(cigar), 
+                seq: Cow::Borrowed(seq) 
+            });
             pos = line_end + 1;
         }
         Ok((results, local_fsj))
     }
 
-    fn process_group_view(&self, id: &str, alignments: &[AlignmentView], stand_map: &HashMap<i32, (char, &str)>, results: &mut Vec<String>, local_fsj: &mut HashMap<String, i32>, chr_tcga_map: &HashMap<String, String>, is_bsj_hg2: &mut IsBSJHg2) -> Result<()> {
-        let mut segments: HashMap<i32, Vec<&AlignmentView>> = HashMap::new();
+    pub(crate) fn process_group_view<'a>(&self, id: &str, alignments: &[AlignmentRecord<'a>], stand_map: &HashMap<i32, (char, Cow<'a, str>)>, results: &mut Vec<String>, local_fsj: &mut HashMap<String, i32>, chr_tcga_map: &HashMap<String, String>, is_bsj_hg2: &mut IsBSJHg2) -> Result<()> {
+        let mut segments: HashMap<i32, Vec<&AlignmentRecord<'a>>> = HashMap::new();
         for aln in alignments {
             segments.entry(if aln.flag & 0x40 != 0 { 0 } else { 1 }).or_insert_with(Vec::new).push(aln);
         }
         let mut tem_fsj_keys = HashSet::new();
         for (&seg_idx, seg_alns) in &segments {
-            let (read_strand, seq) = match stand_map.get(&seg_idx) { Some(&(st, s)) => (st, s), None => continue };
+            let (read_strand, seq) = match stand_map.get(&seg_idx) { Some(&(st, ref s)) => (st, s.as_ref()), None => continue };
             let slen = seq.len() as i32;
             let mut p_str = String::new(); let mut s2_ok = "0";
-            if let Some(&(p_strand, p_seq)) = stand_map.get(&(1 - seg_idx)) {
+            if let Some(&(p_strand, ref p_seq)) = stand_map.get(&(1 - seg_idx)) {
                 if p_strand != read_strand { p_str = p_seq.to_string(); } else { p_str = reverse_complement(p_seq); }
                 s2_ok = "1";
             }
             for aln in seg_alns {
-                let chr = aln.chrom; if !self.index1.contains_key(chr) { continue; }
-                let c = misd(aln.cigar, slen);
+                let chr = aln.chrom.as_ref(); if !self.index1.contains_key(chr) { continue; }
+                let c = misd(&aln.cigar, slen);
                 if c[0] == -1 || c[0] == 10 {
                     if let Some(list) = self.index1.get(chr) {
                         for cand in list {

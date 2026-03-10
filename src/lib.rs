@@ -7,4 +7,5 @@ pub mod scan1;
 pub mod scan2;
 pub mod summary;
 pub mod is_bsj_hg2;
+pub mod sam_bam;
 pub mod tests;

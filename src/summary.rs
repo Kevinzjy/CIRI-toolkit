@@ -5,12 +5,10 @@ use std::collections::{HashMap, HashSet, BTreeMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write, BufWriter};
 use anyhow::Result;
-use crate::is_bsj_hg2::{SmithWaterman, java_substring};
 use crate::annotation::Annotation;
 
 pub struct Summary {
     pub stringency: i32,
-    pub aligner: SmithWaterman,
 }
 
 struct CircSortItem {
@@ -50,7 +48,6 @@ impl Summary {
     pub fn new(stringency: i32) -> Self {
         Self {
             stringency,
-            aligner: SmithWaterman::new(1, -1, -3),
         }
     }
 

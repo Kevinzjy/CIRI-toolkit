@@ -393,3 +393,38 @@ impl IsBSJHg2 {
         format!("1{}", judge_tag)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_java_substring() {
+        assert_eq!(java_substring("ABCDE", 1, 3), "BC");
+        assert_eq!(java_substring("ABCDE", 0, 5), "ABCDE");
+    }
+
+    #[test]
+    fn test_smith_waterman_exact() {
+        let mut sw = SmithWaterman::new(1, -1, -1);
+        sw.set_seq("ATGC", "ATGC");
+        sw.align();
+        assert_eq!(sw.score, 4);
+    }
+
+    #[test]
+    fn test_smith_waterman_mismatch() {
+        let mut sw = SmithWaterman::new(1, -1, -1);
+        sw.set_seq("ATGC", "ATGG");
+        sw.align();
+        assert_eq!(sw.score, 3);
+    }
+
+    #[test]
+    fn test_smith_waterman_short() {
+        let mut sw = SmithWaterman::new(1, -1, -1);
+        sw.set_seq("GCAT", "GC");
+        sw.align();
+        assert_eq!(sw.score, 2);
+    }
+}
