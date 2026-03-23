@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File};
 use std::io::{Write, BufWriter, BufRead, BufReader};
 use std::borrow::Cow;
-use std::time::{Duration, Instant};
+use std::fmt::Write as FmtWrite;
+use std::time::Duration;
 use anyhow::Result;
 use rayon::prelude::*;
 use memmap2::Mmap;
@@ -118,13 +119,17 @@ impl Scan1 {
         for i in 0..num_threads {
             let shard_path = format!("{}.BSJ1.shard_{}", out_prefix, i);
             if let Ok(shard_file) = File::open(&shard_path) {
-                let reader = BufReader::new(shard_file);
-                for line_res in reader.lines() {
-                    let line = line_res?;
-                    let id = line.split('\t').next().unwrap_or("").to_string();
-                    if !id.is_empty() {
-                        writeln!(final_writer, "{}", line)?;
-                        scan1_id_map.insert(id);
+                let mut reader = BufReader::new(shard_file);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line)? == 0 {
+                        break;
+                    }
+                    let tab_idx = line.find('\t').unwrap_or(0);
+                    if tab_idx > 0 {
+                        scan1_id_map.insert(line[..tab_idx].to_string());
+                        final_writer.write_all(line.as_bytes())?;
                     }
                 }
             }
@@ -223,35 +228,13 @@ impl Scan1 {
 
     pub fn run_bam(&mut self, bam_file: &str, out_prefix: &str, fasta_map: &HashMap<String, String>, annotation: &Annotation) -> Result<HashSet<String>> {
         use noodles::bam;
-        const WRITE_FLUSH_THRESHOLD: usize = 512 * 1024;
-        const PROGRESS_UPDATE_INTERVAL: u64 = 4096;
         let file = File::open(bam_file)?;
         let file_size = std::fs::metadata(bam_file)?.len();
+        let mmap = unsafe { Mmap::map(&file)? };
+        let num_threads = rayon::current_num_threads().max(1);
+        let shard_size = mmap.len() / num_threads;
         let mut reader = bam::io::Reader::new(file);
         let header = reader.read_header()?;
-        let mut record = bam::Record::default();
-        let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
-
-        let bsj1_path = format!("{}.BSJ1", out_prefix);
-        let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(&bsj1_path)?);
-        let mut scan1_id_map = HashSet::new();
-        let mut out_buf = String::with_capacity(WRITE_FLUSH_THRESHOLD);
-
-        let mut current_id: Vec<u8> = Vec::new();
-        let mut group: [Vec<AlignmentRecord>; 2] = [Vec::with_capacity(8), Vec::with_capacity(8)];
-        let mut stand_map: HashMap<i32, (char, Cow<str>)> = HashMap::with_capacity(4);
-        let mut align_num = 0usize;
-        let mut one_read_key: i32 = -1;
-        let mut total_records: u64 = 0;
-        let mut total_read_groups: u64 = 0;
-        let mut bsj_hits: u64 = 0;
-        let mut cigar_buf = String::with_capacity(64);
-        let mut seq_buf = String::with_capacity(256);
-        let profile_scan1 = std::env::var("CIRI_PROFILE_SCAN1").ok().as_deref() == Some("1");
-        let scan_start = Instant::now();
-        let mut decode_time = Duration::ZERO;
-        let mut group_eval_time = Duration::ZERO;
-        let mut write_time = Duration::ZERO;
 
         let pb = ProgressBar::new(file_size);
         pb.set_style(
@@ -262,160 +245,27 @@ impl Scan1 {
         pb.set_message("Scan 1 (BAM): starting...");
         pb.enable_steady_tick(Duration::from_millis(120));
 
-        while reader.read_record(&mut record)? != 0 {
-            total_records += 1;
-            let pos = reader.get_ref().virtual_position().compressed();
-            if total_records % PROGRESS_UPDATE_INTERVAL == 0 {
-                pb.set_position(pos.min(file_size));
-            }
-            let read_id = record.name().ok_or_else(|| anyhow::anyhow!("Missing read name"))?;
-            let read_id_bytes = read_id.as_ref();
-            if read_id_bytes != current_id.as_slice() {
-                if !current_id.is_empty() {
-                    total_read_groups += 1;
-                    let id_str = String::from_utf8_lossy(&current_id);
-                    let non_empty_groups = group.iter().filter(|g| !g.is_empty()).count();
-                    if align_num > 2 || non_empty_groups == 1 {
-                        let t0 = if profile_scan1 { Some(Instant::now()) } else { None };
-                        if let Some((_, res_line)) = self.process_group_view(&id_str, &group, &stand_map, fasta_map, annotation, &mut validator) {
-                            out_buf.push_str(&res_line);
-                            out_buf.push('\n');
-                            scan1_id_map.insert(id_str.to_string());
-                            bsj_hits += 1;
-                            if out_buf.len() >= WRITE_FLUSH_THRESHOLD {
-                                let w0 = if profile_scan1 { Some(Instant::now()) } else { None };
-                                writer.write_all(out_buf.as_bytes())?;
-                                out_buf.clear();
-                                if let Some(w0) = w0 {
-                                    write_time += w0.elapsed();
-                                }
-                            }
-                        }
-                        if let Some(t0) = t0 {
-                            group_eval_time += t0.elapsed();
-                        }
-                    }
-                }
-                current_id.clear();
-                current_id.extend_from_slice(read_id_bytes);
-                group[0].clear();
-                group[1].clear();
-                stand_map.clear();
-                align_num = 0;
-                one_read_key = -1;
-            }
+        unsafe { libc::madvise(mmap.as_ptr() as *mut libc::c_void, mmap.len(), libc::MADV_SEQUENTIAL); }
 
-            let decode_start = if profile_scan1 { Some(Instant::now()) } else { None };
-            let chrom = match record.reference_sequence(&header) {
-                Some(Ok((name, _))) => String::from_utf8_lossy(name).to_string(),
-                _ => "*".to_string(),
-            };
-            let flag = i32::from(u16::from(record.flags()));
-            let start_pos = record.alignment_start().transpose()?.map(|p| p.get() as i32).unwrap_or(0);
-            let mapq = record.mapping_quality().map(u8::from).unwrap_or(0) as i32;
-            cigar_buf.clear();
-            for result in record.cigar().iter() {
-                let op = result?;
-                use noodles::sam::alignment::record::cigar::op::Kind;
-                let op_char = match op.kind() {
-                    Kind::Match => 'M',
-                    Kind::Insertion => 'I',
-                    Kind::Deletion => 'D',
-                    Kind::Skip => 'N',
-                    Kind::SoftClip => 'S',
-                    Kind::HardClip => 'H',
-                    Kind::Pad => 'P',
-                    Kind::SequenceMatch => '=',
-                    Kind::SequenceMismatch => 'X',
-                };
-                use std::fmt::Write as _;
-                let _ = write!(&mut cigar_buf, "{}{}", op.len(), op_char);
-            }
-            seq_buf.clear();
-            for b in record.sequence().iter() {
-                seq_buf.push(char::from(b));
-            }
-            if (seq_buf.len() as i32) > self.read_len {
-                self.read_len = seq_buf.len() as i32;
-            }
-            if let Some(decode_start) = decode_start {
-                decode_time += decode_start.elapsed();
-            }
-            let seq = seq_buf.clone();
-            let s_idx = if flag & 0x40 != 0 { 1 } else { 0 };
-            if s_idx != one_read_key {
-                group[s_idx as usize].clear();
-                one_read_key = s_idx;
-                let st_c = if flag & 0x10 != 0 { '1' } else { '0' };
-                stand_map.insert(s_idx, (st_c, Cow::Owned(seq.clone())));
-            }
-            group[s_idx as usize].push(AlignmentRecord {
-                flag,
-                chrom: Cow::Owned(chrom),
-                pos: start_pos,
-                mapq,
-                cigar: Cow::Owned(cigar_buf.clone()),
-                seq: Cow::Owned(seq),
-            });
-            align_num += 1;
-            if total_records % 100_000 == 0 {
-                pb.set_message(format!(
-                    "Scan 1 (BAM): records={} read_groups={} bsj_hits={}",
-                    total_records, total_read_groups, bsj_hits
-                ));
-            }
-        }
+        let header_ref = &header;
+        let shard_max_read_lens: Vec<i32> = (0..num_threads)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * shard_size;
+                let end = if i == num_threads - 1 { mmap.len() } else { (i + 1) * shard_size };
+                let shard_out = format!("{}.BSJ1.shard_{}", out_prefix, i);
+                self.process_bam_shard_to_file(&mmap, start, end, header_ref, fasta_map, annotation, &pb, &shard_out)
+                    .unwrap_or(0)
+            })
+            .collect();
 
-        if !current_id.is_empty() {
-            total_read_groups += 1;
-            let id_str = String::from_utf8_lossy(&current_id);
-            let t0 = if profile_scan1 { Some(Instant::now()) } else { None };
-            if let Some((_, res_line)) = self.process_group_view(&id_str, &group, &stand_map, fasta_map, annotation, &mut validator) {
-                out_buf.push_str(&res_line);
-                out_buf.push('\n');
-                scan1_id_map.insert(id_str.to_string());
-                bsj_hits += 1;
-            }
-            if let Some(t0) = t0 {
-                group_eval_time += t0.elapsed();
-            }
-        }
-        if !out_buf.is_empty() {
-            let w0 = if profile_scan1 { Some(Instant::now()) } else { None };
-            writer.write_all(out_buf.as_bytes())?;
-            if let Some(w0) = w0 {
-                write_time += w0.elapsed();
-            }
-        }
-        writer.flush()?;
+        self.read_len = shard_max_read_lens.into_iter().max().unwrap_or(0);
         pb.set_position(file_size);
-        pb.finish_with_message(format!(
-            "Scan 1 (BAM): done. records={} read_groups={} bsj_hits={}",
-            total_records, total_read_groups, bsj_hits
-        ));
-        if profile_scan1 {
-            let total = scan_start.elapsed();
-            eprintln!(
-                "[PROFILE_SCAN1_BAM] total={:.3}s decode={:.3}s group_eval={:.3}s write={:.3}s other={:.3}s records={} groups={} hits={}",
-                total.as_secs_f64(),
-                decode_time.as_secs_f64(),
-                group_eval_time.as_secs_f64(),
-                write_time.as_secs_f64(),
-                (total
-                    .saturating_sub(decode_time)
-                    .saturating_sub(group_eval_time)
-                    .saturating_sub(write_time))
-                .as_secs_f64(),
-                total_records,
-                total_read_groups,
-                bsj_hits
-            );
-        }
-        Ok(scan1_id_map)
+        pb.finish_with_message("Scan 1 (BAM): completed");
+        self.merge_and_collect_ids(out_prefix, num_threads)
     }
 
-    #[allow(dead_code)]
-    fn process_bam_shard_to_file(&self, mmap: &Mmap, start: usize, end: usize, header: &sam::Header, fasta_map: &HashMap<String, String>, annotation: &Annotation, pb: &ProgressBar, out_path: &str) -> Result<()> {
+    fn process_bam_shard_to_file(&self, mmap: &Mmap, start: usize, end: usize, header: &sam::Header, fasta_map: &HashMap<String, String>, annotation: &Annotation, pb: &ProgressBar, out_path: &str) -> Result<i32> {
         use noodles::bam;
         let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
         let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
@@ -424,8 +274,11 @@ impl Scan1 {
             for i in start..mmap.len() { if i + 3 < mmap.len() && &mmap[i..i+4] == b"\x1f\x8b\x08\x04" { found = Some(i); break; } }
             found.unwrap_or(mmap.len())
         };
-        if pos >= mmap.len() { return Ok(()); }
+        if pos >= mmap.len() { return Ok(0); }
         let mut reader = bam::io::Reader::new(&mmap[pos..]);
+        if start == 0 {
+            let _ = reader.read_header()?;
+        }
         let mut record = bam::Record::default();
         let mut current_id: Vec<u8> = Vec::new();
         let mut group: [Vec<AlignmentRecord>; 2] = [Vec::with_capacity(8), Vec::with_capacity(8)];
@@ -435,6 +288,9 @@ impl Scan1 {
         let mut last_compressed_pos = 0;
         let mut last_evicted_pos = pos;
         let eviction_threshold = 64 * 1024 * 1024;
+        let mut shard_max_read_len = 0i32;
+        let mut cigar_buf = String::with_capacity(64);
+        let mut seq_buf = String::with_capacity(256);
         while reader.read_record(&mut record)? != 0 {
             let curr_c_pos = reader.get_ref().virtual_position().compressed() as usize;
             pb.inc((curr_c_pos - last_compressed_pos) as u64);
@@ -469,19 +325,22 @@ impl Scan1 {
             let flag = i32::from(u16::from(record.flags()));
             let start_pos = record.alignment_start().transpose()?.map(|p| p.get() as i32).unwrap_or(0);
             let mapq = record.mapping_quality().map(u8::from).unwrap_or(0) as i32;
-            let mut cigar = String::new();
+            cigar_buf.clear();
             for result in record.cigar().iter() {
                 let op = result?; use noodles::sam::alignment::record::cigar::op::Kind;
                 let op_char = match op.kind() { Kind::Match => 'M', Kind::Insertion => 'I', Kind::Deletion => 'D', Kind::Skip => 'N', Kind::SoftClip => 'S', Kind::HardClip => 'H', Kind::Pad => 'P', Kind::SequenceMatch => '=', Kind::SequenceMismatch => 'X', };
-                cigar.push_str(&format!("{}{}", op.len(), op_char));
+                let _ = write!(&mut cigar_buf, "{}{}", op.len(), op_char);
             }
-            let mut seq = String::new(); for b in record.sequence().iter() { seq.push(char::from(b)); }
+            seq_buf.clear();
+            for b in record.sequence().iter() { seq_buf.push(char::from(b)); }
+            shard_max_read_len = shard_max_read_len.max(seq_buf.len() as i32);
+            let seq = seq_buf.clone();
             if !seq.is_empty() && seq != "*" {
                 let s_idx = if flag & 0x40 != 0 { 1 } else { 0 };
                 let st_c = if flag & 0x10 != 0 { '1' } else { '0' };
-                stand_map.entry(s_idx).or_insert((st_c, Cow::Owned(seq.clone())));
+                stand_map.entry(s_idx).or_insert_with(|| (st_c, Cow::Owned(seq.clone())));
             }
-            group[if flag & 0x40 != 0 { 1 } else { 0 }].push(AlignmentRecord { flag, chrom: Cow::Owned(chrom), pos: start_pos, mapq, cigar: Cow::Owned(cigar), seq: Cow::Owned(seq) });
+            group[if flag & 0x40 != 0 { 1 } else { 0 }].push(AlignmentRecord { flag, chrom: Cow::Owned(chrom), pos: start_pos, mapq, cigar: Cow::Owned(cigar_buf.clone()), seq: Cow::Owned(seq) });
             align_num += 1;
         }
         if !current_id.is_empty() {
@@ -491,7 +350,7 @@ impl Scan1 {
             }
         }
         writer.flush()?;
-        Ok(())
+        Ok(shard_max_read_len)
     }
 
     fn process_group_view<'a>(&self, read_id: &str, group: &[Vec<AlignmentRecord<'a>>; 2], stand_map: &HashMap<i32, (char, Cow<'a, str>)>, fasta_map: &HashMap<String, String>, annotation: &Annotation, validator: &mut IsBSJHg2) -> Option<(String, String)> {
@@ -544,15 +403,15 @@ impl Scan1 {
                     let (mut str1, mut str2, mut str3, mut str4) = (String::new(), String::new(), String::new(), String::new());
                     let (mut q1, mut q2, mut sum_q) = (0, 0, 0);
                     let al1_strand = if al1.flag & 0x10 != 0 { '1' } else { '0' };
-                    let seq_oriented = if al1_strand == read_strand { read_seq.to_string() } else { crate::utils::reverse_complement(read_seq) };
+                    let seq_oriented: Cow<'_, str> = if al1_strand == read_strand { Cow::Borrowed(read_seq) } else { Cow::Owned(crate::utils::reverse_complement(read_seq)) };
                     if c1[0] * c2[0] == -1 {
                         let scale = c1[0] * al1.pos + c1[2] + c2[0] * al2.pos + c2[2];
                         if scale > 0 && (c1[1] - c2[1]).abs() <= 6 && scale <= self.max_circle && scale >= self.min_circle {
                             adj1 = (c1[1] * c1[0] + c2[1] * c2[0]) / 2; adj2 = (c1[1] * c1[0] + c2[1] * c2[0]) - adj1;
                             if adj1.abs() <= 4 {
                                 identified = true; s1_n = al1.pos + adj1; s2_n = al2.pos + c2[3] - 1 - adj2;
-                                str2 = java_substring(&seq_oriented, 0, c1[1] + adj1).to_string();
-                                str1 = java_substring(&seq_oriented, c1[1] + adj1, seq_len).to_string();
+                                str2 = java_substring(seq_oriented.as_ref(), 0, c1[1] + adj1).to_string();
+                                str1 = java_substring(seq_oriented.as_ref(), c1[1] + adj1, seq_len).to_string();
                                 str3 = "*".to_string();
                                 if al1.mapq >= self.min_mapq_uni && al2.mapq >= self.min_mapq_uni { q1 = 1; q2 = 1; sum_q = 1; }
                                 else if al1.mapq >= self.min_mapq_uni { q1 = 1; } else if al2.mapq >= self.min_mapq_uni { q2 = 1; }
@@ -565,9 +424,9 @@ impl Scan1 {
                                 adj1 = (c2[1] + c2[3] - c1[1]) / 2; adj2 = (c2[1] + c2[3] - c1[1]) - adj1;
                                 if adj1.abs() <= 4 {
                                     identified = true; s1_n = al1.pos + adj1; s2_n = al2.pos + c2[3] - 1 - adj2;
-                                    str1 = java_substring(&seq_oriented, c1[1] + adj1, seq_len).to_string();
-                                    str2 = java_substring(&seq_oriented, c2[1], c1[1] + adj1).to_string();
-                                    str3 = java_substring(&seq_oriented, 0, c2[1]).to_string();
+                                    str1 = java_substring(seq_oriented.as_ref(), c1[1] + adj1, seq_len).to_string();
+                                    str2 = java_substring(seq_oriented.as_ref(), c2[1], c1[1] + adj1).to_string();
+                                    str3 = java_substring(seq_oriented.as_ref(), 0, c2[1]).to_string();
                                     if al1.mapq >= self.min_mapq_uni && al2.mapq >= self.min_mapq_uni { q1 = 1; q2 = 1; sum_q = 1; }
                                     else if al1.mapq >= self.min_mapq_uni { q1 = 1; } else if al2.mapq >= self.min_mapq_uni { q2 = 1; }
                                 }
@@ -578,9 +437,9 @@ impl Scan1 {
                                 adj1 = (c1[1] - c2[1]) / 2; adj2 = (c1[1] - c2[1]) - adj1;
                                 if adj1.abs() <= 4 {
                                     identified = true; s1_n = al2.pos + adj1; s2_n = al1.pos + c1[3] - 1 - adj2;
-                                    str2 = java_substring(&seq_oriented, 0, c1[1] - adj2).to_string();
-                                    str1 = java_substring(&seq_oriented, c1[1] - adj2, seq_len - c2[2]).to_string();
-                                    str3 = java_substring(&seq_oriented, seq_len - c2[2], seq_len).to_string();
+                                    str2 = java_substring(seq_oriented.as_ref(), 0, c1[1] - adj2).to_string();
+                                    str1 = java_substring(seq_oriented.as_ref(), c1[1] - adj2, seq_len - c2[2]).to_string();
+                                    str3 = java_substring(seq_oriented.as_ref(), seq_len - c2[2], seq_len).to_string();
                                     if al1.mapq >= self.min_mapq_uni && al2.mapq >= self.min_mapq_uni { q1 = 1; q2 = 1; sum_q = 1; }
                                     else if al2.mapq >= self.min_mapq_uni { q1 = 1; } else if al1.mapq >= self.min_mapq_uni { q2 = 1; }
                                 }

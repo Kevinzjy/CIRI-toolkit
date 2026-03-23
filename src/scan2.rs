@@ -345,20 +345,11 @@ impl Scan2 {
         use noodles::bam;
         let file = File::open(bam_file)?;
         let file_size = std::fs::metadata(bam_file)?.len();
+        let mmap = unsafe { Mmap::map(&file)? };
+        let num_threads = rayon::current_num_threads().max(1);
+        let shard_size = mmap.len() / num_threads;
         let mut reader = bam::io::Reader::new(file);
         let header = reader.read_header()?;
-        let mut record = bam::Record::default();
-        let mut writer = BufWriter::with_capacity(1024 * 1024, std::fs::OpenOptions::new().create(true).append(true).open(output_bsj2)?);
-        let mut local_fsj: HashMap<String, i32> = HashMap::new();
-        let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
-
-        let mut current_id: Vec<u8> = Vec::new();
-        let mut alignments: Vec<AlignmentRecord> = Vec::with_capacity(16);
-        let mut stand_map: HashMap<i32, (char, Cow<str>)> = HashMap::with_capacity(4);
-        let mut one_read_key: i32 = -1;
-        let mut total_records: u64 = 0;
-        let mut total_read_groups: u64 = 0;
-        let mut rescued_lines: u64 = 0;
 
         let pb = ProgressBar::new(file_size);
         pb.set_style(
@@ -369,106 +360,27 @@ impl Scan2 {
         pb.set_message("Scan 2 (BAM): starting...");
         pb.enable_steady_tick(Duration::from_millis(120));
 
-        while reader.read_record(&mut record)? != 0 {
-            total_records += 1;
-            let pos = reader.get_ref().virtual_position().compressed();
-            pb.set_position(pos.min(file_size));
-            let read_id = record.name().ok_or_else(|| anyhow::anyhow!("Missing read name"))?;
-            if read_id.to_vec() != current_id {
-                if !current_id.is_empty() {
-                    total_read_groups += 1;
-                    let id_str = String::from_utf8_lossy(&current_id);
-                    let mut res_batch = Vec::new();
-                    self.process_group_view(&id_str, &alignments, &stand_map, &mut res_batch, &mut local_fsj, chr_tcga_map, &mut validator)?;
-                    for line in res_batch {
-                        writeln!(writer, "{}", line)?;
-                        rescued_lines += 1;
-                    }
-                }
-                current_id = read_id.to_vec();
-                alignments.clear();
-                stand_map.clear();
-                one_read_key = -1;
-            }
+        unsafe { libc::madvise(mmap.as_ptr() as *mut libc::c_void, mmap.len(), libc::MADV_SEQUENTIAL); }
 
-            let flag = i32::from(u16::from(record.flags()));
-            let chrom = match record.reference_sequence(&header) {
-                Some(Ok((name, _))) => String::from_utf8_lossy(name).to_string(),
-                _ => "*".to_string(),
-            };
-            let start_pos = record.alignment_start().transpose()?.map(|p| p.get() as i32).unwrap_or(0);
-            let mapq = record.mapping_quality().map(u8::from).unwrap_or(0) as i32;
-            let mut cigar = String::new();
-            for result in record.cigar().iter() {
-                let op = result?;
-                use noodles::sam::alignment::record::cigar::op::Kind;
-                let op_char = match op.kind() {
-                    Kind::Match => 'M',
-                    Kind::Insertion => 'I',
-                    Kind::Deletion => 'D',
-                    Kind::Skip => 'N',
-                    Kind::SoftClip => 'S',
-                    Kind::HardClip => 'H',
-                    Kind::Pad => 'P',
-                    Kind::SequenceMatch => '=',
-                    Kind::SequenceMismatch => 'X',
-                };
-                cigar.push_str(&format!("{}{}", op.len(), op_char));
-            }
-            let mut seq = String::new();
-            for b in record.sequence().iter() {
-                seq.push(char::from(b));
-            }
-            let s_idx = if flag & 0x40 != 0 { 1 } else { 0 };
-            if s_idx != one_read_key {
-                one_read_key = s_idx;
-                alignments.retain(|a| {
-                    let idx = if a.flag & 0x40 != 0 { 1 } else { 0 };
-                    idx != s_idx
-                });
-                let st_c = if flag & 0x10 != 0 { '1' } else { '0' };
-                stand_map.insert(s_idx, (st_c, Cow::Owned(seq.clone())));
-            }
-            alignments.push(AlignmentRecord {
-                flag,
-                chrom: Cow::Owned(chrom),
-                pos: start_pos,
-                mapq,
-                cigar: Cow::Owned(cigar),
-                seq: Cow::Owned(seq),
-            });
-            if total_records % 100_000 == 0 {
-                pb.set_message(format!(
-                    "Scan 2 (BAM): records={} read_groups={} rescued_lines={} fsj_keys={}",
-                    total_records, total_read_groups, rescued_lines, local_fsj.len()
-                ));
-            }
-        }
+        let header_ref = &header;
+        let shard_results: Vec<HashMap<String, i32>> = (0..num_threads)
+            .into_par_iter()
+            .map(|i| {
+                let start = i * shard_size;
+                let end = if i == num_threads - 1 { mmap.len() } else { (i + 1) * shard_size };
+                let shard_out = format!("{}.shard_{}", output_bsj2, i);
+                let (_, partial_fsj) = self
+                    .process_bam_shard_to_file(&mmap, start, end, header_ref, chr_tcga_map, &pb, &shard_out)
+                    .unwrap_or_default();
+                partial_fsj
+            })
+            .collect();
 
-        if !current_id.is_empty() {
-            total_read_groups += 1;
-            let id_str = String::from_utf8_lossy(&current_id);
-            let mut res_batch = Vec::new();
-            self.process_group_view(&id_str, &alignments, &stand_map, &mut res_batch, &mut local_fsj, chr_tcga_map, &mut validator)?;
-            for line in res_batch {
-                writeln!(writer, "{}", line)?;
-                rescued_lines += 1;
-            }
-        }
-
-        for (key, count) in local_fsj {
-            *self.fsj_map.entry(key).or_insert(0) += count;
-        }
-        writer.flush()?;
         pb.set_position(file_size);
-        pb.finish_with_message(format!(
-            "Scan 2 (BAM): done. records={} read_groups={} rescued_lines={} fsj_keys={}",
-            total_records, total_read_groups, rescued_lines, self.fsj_map.len()
-        ));
-        Ok(())
+        pb.finish_with_message("Scan 2 (BAM): completed");
+        self.merge_shards_and_fsj(output_bsj2, shard_results, num_threads)
     }
 
-    #[allow(dead_code)]
     fn process_bam_shard_to_file(&self, mmap: &Mmap, start: usize, end: usize, header: &sam::Header, chr_tcga_map: &HashMap<String, String>, pb: &ProgressBar, out_path: &str) -> Result<(Vec<String>, HashMap<String, i32>)> {
         use noodles::bam;
         let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
@@ -482,6 +394,9 @@ impl Scan2 {
         if pos >= mmap.len() { return Ok((Vec::new(), local_fsj)); }
 
         let mut reader = bam::io::Reader::new(&mmap[pos..]);
+        if start == 0 {
+            let _ = reader.read_header()?;
+        }
         let mut record = bam::Record::default();
         let mut current_id: Vec<u8> = Vec::new();
         let mut alignments: Vec<AlignmentRecord> = Vec::with_capacity(16);

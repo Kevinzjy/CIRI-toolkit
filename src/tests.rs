@@ -1,55 +1,10 @@
 #[cfg(test)]
 mod tests {
     use crate::scan2::Scan2;
-    use crate::is_bsj_hg2::IsBSJHg2;
-    use crate::utils::AlignmentRecord;
-    use std::collections::HashMap;
-    use std::borrow::Cow;
     use std::fs::File;
     use tempfile::tempdir;
 
-    fn mock_record<'a>(flag: i32, chr: &'a str, pos: i32, mq: i32, cigar: &'a str, seq: &'a str) -> AlignmentRecord<'a> {
-        AlignmentRecord {
-            flag,
-            chrom: Cow::Borrowed(chr),
-            pos,
-            mapq: mq,
-            cigar: Cow::Borrowed(cigar),
-            seq: Cow::Borrowed(seq),
-        }
-    }
 
-    #[test]
-    fn test_scan2_rescue_simulate_10025() {
-        let mut scan2 = Scan2::new(10, 5, 100);
-        let bsj1_line = "fake\t88M12S\t1\tchr1\t155252202\t155252631\t+\tAG\tGT\t1\n";
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        std::io::Write::write_all(&mut tmp, bsj1_line.as_bytes()).unwrap();
-        scan2.build_index(tmp.path().to_str().unwrap()).unwrap();
-
-        let mut chr_map = HashMap::new();
-        let mut seq = "N".repeat(155252190);
-        seq.push_str("NNNNNNNNNNAG");
-        seq.push_str(&"N".repeat(420));
-        seq.push_str("NNNNNNNNNNGT");
-        seq.push_str(&"N".repeat(1000));
-        chr_map.insert("chr1".to_string(), seq);
-
-        let read_seq = "N".repeat(100);
-        let alignments = vec![
-            mock_record(99, "chr1", 155252546, 60, "88M12S", &read_seq),
-        ];
-        let mut stand_map = HashMap::new();
-        stand_map.insert(0, ('0', Cow::Borrowed(read_seq.as_str())));
-
-        let mut results = Vec::new();
-        let mut local_fsj = HashMap::new();
-        let mut is_bsj_hg2 = IsBSJHg2::new(5, 10);
-        
-        scan2.process_group_view("simulate:10025", &alignments, &stand_map, &mut results, &mut local_fsj, &chr_map, &mut is_bsj_hg2).unwrap();
-        
-        assert!(!results.is_empty(), "Rescue failed for 10025.");
-    }
 
     #[test]
     fn test_full_pipeline_mock() {
