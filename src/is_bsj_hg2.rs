@@ -5,6 +5,7 @@
 
 use crate::index_compare::IndexCompare;
 use std::collections::HashMap;
+use std::fmt::Write as FmtWrite;
 
 /// Smith-Waterman local alignment implementation with traceback.
 pub struct SmithWaterman {
@@ -172,42 +173,64 @@ impl IsBSJHg2 {
     }
 
     /// Internal distance check for window-based sequence mapping.
-    fn distance_loci(&self, locus_list: &[i32], locus2_list: &[i32], window_step: i32) -> i32 {
-        if locus_list.len() < 2 && locus2_list.len() < 2 { return 0; }
-        let mut locus_sum = 0;
-        let mut locus2_sum = 0;
-        for i in 1..locus_list.len() { locus_sum += (locus_list[i] - locus_list[i-1]).abs(); }
-        for i in 1..locus2_list.len() { locus2_sum += (locus2_list[i] - locus2_list[i-1]).abs(); }
-        if locus_sum <= window_step * locus_list.len() as i32 && locus_sum * 20 < locus2_sum { 1 } else { 0 }
+    fn distance_loci_stats(&self, locus_count: usize, locus_sum: i32, locus2_count: usize, locus2_sum: i32, window_step: i32) -> i32 {
+        if locus_count < 2 && locus2_count < 2 { return 0; }
+        if locus_sum <= window_step * locus_count as i32 && locus_sum * 20 < locus2_sum { 1 } else { 0 }
     }
 
     /// Linear competition check (Phase 1.1).
     pub fn is_in_circ_rna_1_1(&self, len_str: i32, str_val: &str, circ_range_seq: &str, linear_range: &str) -> i32 {
         for &step in &self.window_unit {
             if len_str < step * 2 { continue; }
-            let mut locus_list = Vec::new();
-            let mut locus2_list = Vec::new();
             let window_size = step * 2;
             let mut trial = (len_str - window_size) / step;
+            let mut locus_count = 0usize;
+            let mut locus2_count = 0usize;
+            let mut locus_sum = 0i32;
+            let mut locus2_sum = 0i32;
+            let mut prev_locus: Option<i32> = None;
+            let mut prev_locus2: Option<i32> = None;
             let mut miss_count = [0, 0, 0]; 
             let mut miss_count2_total = 0;
             for j in 0..=trial {
                 let s_idx = len_str - j * step - window_size;
                 let e_idx = len_str - j * step;
                 let seq = &str_val[s_idx as usize..e_idx as usize];
-                if let Some(pos) = circ_range_seq.rfind(seq) { locus_list.push(pos as i32); miss_count[0] = 0; }
+                if let Some(pos) = circ_range_seq.rfind(seq) {
+                    let pos = pos as i32;
+                    if let Some(prev) = prev_locus { locus_sum += (pos - prev).abs(); }
+                    prev_locus = Some(pos);
+                    locus_count += 1;
+                    miss_count[0] = 0;
+                }
                 else { miss_count[1] += 1; miss_count[0] += 1; if miss_count[0] > miss_count[2] { miss_count[2] = miss_count[0]; } }
-                if let Some(pos2) = linear_range.rfind(seq) { locus2_list.push(pos2 as i32); } else { miss_count2_total += 1; }
+                if let Some(pos2) = linear_range.rfind(seq) {
+                    let pos2 = pos2 as i32;
+                    if let Some(prev) = prev_locus2 { locus2_sum += (pos2 - prev).abs(); }
+                    prev_locus2 = Some(pos2);
+                    locus2_count += 1;
+                } else { miss_count2_total += 1; }
             }
             if len_str % step != 0 {
                 trial += 1;
                 let seq = &str_val[0..window_size as usize];
-                if let Some(pos) = circ_range_seq.rfind(seq) { locus_list.push(pos as i32); miss_count[0] = 0; }
+                if let Some(pos) = circ_range_seq.rfind(seq) {
+                    let pos = pos as i32;
+                    if let Some(prev) = prev_locus { locus_sum += (pos - prev).abs(); }
+                    prev_locus = Some(pos);
+                    locus_count += 1;
+                    miss_count[0] = 0;
+                }
                 else { miss_count[1] += 1; miss_count[0] += 1; if miss_count[0] > miss_count[2] { miss_count[2] = miss_count[0]; } }
-                if let Some(pos2) = linear_range.rfind(seq) { locus2_list.push(pos2 as i32); } else { miss_count2_total += 1; }
+                if let Some(pos2) = linear_range.rfind(seq) {
+                    let pos2 = pos2 as i32;
+                    if let Some(prev) = prev_locus2 { locus2_sum += (pos2 - prev).abs(); }
+                    prev_locus2 = Some(pos2);
+                    locus2_count += 1;
+                } else { miss_count2_total += 1; }
             }
-            if miss_count2_total == 0 && miss_count[1] == 0 { if self.distance_loci(&locus_list, &locus2_list, step) == 1 { return 1; } else { return 0; } }
-            else if miss_count2_total <= miss_count[1] { if !locus2_list.is_empty() { return 0; } }
+            if miss_count2_total == 0 && miss_count[1] == 0 { if self.distance_loci_stats(locus_count, locus_sum, locus2_count, locus2_sum, step) == 1 { return 1; } else { return 0; } }
+            else if miss_count2_total <= miss_count[1] { if locus2_count != 0 { return 0; } }
             else if miss_count[2] > 5 || miss_count[1] * 2 > trial { continue; } else { return 1; }
         }
         0
@@ -217,29 +240,55 @@ impl IsBSJHg2 {
     pub fn is_in_circ_rna_1_2(&self, len_str: i32, str_val: &str, circ_range_seq: &str, linear_range: &str) -> i32 {
         for &step in &self.window_unit {
             if len_str < step * 2 { continue; }
-            let mut locus_list = Vec::new();
-            let mut locus2_list = Vec::new();
             let window_size = step * 2;
             let mut trial = (len_str - window_size) / step;
+            let mut locus_count = 0usize;
+            let mut locus2_count = 0usize;
+            let mut locus_sum = 0i32;
+            let mut locus2_sum = 0i32;
+            let mut prev_locus: Option<i32> = None;
+            let mut prev_locus2: Option<i32> = None;
             let mut miss_count = [0, 0, 0];
             let mut miss_count2_total = 0;
             for j in 0..=trial {
                 let s_idx = j * step;
                 let e_idx = j * step + window_size;
                 let seq = &str_val[s_idx as usize..e_idx as usize];
-                if let Some(pos) = circ_range_seq.find(seq) { locus_list.push(pos as i32); miss_count[0] = 0; }
+                if let Some(pos) = circ_range_seq.find(seq) {
+                    let pos = pos as i32;
+                    if let Some(prev) = prev_locus { locus_sum += (pos - prev).abs(); }
+                    prev_locus = Some(pos);
+                    locus_count += 1;
+                    miss_count[0] = 0;
+                }
                 else { miss_count[1] += 1; miss_count[0] += 1; if miss_count[0] > miss_count[2] { miss_count[2] = miss_count[0]; } }
-                if let Some(pos2) = linear_range.find(seq) { locus2_list.push(pos2 as i32); } else { miss_count2_total += 1; }
+                if let Some(pos2) = linear_range.find(seq) {
+                    let pos2 = pos2 as i32;
+                    if let Some(prev) = prev_locus2 { locus2_sum += (pos2 - prev).abs(); }
+                    prev_locus2 = Some(pos2);
+                    locus2_count += 1;
+                } else { miss_count2_total += 1; }
             }
             if len_str % step != 0 {
                 trial += 1;
                 let seq = &str_val[(len_str - window_size) as usize..len_str as usize];
-                if let Some(pos) = circ_range_seq.find(seq) { locus_list.push(pos as i32); miss_count[0] = 0; }
+                if let Some(pos) = circ_range_seq.find(seq) {
+                    let pos = pos as i32;
+                    if let Some(prev) = prev_locus { locus_sum += (pos - prev).abs(); }
+                    prev_locus = Some(pos);
+                    locus_count += 1;
+                    miss_count[0] = 0;
+                }
                 else { miss_count[1] += 1; miss_count[0] += 1; if miss_count[0] > miss_count[2] { miss_count[2] = miss_count[0]; } }
-                if let Some(pos2) = linear_range.find(seq) { locus2_list.push(pos2 as i32); } else { miss_count2_total += 1; }
+                if let Some(pos2) = linear_range.find(seq) {
+                    let pos2 = pos2 as i32;
+                    if let Some(prev) = prev_locus2 { locus2_sum += (pos2 - prev).abs(); }
+                    prev_locus2 = Some(pos2);
+                    locus2_count += 1;
+                } else { miss_count2_total += 1; }
             }
-            if miss_count2_total == 0 && miss_count[1] == 0 { if self.distance_loci(&locus_list, &locus2_list, step) == 1 { return 1; } else { return 0; } }
-            else if miss_count2_total <= miss_count[1] { if !locus2_list.is_empty() { return 0; } }
+            if miss_count2_total == 0 && miss_count[1] == 0 { if self.distance_loci_stats(locus_count, locus_sum, locus2_count, locus2_sum, step) == 1 { return 1; } else { return 0; } }
+            else if miss_count2_total <= miss_count[1] { if locus2_count != 0 { return 0; } }
             else if miss_count[2] > 5 || miss_count[1] * 2 > trial { continue; } else { return 1; }
         }
         0
@@ -266,18 +315,31 @@ impl IsBSJHg2 {
         let window_step = 5; let window_size = 10;
         let trial = (ano_read_len - window_size) / window_step;
         let mut miss_count = [0, 0, 0]; let mut miss_count2_total = 0;
-        let mut locus_list = Vec::new(); let mut locus2_list = Vec::new();
+        let mut locus_count = 0usize; let mut locus2_count = 0usize;
+        let mut locus_sum = 0i32; let mut locus2_sum = 0i32;
+        let mut prev_locus: Option<i32> = None; let mut prev_locus2: Option<i32> = None;
         for j in 0..=trial {
             let seq = &ano_read[(j * window_step) as usize..(window_size + j * window_step) as usize];
-            if let Some(pos) = circ_range_seq.find(seq) { locus_list.push(pos as i32); miss_count[0] = 0; }
+            if let Some(pos) = circ_range_seq.find(seq) {
+                let pos = pos as i32;
+                if let Some(prev) = prev_locus { locus_sum += (pos - prev).abs(); }
+                prev_locus = Some(pos);
+                locus_count += 1;
+                miss_count[0] = 0;
+            }
             else { miss_count[1] += 1; miss_count[0] += 1; if miss_count[0] > miss_count[2] { miss_count[2] = miss_count[0]; } }
             if !pem_null_range_seq.is_empty() {
-                if let Some(pos2) = pem_null_range_seq.find(seq) { locus2_list.push(pos2 as i32); } else { miss_count2_total += 1; }
+                if let Some(pos2) = pem_null_range_seq.find(seq) {
+                    let pos2 = pos2 as i32;
+                    if let Some(prev) = prev_locus2 { locus2_sum += (pos2 - prev).abs(); }
+                    prev_locus2 = Some(pos2);
+                    locus2_count += 1;
+                } else { miss_count2_total += 1; }
             }
         }
         if !pem_null_range_seq.is_empty() {
-            if miss_count2_total == 0 && miss_count[1] == 0 { if self.distance_loci(&locus_list, &locus2_list, window_step) == 1 { return 1; } else { return -2; } }
-            else if miss_count2_total <= miss_count[1] { if !locus2_list.is_empty() { return -2; } else { return -1; } }
+            if miss_count2_total == 0 && miss_count[1] == 0 { if self.distance_loci_stats(locus_count, locus_sum, locus2_count, locus2_sum, window_step) == 1 { return 1; } else { return -2; } }
+            else if miss_count2_total <= miss_count[1] { if locus2_count != 0 { return -2; } else { return -1; } }
             else if miss_count[1] * 4 > trial * 3 && pre_judge == "0" { return -2; }
             else if miss_count[2] > 5 || miss_count[1] * 2 > trial { return -1; } else { return 1; }
         } else {
@@ -318,44 +380,68 @@ impl IsBSJHg2 {
         }
 
         let mut index_strand_map = if circ_line_arr[1] == mitochondrion || sp_label { IndexCompare::index_compare_chrm(&end_string1, &end_string2) } else { IndexCompare::index_compare(&end_string1, &end_string2) };
+        let chr = circ_line_arr[1].as_str();
+        let mut start_key = String::with_capacity(chr.len() + 16);
+        let mut end_key = String::with_capacity(chr.len() + 16);
         for i in 0..=adjt_bp {
-            let start_key = format!("{}\t{}", circ_line_arr[1], tmp_site1 + i);
-            let end_key = format!("{}\t{}", circ_line_arr[1], tmp_site2 + i);
-            if !index_strand_map.contains_key(&i) && chr_exon_start_map.contains_key(&start_key) && chr_exon_end_map.contains_key(&end_key) {
-                let gene_stand = chr_exon_start_map.get(&start_key).unwrap();
-                if gene_stand == chr_exon_end_map.get(&end_key).unwrap() {
-                    let parts: Vec<&str> = gene_stand.split('\t').collect();
-                    index_strand_map.insert(i, format!("{}\t{}\t{}\t{}", i, parts[1], java_substring(chr_taga, tmp_site1 + i - 3, tmp_site1 + i - 1), java_substring(chr_taga, tmp_site2 + i, tmp_site2 + i + 2)));
+            start_key.clear();
+            start_key.push_str(chr);
+            start_key.push('\t');
+            let _ = write!(&mut start_key, "{}", tmp_site1 + i);
+            end_key.clear();
+            end_key.push_str(chr);
+            end_key.push('\t');
+            let _ = write!(&mut end_key, "{}", tmp_site2 + i);
+            if !index_strand_map.contains_key(&i) {
+                if let (Some(gene_start), Some(gene_end)) = (chr_exon_start_map.get(&start_key), chr_exon_end_map.get(&end_key)) {
+                    if gene_start == gene_end {
+                        let mut parts = gene_start.split('\t');
+                        let _ = parts.next();
+                        let strand = parts.next().unwrap_or("");
+                        index_strand_map.insert(i, format!("{}\t{}\t{}\t{}", i, strand, java_substring(chr_taga, tmp_site1 + i - 3, tmp_site1 + i - 1), java_substring(chr_taga, tmp_site2 + i, tmp_site2 + i + 2)));
+                    }
                 }
             }
         }
 
         if !index_strand_map.is_empty() {
             for (&shift, sig) in &index_strand_map {
-                let shift_arr: Vec<&str> = sig.split('\t').collect();
+                let mut shift_parts = sig.split('\t');
+                let _shift_idx = shift_parts.next().unwrap_or("");
+                let shift_strand = shift_parts.next().unwrap_or("");
+                let shift_left = shift_parts.next().unwrap_or("");
+                let shift_right = shift_parts.next().unwrap_or("");
                 let diff_adjt = if end_adjt2 >= 0 { shift - 1 - end_adjt1 } else { shift - 1 + total_adjustment - end_adjt1 };
                 let site1_new = site1 + diff_adjt; let site2_new = site2 + diff_adjt;
                 let mut str_new = ["".to_string(), "".to_string()];
                 if diff_adjt >= 0 {
                     let str_adj = java_substring(&circ_line_arr[2], 0, diff_adjt);
-                    str_new[1] = format!("{}{}", circ_line_arr[3], str_adj);
+                    str_new[1] = String::with_capacity(circ_line_arr[3].len() + str_adj.len());
+                    str_new[1].push_str(&circ_line_arr[3]);
+                    str_new[1].push_str(str_adj);
                     str_new[0] = java_substring(&circ_line_arr[2], diff_adjt, circ_line_arr[2].len() as i32).to_string();
                 } else {
                     let str_adj = java_substring(&circ_line_arr[3], circ_line_arr[3].len() as i32 + diff_adjt, circ_line_arr[3].len() as i32);
-                    str_new[0] = format!("{}{}", str_adj, circ_line_arr[2]);
+                    str_new[0] = String::with_capacity(str_adj.len() + circ_line_arr[2].len());
+                    str_new[0].push_str(str_adj);
+                    str_new[0].push_str(&circ_line_arr[2]);
                     str_new[1] = java_substring(&circ_line_arr[3], 0, circ_line_arr[3].len() as i32 + diff_adjt).to_string();
                 }
-                str_new[0] = format!("{}{}", shift_arr[2], str_new[0]); str_new[1] = format!("{}{}", str_new[1], shift_arr[3]);
+                {
+                    let mut merged = String::with_capacity(shift_left.len() + str_new[0].len());
+                    merged.push_str(shift_left);
+                    merged.push_str(&str_new[0]);
+                    str_new[0] = merged;
+                }
+                str_new[1].push_str(shift_right);
                 let initial_seq1 = java_substring(&str_new[0], 0, self.initial_size1);
                 let initial_seq2 = java_substring(&str_new[1], str_new[1].len() as i32 - self.initial_size1, str_new[1].len() as i32);
                 let circ_range_seq = if site1_new - 3 < 0 && site2_new + 2 > chr_taga_len { &chr_taga[..] }
                 else if site1_new - 3 < 0 { java_substring(chr_taga, 0, site2_new + 2) }
                 else if site2_new + 2 > chr_taga_len { java_substring(chr_taga, site1_new - 3, chr_taga_len) }
                 else { java_substring(chr_taga, site1_new - 3, site2_new + 2) };
-                let circ_range_len = circ_range_seq.len() as i32;
-
-                if java_substring(circ_range_seq, 0, initial_seq1.len() as i32) == initial_seq1 &&
-                   java_substring(circ_range_seq, circ_range_len - initial_seq2.len() as i32, circ_range_len) == initial_seq2 {
+                if circ_range_seq.starts_with(initial_seq1) &&
+                   circ_range_seq.ends_with(initial_seq2) {
                     for i in 0..=1 {
                         if circ_line_arr[6 + i] != "1" {
                             let linear_range;
@@ -401,7 +487,7 @@ impl IsBSJHg2 {
                             };
                             tag = self.is_in_circ_rna_3(&circ_line_arr[5], &circ_line_arr[8], circ_range_seq, pem_null);
                         }
-                        return Some(format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", tag, circ_line_arr[1], site1_new, site2_new, shift_arr[1], shift_arr[2], shift_arr[3], sum_q));
+                        return Some(format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", tag, circ_line_arr[1], site1_new, site2_new, shift_strand, shift_left, shift_right, sum_q));
                     }
                 }
             }
