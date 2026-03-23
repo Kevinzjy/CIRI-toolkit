@@ -6,6 +6,124 @@
 use crate::index_compare::IndexCompare;
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+#[derive(Default)]
+struct HgProfile {
+    hg1_total_ns: AtomicU64,
+    hg1_calls: AtomicU64,
+    index_compare_ns: AtomicU64,
+    index_compare_calls: AtomicU64,
+    exon_lookup_ns: AtomicU64,
+    exon_lookup_calls: AtomicU64,
+    shift_prepare_ns: AtomicU64,
+    shift_prepare_calls: AtomicU64,
+    shift_entries: AtomicU64,
+    linear_check_ns: AtomicU64,
+    linear_check_calls: AtomicU64,
+    circ2_ns: AtomicU64,
+    circ2_calls: AtomicU64,
+    circ3_ns: AtomicU64,
+    circ3_calls: AtomicU64,
+    hg1_hits: AtomicU64,
+    sw_ns: AtomicU64,
+    sw_calls: AtomicU64,
+}
+
+static HG_PROFILE: HgProfile = HgProfile {
+    hg1_total_ns: AtomicU64::new(0),
+    hg1_calls: AtomicU64::new(0),
+    index_compare_ns: AtomicU64::new(0),
+    index_compare_calls: AtomicU64::new(0),
+    exon_lookup_ns: AtomicU64::new(0),
+    exon_lookup_calls: AtomicU64::new(0),
+    shift_prepare_ns: AtomicU64::new(0),
+    shift_prepare_calls: AtomicU64::new(0),
+    shift_entries: AtomicU64::new(0),
+    linear_check_ns: AtomicU64::new(0),
+    linear_check_calls: AtomicU64::new(0),
+    circ2_ns: AtomicU64::new(0),
+    circ2_calls: AtomicU64::new(0),
+    circ3_ns: AtomicU64::new(0),
+    circ3_calls: AtomicU64::new(0),
+    hg1_hits: AtomicU64::new(0),
+    sw_ns: AtomicU64::new(0),
+    sw_calls: AtomicU64::new(0),
+};
+
+#[inline]
+fn scan1_profile_enabled() -> bool {
+    matches!(std::env::var("CIRI_PROFILE_SCAN1"), Ok(v) if !v.is_empty() && v != "0")
+}
+
+#[inline]
+fn add_ns(counter: &AtomicU64, started: Instant) {
+    counter.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+pub fn report_scan1_hg_profile() {
+    if !scan1_profile_enabled() {
+        return;
+    }
+    let hg1_total_ns = HG_PROFILE.hg1_total_ns.load(Ordering::Relaxed);
+    let hg1_calls = HG_PROFILE.hg1_calls.load(Ordering::Relaxed);
+    let index_compare_ns = HG_PROFILE.index_compare_ns.load(Ordering::Relaxed);
+    let index_compare_calls = HG_PROFILE.index_compare_calls.load(Ordering::Relaxed);
+    let exon_lookup_ns = HG_PROFILE.exon_lookup_ns.load(Ordering::Relaxed);
+    let exon_lookup_calls = HG_PROFILE.exon_lookup_calls.load(Ordering::Relaxed);
+    let shift_prepare_ns = HG_PROFILE.shift_prepare_ns.load(Ordering::Relaxed);
+    let shift_prepare_calls = HG_PROFILE.shift_prepare_calls.load(Ordering::Relaxed);
+    let shift_entries = HG_PROFILE.shift_entries.load(Ordering::Relaxed);
+    let linear_check_ns = HG_PROFILE.linear_check_ns.load(Ordering::Relaxed);
+    let linear_check_calls = HG_PROFILE.linear_check_calls.load(Ordering::Relaxed);
+    let circ2_ns = HG_PROFILE.circ2_ns.load(Ordering::Relaxed);
+    let circ2_calls = HG_PROFILE.circ2_calls.load(Ordering::Relaxed);
+    let circ3_ns = HG_PROFILE.circ3_ns.load(Ordering::Relaxed);
+    let circ3_calls = HG_PROFILE.circ3_calls.load(Ordering::Relaxed);
+    let hg1_hits = HG_PROFILE.hg1_hits.load(Ordering::Relaxed);
+    let sw_ns = HG_PROFILE.sw_ns.load(Ordering::Relaxed);
+    let sw_calls = HG_PROFILE.sw_calls.load(Ordering::Relaxed);
+    let known_ns = index_compare_ns
+        .saturating_add(exon_lookup_ns)
+        .saturating_add(shift_prepare_ns)
+        .saturating_add(linear_check_ns)
+        .saturating_add(circ2_ns)
+        .saturating_add(circ3_ns);
+    let other_ns = hg1_total_ns.saturating_sub(known_ns);
+    let pct = |part: u64, whole: u64| -> f64 {
+        if whole == 0 { 0.0 } else { part as f64 * 100.0 / whole as f64 }
+    };
+    eprintln!(
+        "[PROFILE_SCAN1_HG1] calls={} hits={} shift_entries={} sw_calls={}",
+        hg1_calls, hg1_hits, shift_entries, sw_calls
+    );
+    eprintln!(
+        "[PROFILE_SCAN1_HG1] total_ms={:.3} index_compare_ms={:.3} ({:.1}%, calls={}) exon_lookup_ms={:.3} ({:.1}%, calls={}) shift_prepare_ms={:.3} ({:.1}%, calls={}) linear_check_ms={:.3} ({:.1}%, calls={}) circ2_ms={:.3} ({:.1}%, calls={}) circ3_ms={:.3} ({:.1}%, calls={}) other_ms={:.3} ({:.1}%) sw_ms={:.3}",
+        hg1_total_ns as f64 / 1_000_000.0,
+        index_compare_ns as f64 / 1_000_000.0,
+        pct(index_compare_ns, hg1_total_ns),
+        index_compare_calls,
+        exon_lookup_ns as f64 / 1_000_000.0,
+        pct(exon_lookup_ns, hg1_total_ns),
+        exon_lookup_calls,
+        shift_prepare_ns as f64 / 1_000_000.0,
+        pct(shift_prepare_ns, hg1_total_ns),
+        shift_prepare_calls,
+        linear_check_ns as f64 / 1_000_000.0,
+        pct(linear_check_ns, hg1_total_ns),
+        linear_check_calls,
+        circ2_ns as f64 / 1_000_000.0,
+        pct(circ2_ns, hg1_total_ns),
+        circ2_calls,
+        circ3_ns as f64 / 1_000_000.0,
+        pct(circ3_ns, hg1_total_ns),
+        circ3_calls,
+        other_ns as f64 / 1_000_000.0,
+        pct(other_ns, hg1_total_ns),
+        sw_ns as f64 / 1_000_000.0,
+    );
+}
 
 /// Smith-Waterman local alignment implementation with traceback.
 pub struct SmithWaterman {
@@ -41,12 +159,17 @@ impl SmithWaterman {
 
     /// Performs local alignment and traceback to calculate the optimal score and aligned length.
     pub fn align(&mut self) {
+        let sw_started = scan1_profile_enabled().then(Instant::now);
         // Java parity (`smith` package): table rows = seq2, cols = seq1.
         let cols = self.seq1.len();
         let rows = self.seq2.len();
         if cols == 0 || rows == 0 {
             self.score = 0;
             self.aligned_len = 0;
+            if let Some(sw_started) = sw_started {
+                HG_PROFILE.sw_calls.fetch_add(1, Ordering::Relaxed);
+                add_ns(&HG_PROFILE.sw_ns, sw_started);
+            }
             return;
         }
 
@@ -138,6 +261,10 @@ impl SmithWaterman {
             }
         }
         self.score = total;
+        if let Some(sw_started) = sw_started {
+            HG_PROFILE.sw_calls.fetch_add(1, Ordering::Relaxed);
+            add_ns(&HG_PROFILE.sw_ns, sw_started);
+        }
     }
 }
 
@@ -300,6 +427,9 @@ impl IsBSJHg2 {
         let window_step = 5; let window_size = 10;
         let mut miss_count3 = [0, 0, 0];
         let trial = (seq_len - window_size) / window_step;
+        if trial < 0 {
+            return 1;
+        }
         for j in 0..=trial {
             let seq = if seq_len <= 10 { unmap_seq } else { &unmap_seq[(j * window_step) as usize..(j * window_step + window_size) as usize] };
             if circ_range_seq.contains(seq) { miss_count3[0] = 0; }
@@ -309,36 +439,120 @@ impl IsBSJHg2 {
         1
     }
 
+    #[inline]
+    fn encode_window_base(base: u8) -> u32 {
+        match base {
+            b'A' | b'a' => 0,
+            b'C' | b'c' => 1,
+            b'G' | b'g' => 2,
+            b'T' | b't' => 3,
+            b'N' | b'n' => 4,
+            _ => 7,
+        }
+    }
+
+    #[inline]
+    fn encode_window(seq: &[u8]) -> u32 {
+        let mut code = 0u32;
+        for &base in seq {
+            code = (code << 3) | Self::encode_window_base(base);
+        }
+        code
+    }
+
+    fn find_window_positions(query_codes: &[u32], haystack: &[u8], out: &mut [i32]) {
+        const WINDOW_SIZE: usize = 10;
+        const KEEP_LAST_9_BASES_MASK: u32 = (1 << 27) - 1;
+
+        if haystack.len() < WINDOW_SIZE || query_codes.is_empty() {
+            return;
+        }
+
+        let mut remaining = out.len();
+        let mut rolling_code = Self::encode_window(&haystack[..WINDOW_SIZE]);
+        let last_start = haystack.len() - WINDOW_SIZE;
+
+        for start in 0..=last_start {
+            if start != 0 {
+                rolling_code = ((rolling_code & KEEP_LAST_9_BASES_MASK) << 3)
+                    | Self::encode_window_base(haystack[start + WINDOW_SIZE - 1]);
+            }
+
+            for (idx, &query_code) in query_codes.iter().enumerate() {
+                if out[idx] == -1 && query_code == rolling_code {
+                    out[idx] = start as i32;
+                    remaining -= 1;
+                }
+            }
+
+            if remaining == 0 {
+                break;
+            }
+        }
+    }
+
     /// Validates sequence mapping for mate reads (Phase 3).
     pub fn is_in_circ_rna_3(&self, ano_read: &str, pre_judge: &str, circ_range_seq: &str, pem_null_range_seq: &str) -> i32 {
+        const WINDOW_STEP: usize = 5;
+        const WINDOW_SIZE: usize = 10;
         let ano_read_len = ano_read.len() as i32;
-        let window_step = 5; let window_size = 10;
-        let trial = (ano_read_len - window_size) / window_step;
+        let trial = (ano_read_len - WINDOW_SIZE as i32) / WINDOW_STEP as i32;
+        if trial < 0 {
+            if !pem_null_range_seq.is_empty() {
+                return -2;
+            }
+            return 1;
+        }
         let mut miss_count = [0, 0, 0]; let mut miss_count2_total = 0;
         let mut locus_count = 0usize; let mut locus2_count = 0usize;
         let mut locus_sum = 0i32; let mut locus2_sum = 0i32;
         let mut prev_locus: Option<i32> = None; let mut prev_locus2: Option<i32> = None;
-        for j in 0..=trial {
-            let seq = &ano_read[(j * window_step) as usize..(window_size + j * window_step) as usize];
-            if let Some(pos) = circ_range_seq.find(seq) {
-                let pos = pos as i32;
+        let ano_read_bytes = ano_read.as_bytes();
+        let window_count = trial.max(0) as usize + 1;
+        let mut query_codes = Vec::with_capacity(window_count);
+        for j in 0..window_count {
+            let start = j * WINDOW_STEP;
+            let end = start + WINDOW_SIZE;
+            query_codes.push(Self::encode_window(&ano_read_bytes[start..end]));
+        }
+
+        let mut circ_positions = vec![-1; window_count];
+        Self::find_window_positions(&query_codes, circ_range_seq.as_bytes(), &mut circ_positions);
+
+        let mut pem_positions = if pem_null_range_seq.is_empty() {
+            None
+        } else {
+            let mut positions = vec![-1; window_count];
+            Self::find_window_positions(&query_codes, pem_null_range_seq.as_bytes(), &mut positions);
+            Some(positions)
+        };
+
+        for j in 0..window_count {
+            let pos = circ_positions[j];
+            if pos >= 0 {
                 if let Some(prev) = prev_locus { locus_sum += (pos - prev).abs(); }
                 prev_locus = Some(pos);
                 locus_count += 1;
                 miss_count[0] = 0;
+            } else {
+                miss_count[1] += 1;
+                miss_count[0] += 1;
+                if miss_count[0] > miss_count[2] { miss_count[2] = miss_count[0]; }
             }
-            else { miss_count[1] += 1; miss_count[0] += 1; if miss_count[0] > miss_count[2] { miss_count[2] = miss_count[0]; } }
-            if !pem_null_range_seq.is_empty() {
-                if let Some(pos2) = pem_null_range_seq.find(seq) {
-                    let pos2 = pos2 as i32;
+
+            if let Some(ref mut pem_positions) = pem_positions {
+                let pos2 = pem_positions[j];
+                if pos2 >= 0 {
                     if let Some(prev) = prev_locus2 { locus2_sum += (pos2 - prev).abs(); }
                     prev_locus2 = Some(pos2);
                     locus2_count += 1;
-                } else { miss_count2_total += 1; }
+                } else {
+                    miss_count2_total += 1;
+                }
             }
         }
         if !pem_null_range_seq.is_empty() {
-            if miss_count2_total == 0 && miss_count[1] == 0 { if self.distance_loci_stats(locus_count, locus_sum, locus2_count, locus2_sum, window_step) == 1 { return 1; } else { return -2; } }
+            if miss_count2_total == 0 && miss_count[1] == 0 { if self.distance_loci_stats(locus_count, locus_sum, locus2_count, locus2_sum, WINDOW_STEP as i32) == 1 { return 1; } else { return -2; } }
             else if miss_count2_total <= miss_count[1] { if locus2_count != 0 { return -2; } else { return -1; } }
             else if miss_count[1] * 4 > trial * 3 && pre_judge == "0" { return -2; }
             else if miss_count[2] > 5 || miss_count[1] * 2 > trial { return -1; } else { return 1; }
@@ -351,6 +565,8 @@ impl IsBSJHg2 {
 
     /// High-level BSJ identification from Scan 1 metadata.
     pub fn is_bsj_hg1(&mut self, circ_line_arr: &mut [String], chr_taga: &str, sum_q: i32, mitochondrion: &str, sp_label: bool, chr_exon_start_map: &HashMap<String, String>, chr_exon_end_map: &HashMap<String, String>) -> Option<String> {
+        let hg1_started = scan1_profile_enabled().then(Instant::now);
+        HG_PROFILE.hg1_calls.fetch_add(1, Ordering::Relaxed);
         let site1 = circ_line_arr[9].parse::<i32>().unwrap_or(0);
         let site2 = circ_line_arr[10].parse::<i32>().unwrap_or(0);
         let end_adjt1 = circ_line_arr[11].parse::<i32>().unwrap_or(0);
@@ -379,10 +595,16 @@ impl IsBSJHg2 {
             end_string2 = java_substring(chr_taga, site2 + end_adjt2 - 1, 3 + site2 - end_adjt1).to_string();
         }
 
+        let index_compare_started = scan1_profile_enabled().then(Instant::now);
         let mut index_strand_map = if circ_line_arr[1] == mitochondrion || sp_label { IndexCompare::index_compare_chrm(&end_string1, &end_string2) } else { IndexCompare::index_compare(&end_string1, &end_string2) };
+        if let Some(index_compare_started) = index_compare_started {
+            HG_PROFILE.index_compare_calls.fetch_add(1, Ordering::Relaxed);
+            add_ns(&HG_PROFILE.index_compare_ns, index_compare_started);
+        }
         let chr = circ_line_arr[1].as_str();
         let mut start_key = String::with_capacity(chr.len() + 16);
         let mut end_key = String::with_capacity(chr.len() + 16);
+        let exon_lookup_started = scan1_profile_enabled().then(Instant::now);
         for i in 0..=adjt_bp {
             start_key.clear();
             start_key.push_str(chr);
@@ -403,9 +625,14 @@ impl IsBSJHg2 {
                 }
             }
         }
+        if let Some(exon_lookup_started) = exon_lookup_started {
+            HG_PROFILE.exon_lookup_calls.fetch_add(1, Ordering::Relaxed);
+            add_ns(&HG_PROFILE.exon_lookup_ns, exon_lookup_started);
+        }
 
         if !index_strand_map.is_empty() {
             for (&shift, sig) in &index_strand_map {
+                HG_PROFILE.shift_entries.fetch_add(1, Ordering::Relaxed);
                 let mut shift_parts = sig.split('\t');
                 let _shift_idx = shift_parts.next().unwrap_or("");
                 let shift_strand = shift_parts.next().unwrap_or("");
@@ -413,6 +640,7 @@ impl IsBSJHg2 {
                 let shift_right = shift_parts.next().unwrap_or("");
                 let diff_adjt = if end_adjt2 >= 0 { shift - 1 - end_adjt1 } else { shift - 1 + total_adjustment - end_adjt1 };
                 let site1_new = site1 + diff_adjt; let site2_new = site2 + diff_adjt;
+                let shift_prepare_started = scan1_profile_enabled().then(Instant::now);
                 let mut str_new = ["".to_string(), "".to_string()];
                 if diff_adjt >= 0 {
                     let str_adj = java_substring(&circ_line_arr[2], 0, diff_adjt);
@@ -440,6 +668,10 @@ impl IsBSJHg2 {
                 else if site1_new - 3 < 0 { java_substring(chr_taga, 0, site2_new + 2) }
                 else if site2_new + 2 > chr_taga_len { java_substring(chr_taga, site1_new - 3, chr_taga_len) }
                 else { java_substring(chr_taga, site1_new - 3, site2_new + 2) };
+                if let Some(shift_prepare_started) = shift_prepare_started {
+                    HG_PROFILE.shift_prepare_calls.fetch_add(1, Ordering::Relaxed);
+                    add_ns(&HG_PROFILE.shift_prepare_ns, shift_prepare_started);
+                }
                 if circ_range_seq.starts_with(initial_seq1) &&
                    circ_range_seq.ends_with(initial_seq2) {
                     for i in 0..=1 {
@@ -452,11 +684,29 @@ impl IsBSJHg2 {
                                 if site2_new - site1_new + 5 >= self.linear_range_size_min { if 2 * site2_new - site1_new + 5 > chr_taga_len { linear_range = java_substring(chr_taga, site2_new, chr_taga_len); } else { linear_range = java_substring(chr_taga, site2_new, 2 * site2_new - site1_new + 5); } }
                                 else { if site2_new + self.linear_range_size_min > chr_taga_len { linear_range = java_substring(chr_taga, site2_new, chr_taga_len); } else { linear_range = java_substring(chr_taga, site2_new, site2_new + self.linear_range_size_min); } }
                             }
+                            let linear_started = scan1_profile_enabled().then(Instant::now);
                             circ_line_arr[6 + i] = self.is_in_circ_rna_1_2(str_new[i].len() as i32, &str_new[i], circ_range_seq, linear_range).to_string();
+                            if let Some(linear_started) = linear_started {
+                                HG_PROFILE.linear_check_calls.fetch_add(1, Ordering::Relaxed);
+                                add_ns(&HG_PROFILE.linear_check_ns, linear_started);
+                            }
                         }
                     }
                     if circ_line_arr[6] == "1" && circ_line_arr[7] == "1" {
-                        if circ_line_arr[4] != "*" && self.is_in_circ_rna_2(&circ_line_arr[4], circ_range_seq) == 0 { return None; }
+                        if circ_line_arr[4] != "*" {
+                            let circ2_started = scan1_profile_enabled().then(Instant::now);
+                            let circ2_ok = self.is_in_circ_rna_2(&circ_line_arr[4], circ_range_seq);
+                            if let Some(circ2_started) = circ2_started {
+                                HG_PROFILE.circ2_calls.fetch_add(1, Ordering::Relaxed);
+                                add_ns(&HG_PROFILE.circ2_ns, circ2_started);
+                            }
+                            if circ2_ok == 0 {
+                                if let Some(hg1_started) = hg1_started {
+                                    add_ns(&HG_PROFILE.hg1_total_ns, hg1_started);
+                                }
+                                return None;
+                            }
+                        }
                         let mut tag = 1;
                         if circ_line_arr[5].len() > 5 {
                             // Java parity: preserve original branch order/conditions.
@@ -485,12 +735,24 @@ impl IsBSJHg2 {
                                     java_substring(chr_taga, site2_new, site2_new + self.linear_range_size_min)
                                 }
                             };
+                            let circ3_started = scan1_profile_enabled().then(Instant::now);
                             tag = self.is_in_circ_rna_3(&circ_line_arr[5], &circ_line_arr[8], circ_range_seq, pem_null);
+                            if let Some(circ3_started) = circ3_started {
+                                HG_PROFILE.circ3_calls.fetch_add(1, Ordering::Relaxed);
+                                add_ns(&HG_PROFILE.circ3_ns, circ3_started);
+                            }
+                        }
+                        HG_PROFILE.hg1_hits.fetch_add(1, Ordering::Relaxed);
+                        if let Some(hg1_started) = hg1_started {
+                            add_ns(&HG_PROFILE.hg1_total_ns, hg1_started);
                         }
                         return Some(format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", tag, circ_line_arr[1], site1_new, site2_new, shift_strand, shift_left, shift_right, sum_q));
                     }
                 }
             }
+        }
+        if let Some(hg1_started) = hg1_started {
+            add_ns(&HG_PROFILE.hg1_total_ns, hg1_started);
         }
         None
     }

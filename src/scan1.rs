@@ -3,19 +3,20 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File};
-use std::io::{Write, BufWriter, BufRead, BufReader};
+use std::io::{Write, BufWriter, BufRead, BufReader, Seek};
 use std::borrow::Cow;
 use std::fmt::Write as FmtWrite;
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Result;
 use rayon::prelude::*;
 use memmap2::Mmap;
-use memchr::memchr;
-use noodles::sam::{self, alignment::Record as _};
+use noodles::sam::{self, alignment::{Record as _, record::Sequence as _}};
 use indicatif::{ProgressBar, ProgressStyle};
 use crate::misd::misd;
-use crate::is_bsj_hg2::{IsBSJHg2, java_substring};
+use crate::is_bsj_hg2::{IsBSJHg2, java_substring, report_scan1_hg_profile};
 use crate::annotation::Annotation;
 use crate::utils::AlignmentRecord;
 
@@ -28,11 +29,14 @@ pub struct Scan1 {
     pub read_len: i32,
 }
 
-#[inline]
-fn fast_parse_i32(bytes: &[u8]) -> i32 {
-    let mut res = 0;
-    for &b in bytes { if b >= b'0' && b <= b'9' { res = res * 10 + (b - b'0') as i32; } }
-    res
+type OwnedAlignmentRecord = AlignmentRecord<'static>;
+type OwnedStandMap = HashMap<i32, (char, Cow<'static, str>)>;
+
+struct SamOwnedGroup {
+    read_id: String,
+    group: [Vec<OwnedAlignmentRecord>; 2],
+    stand_map: OwnedStandMap,
+    align_num: usize,
 }
 
 /// Active Page Cache eviction with strict alignment.
@@ -119,6 +123,7 @@ impl Scan1Profile {
             other_shard_ns as f64 / 1_000_000.0,
             pct(other_shard_ns, shard_total_ns),
         );
+        report_scan1_hg_profile();
     }
 }
 
@@ -148,27 +153,200 @@ impl Scan1 {
     }
 
     pub fn run_sam(&mut self, sam_file: &str, out_prefix: &str, fasta_map: &HashMap<String, String>, annotation: &Annotation) -> Result<HashSet<String>> {
-        let file = File::open(sam_file)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        let file_size = mmap.len();
-        let num_threads = rayon::current_num_threads().max(1);
-        let shard_size = file_size / num_threads;
+        let file_size = std::fs::metadata(sam_file)?.len();
+        let pb = ProgressBar::new(file_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {percent:>3}% ({eta}) {msg}")?
+                .progress_chars("#>-"),
+        );
+        pb.set_message("Scan 1 (SAM): reading groups...");
+        pb.enable_steady_tick(Duration::from_millis(120));
 
-        unsafe { libc::madvise(mmap.as_ptr() as *mut libc::c_void, file_size, libc::MADV_SEQUENTIAL); }
+        let shard_out = format!("{}.BSJ1.shard_0", out_prefix);
+        self.read_len = self.process_sam_file_to_file(sam_file, fasta_map, annotation, &pb, &shard_out)?;
 
-        let pb = ProgressBar::new(file_size as u64);
-        pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")?.progress_chars("#>-"));
-        pb.set_message("Scan 1: Identifying BSJ candidates");
+        pb.finish_with_message("Scan 1 (SAM): completed");
+        self.merge_and_collect_ids(out_prefix, 1)
+    }
 
-        (0..num_threads).into_par_iter().for_each(|i| {
-            let start = i * shard_size;
-            let end = if i == num_threads - 1 { file_size } else { (i + 1) * shard_size };
-            let shard_out = format!("{}.BSJ1.shard_{}", out_prefix, i);
-            let _ = self.process_shard_robust_to_file(&mmap, start, end, fasta_map, annotation, &pb, &shard_out);
+    fn process_sam_file_to_file(&self, sam_file: &str, fasta_map: &HashMap<String, String>, annotation: &Annotation, pb: &ProgressBar, out_path: &str) -> Result<i32> {
+        let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
+        let batch_size = (rayon::current_num_threads().max(1) * 256).max(1024);
+        let (tx, rx) = mpsc::sync_channel::<Vec<SamOwnedGroup>>(rayon::current_num_threads().max(2));
+        let pb_clone = pb.clone();
+
+        let max_read_len = thread::scope(|scope| -> Result<i32> {
+            let producer = scope.spawn(|| self.stream_sam_group_batches(sam_file, &pb_clone, tx, batch_size));
+
+            for mut batch in rx {
+                self.process_sam_group_batch(&mut writer, &mut batch, fasta_map, annotation)?;
+            }
+
+            producer
+                .join()
+                .map_err(|_| anyhow::anyhow!("SAM group producer thread panicked"))?
+        })?;
+
+        writer.flush()?;
+        Ok(max_read_len)
+    }
+
+    fn stream_sam_group_batches(
+        &self,
+        sam_file: &str,
+        pb: &ProgressBar,
+        tx: mpsc::SyncSender<Vec<SamOwnedGroup>>,
+        batch_size: usize,
+    ) -> Result<i32> {
+        let sam_reader = BufReader::with_capacity(1024 * 1024, File::open(sam_file)?);
+        let mut reader = sam::io::Reader::new(sam_reader);
+        let header = reader.read_header()?;
+        let mut record = sam::Record::default();
+        let mut current_id: Vec<u8> = Vec::new();
+        let mut group: [Vec<OwnedAlignmentRecord>; 2] = [Vec::with_capacity(8), Vec::with_capacity(8)];
+        let mut stand_map: OwnedStandMap = HashMap::with_capacity(4);
+        let mut align_num = 0usize;
+        let mut max_read_len = 0i32;
+        let mut cigar_buf = String::with_capacity(64);
+        let mut seq_buf = String::with_capacity(256);
+        let mut batch = Vec::with_capacity(batch_size);
+        let mut records_since_progress = 0usize;
+        let mut last_progress_pos = reader.get_mut().stream_position()?;
+
+        while reader.read_record(&mut record)? != 0 {
+            let read_id = record.name().ok_or_else(|| anyhow::anyhow!("Missing read name"))?;
+            if read_id.to_vec() != current_id {
+                if !current_id.is_empty() {
+                    self.push_sam_owned_group(&mut batch, &current_id, &mut group, &mut stand_map, align_num);
+                    if batch.len() >= batch_size {
+                        tx.send(std::mem::take(&mut batch))
+                            .map_err(|_| anyhow::anyhow!("SAM group consumer dropped"))?;
+                        batch = Vec::with_capacity(batch_size);
+                    }
+                }
+                current_id = read_id.to_vec();
+                align_num = 0;
+            }
+
+            let chrom = match record.reference_sequence(&header) {
+                Some(Ok((name, _))) => String::from_utf8_lossy(name).to_string(),
+                _ => "*".to_string(),
+            };
+            let flag = i32::from(u16::from(record.flags()?));
+            let start_pos = record.alignment_start().transpose()?.map(|p| p.get() as i32).unwrap_or(0);
+            let mapq = record.mapping_quality().transpose()?.map(u8::from).unwrap_or(0) as i32;
+
+            cigar_buf.clear();
+            for result in record.cigar().iter() {
+                let op = result?;
+                use noodles::sam::alignment::record::cigar::op::Kind;
+                let op_char = match op.kind() {
+                    Kind::Match => 'M',
+                    Kind::Insertion => 'I',
+                    Kind::Deletion => 'D',
+                    Kind::Skip => 'N',
+                    Kind::SoftClip => 'S',
+                    Kind::HardClip => 'H',
+                    Kind::Pad => 'P',
+                    Kind::SequenceMatch => '=',
+                    Kind::SequenceMismatch => 'X',
+                };
+                let _ = write!(&mut cigar_buf, "{}{}", op.len(), op_char);
+            }
+
+            seq_buf.clear();
+            for b in record.sequence().iter() {
+                seq_buf.push(char::from(b));
+            }
+            max_read_len = max_read_len.max(seq_buf.len() as i32);
+            let seq = seq_buf.clone();
+            let s_idx = if flag & 0x40 != 0 { 1 } else { 0 };
+            if !seq.is_empty() && seq != "*" {
+                let st_c = if flag & 0x10 != 0 { '1' } else { '0' };
+                stand_map.entry(s_idx).or_insert_with(|| (st_c, Cow::Owned(seq.clone())));
+            }
+            group[s_idx as usize].push(AlignmentRecord {
+                flag,
+                chrom: Cow::Owned(chrom),
+                pos: start_pos,
+                mapq,
+                cigar: Cow::Owned(cigar_buf.clone()),
+                seq: Cow::Owned(seq),
+            });
+            align_num += 1;
+            records_since_progress += 1;
+            if records_since_progress >= 4096 {
+                let pos = reader.get_mut().stream_position()?;
+                if pos > last_progress_pos {
+                    pb.inc(pos - last_progress_pos);
+                    last_progress_pos = pos;
+                }
+                records_since_progress = 0;
+            }
+        }
+
+        if !current_id.is_empty() {
+            self.push_sam_owned_group(&mut batch, &current_id, &mut group, &mut stand_map, align_num);
+        }
+        if !batch.is_empty() {
+            tx.send(batch)
+                .map_err(|_| anyhow::anyhow!("SAM group consumer dropped"))?;
+        }
+
+        let final_pos = reader.get_mut().stream_position()?;
+        if final_pos > last_progress_pos {
+            pb.inc(final_pos - last_progress_pos);
+        }
+
+        Ok(max_read_len)
+    }
+
+    fn push_sam_owned_group(
+        &self,
+        batch: &mut Vec<SamOwnedGroup>,
+        current_id: &[u8],
+        group: &mut [Vec<OwnedAlignmentRecord>; 2],
+        stand_map: &mut OwnedStandMap,
+        align_num: usize,
+    ) {
+        batch.push(SamOwnedGroup {
+            read_id: String::from_utf8_lossy(current_id).into_owned(),
+            group: [std::mem::take(&mut group[0]), std::mem::take(&mut group[1])],
+            stand_map: std::mem::take(stand_map),
+            align_num,
         });
+        group[0] = Vec::with_capacity(8);
+        group[1] = Vec::with_capacity(8);
+        *stand_map = HashMap::with_capacity(4);
+    }
 
-        pb.finish_with_message("Scan 1: Completed");
-        self.merge_and_collect_ids(out_prefix, num_threads)
+    fn process_sam_group_batch(
+        &self,
+        writer: &mut BufWriter<File>,
+        batch: &mut Vec<SamOwnedGroup>,
+        fasta_map: &HashMap<String, String>,
+        annotation: &Annotation,
+    ) -> Result<()> {
+        let groups = std::mem::take(batch);
+        let results: Vec<Option<String>> = groups
+            .into_par_iter()
+            .map(|owned| {
+                let non_empty_groups = owned.group.iter().filter(|g| !g.is_empty()).count();
+                if owned.align_num <= 2 && non_empty_groups != 1 {
+                    return None;
+                }
+                let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
+                self.process_group_view(&owned.read_id, &owned.group, &owned.stand_map, fasta_map, annotation, &mut validator, None)
+                    .map(|(_, res_line)| res_line)
+            })
+            .collect();
+
+        for res_line in results.into_iter().flatten() {
+            writeln!(writer, "{}", res_line)?;
+        }
+
+        Ok(())
     }
 
     fn merge_and_collect_ids(&self, out_prefix: &str, num_threads: usize) -> Result<HashSet<String>> {
@@ -196,93 +374,6 @@ impl Scan1 {
         }
         final_writer.flush()?;
         Ok(scan1_id_map)
-    }
-
-    fn process_shard_robust_to_file<'a>(&self, mmap: &'a Mmap, start: usize, end: usize, fasta_map: &HashMap<String, String>, annotation: &Annotation, pb: &ProgressBar, out_path: &str) -> Result<()> {
-        let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
-        let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
-        let mut pos = if start == 0 { 0 } else { 
-            let mut next_line = memchr(b'\n', &mmap[start..]).map(|p| start + p + 1).unwrap_or(mmap.len());
-            if next_line >= mmap.len() { return Ok(()); }
-            let first_tab = memchr(b'\t', &mmap[next_line..]).map(|p| next_line + p).unwrap_or(mmap.len());
-            let first_id = &mmap[next_line..first_tab];
-            while next_line < mmap.len() {
-                let line_end = memchr(b'\n', &mmap[next_line..]).map(|p| next_line + p).unwrap_or(mmap.len());
-                let line_tab = memchr(b'\t', &mmap[next_line..line_end]).map(|p| next_line + p).unwrap_or(line_end);
-                if &mmap[next_line..line_tab] != first_id { break; }
-                next_line = line_end + 1;
-            }
-            next_line
-        };
-
-        let mut current_id: &[u8] = &[];
-        let mut group: [Vec<AlignmentRecord<'a>>; 2] = [Vec::with_capacity(8), Vec::with_capacity(8)];
-        let mut stand_map: HashMap<i32, (char, Cow<'a, str>)> = HashMap::with_capacity(4);
-        let mut align_num = 0usize;
-        let mut one_read_key: i32 = -1;
-        let mut last_evicted_pos = pos;
-        
-        // Aggressive eviction: use small fixed windows (e.g. 64MB) to keep RES low
-        let eviction_threshold = 64 * 1024 * 1024; 
-
-        while pos < mmap.len() {
-            let line_end = memchr(b'\n', &mmap[pos..]).map(|p| pos + p).unwrap_or(mmap.len());
-            let line = &mmap[pos..line_end];
-            if line.is_empty() { pb.inc(1); pos = line_end + 1; continue; }
-            
-            if pos - last_evicted_pos > eviction_threshold {
-                advise_dontneed_aligned(mmap, last_evicted_pos, pos - last_evicted_pos);
-                last_evicted_pos = pos;
-            }
-
-            if line[0] == b'@' { pb.inc((line_end - pos + 1) as u64); pos = line_end + 1; continue; }
-            let mut cols = line.split(|&b| b == b'\t');
-            let read_id = cols.next().unwrap();
-            if read_id != current_id {
-                if !current_id.is_empty() {
-                    let id_str = unsafe { std::str::from_utf8_unchecked(current_id) };
-                    let non_empty_groups = group.iter().filter(|g| !g.is_empty()).count();
-                    if align_num > 2 || non_empty_groups == 1 {
-                        if let Some((_, res_line)) = self.process_group_view(id_str, &group, &stand_map, fasta_map, annotation, &mut validator, None) {
-                            writeln!(writer, "{}", res_line)?;
-                        }
-                    }
-                    if pos > end { break; }
-                }
-                current_id = read_id;
-                group[0].clear();
-                group[1].clear();
-                stand_map.clear();
-                align_num = 0;
-                one_read_key = -1;
-            }
-            let flag = fast_parse_i32(cols.next().unwrap_or(b"0"));
-            let chrom = unsafe { std::str::from_utf8_unchecked(cols.next().unwrap_or(b"*")) };
-            let start_pos = fast_parse_i32(cols.next().unwrap_or(b"0"));
-            let mapq = fast_parse_i32(cols.next().unwrap_or(b"0"));
-            let cigar = unsafe { std::str::from_utf8_unchecked(cols.next().unwrap_or(b"*")) };
-            cols.next(); cols.next(); cols.next();
-            let seq = unsafe { std::str::from_utf8_unchecked(cols.next().unwrap_or(b"*")).trim() };
-            let s_idx = if flag & 0x40 != 0 { 1 } else { 0 };
-            if s_idx != one_read_key {
-                group[s_idx as usize].clear();
-                one_read_key = s_idx;
-                let st_c = if flag & 0x10 != 0 { '1' } else { '0' };
-                stand_map.insert(s_idx, (st_c, Cow::Borrowed(seq)));
-            }
-            group[s_idx as usize].push(AlignmentRecord { flag, chrom: Cow::Borrowed(chrom), pos: start_pos, mapq, cigar: Cow::Borrowed(cigar), seq: Cow::Borrowed(seq) });
-            align_num += 1;
-            pb.inc((line_end - pos + 1) as u64);
-            pos = line_end + 1;
-        }
-        if !current_id.is_empty() && pos >= mmap.len() {
-            let id_str = unsafe { std::str::from_utf8_unchecked(current_id) };
-            if let Some((_, res_line)) = self.process_group_view(id_str, &group, &stand_map, fasta_map, annotation, &mut validator, None) {
-                writeln!(writer, "{}", res_line)?;
-            }
-        }
-        writer.flush()?;
-        Ok(())
     }
 
     pub fn run_bam(&mut self, bam_file: &str, out_prefix: &str, fasta_map: &HashMap<String, String>, annotation: &Annotation) -> Result<HashSet<String>> {
