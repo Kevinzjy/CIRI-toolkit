@@ -17,6 +17,12 @@
 /// 3: Total mapped length (sum of M and D operations).
 pub fn misd(old_cigar: &str, seq_length: i32) -> [i32; 4] {
     let mut cigar_ite = [0, 0, 0, 0];
+
+    // Java parity: classNumStr.length==1 and classCIGAR="*" falls into "not M" => -1.
+    if old_cigar == "*" {
+        cigar_ite[3] = -1;
+        return cigar_ite;
+    }
     
     // Standardize: Replace H (Hard clip) with S (Soft clip) conceptually for length.
     let mut counts = Vec::with_capacity(4);
@@ -111,7 +117,7 @@ mod tests {
     #[test]
     fn test_misd_invalid() {
         let res = misd("*", 100);
-        assert_eq!(res[3], -2);
+        assert_eq!(res[3], -1);
     }
 
     #[test]

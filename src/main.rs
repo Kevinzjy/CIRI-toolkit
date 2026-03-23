@@ -38,9 +38,21 @@ struct Args {
     #[arg(short = 'm', long = "mapq", default_value_t = 10)]
     min_mapq: i32,
 
-    /// Stringency level (0, 1, 2)
-    #[arg(short = 's', long = "stringency", default_value_t = 1)]
+    /// Stringency level (0, 1, 2), Java default is 2
+    #[arg(short = 's', long = "stringency", default_value_t = 2)]
     stringency: i32,
+
+    /// Max spanning distance of circRNAs (Java -Max, default 200000)
+    #[arg(long = "max-span", default_value_t = 200000)]
+    max_span: i32,
+
+    /// Min spanning distance of circRNAs (Java -Min, default 140)
+    #[arg(long = "min-span", default_value_t = 140)]
+    min_span: i32,
+
+    /// Linear competition search range size (Java internal default 50000)
+    #[arg(long = "linear-range-size-min", default_value_t = 50000)]
+    linear_range_size_min: i32,
 
     /// Number of threads to use (default: auto)
     #[arg(short = 't', long = "threads", default_value_t = 0)]
@@ -88,14 +100,15 @@ fn main() -> Result<()> {
     // 3. Scan 1
     log_info("Processing Scan 1", "Identifying Back-Spliced Junctions...");
     let bsj1_output = format!("{}.BSJ1", args.out_prefix);
-    let mut scan1 = Scan1::new(args.min_mapq, 140, 200000, 5);
+    let mut scan1 = Scan1::new(args.min_mapq, args.min_span, args.max_span, args.linear_range_size_min);
     scan1.set_mem_limit(mem_limit);
     scan1.run(&args.in_sam, &args.out_prefix, &fasta.chr_tcga_map, &annotation)?;
     println!();
 
     // 4. Indexing
     log_info("Index Mapping", "Constructing candidate site lookup...");
-    let mut scan2 = Scan2::new(args.min_mapq, 5, 100);
+    let scan2_seq_len = (scan1.read_len - 12).max(1);
+    let mut scan2 = Scan2::new(args.min_mapq, args.linear_range_size_min, scan2_seq_len);
     scan2.set_mem_limit(mem_limit);
     scan2.build_index(&bsj1_output)?;
 

@@ -40,50 +40,103 @@ impl SmithWaterman {
 
     /// Performs local alignment and traceback to calculate the optimal score and aligned length.
     pub fn align(&mut self) {
-        let n = self.seq1.len();
-        let m = self.seq2.len();
-        if n == 0 || m == 0 { self.score = 0; self.aligned_len = 0; return; }
-        
-        let mut dp = vec![vec![0; m + 1]; n + 1];
-        let mut max_score = 0;
-        let mut max_i = 0;
-        let mut max_j = 0;
-        let s1_bytes = self.seq1.as_bytes();
-        let s2_bytes = self.seq2.as_bytes();
-        
-        for i in 1..=n {
-            for j in 1..=m {
-                let score = if s1_bytes[i - 1] == s2_bytes[j - 1] { self.match_score } else { self.mismatch_penalty };
-                dp[i][j] = (dp[i - 1][j - 1] + score)
-                    .max(dp[i - 1][j] + self.gap_penalty)
-                    .max(dp[i][j - 1] + self.gap_penalty)
-                    .max(0);
-                    
-                if dp[i][j] >= max_score { 
-                    max_score = dp[i][j];
-                    max_i = i;
-                    max_j = j;
+        // Java parity (`smith` package): table rows = seq2, cols = seq1.
+        let cols = self.seq1.len();
+        let rows = self.seq2.len();
+        if cols == 0 || rows == 0 {
+            self.score = 0;
+            self.aligned_len = 0;
+            return;
+        }
+
+        let s1 = self.seq1.as_bytes();
+        let s2 = self.seq2.as_bytes();
+        let mut score_table = vec![vec![0i32; cols + 1]; rows + 1];
+        let mut prev: Vec<Vec<Option<(usize, usize)>>> = vec![vec![None; cols + 1]; rows + 1];
+        let mut high_row = 0usize;
+        let mut high_col = 0usize;
+
+        for row in 1..=rows {
+            for col in 1..=cols {
+                let row_space_score = score_table[row - 1][col] + self.gap_penalty;
+                let col_space_score = score_table[row][col - 1] + self.gap_penalty;
+                let mut match_or_mismatch_score = score_table[row - 1][col - 1];
+                if s2[row - 1] == s1[col - 1] {
+                    match_or_mismatch_score += self.match_score;
+                } else {
+                    match_or_mismatch_score += self.mismatch_penalty;
+                }
+
+                let mut cell_score = 0i32;
+                let mut cell_prev: Option<(usize, usize)> = None;
+                if row_space_score >= col_space_score {
+                    if match_or_mismatch_score >= row_space_score {
+                        if match_or_mismatch_score > 0 {
+                            cell_score = match_or_mismatch_score;
+                            cell_prev = Some((row - 1, col - 1));
+                        }
+                    } else if row_space_score > 0 {
+                        cell_score = row_space_score;
+                        cell_prev = Some((row - 1, col));
+                    }
+                } else if match_or_mismatch_score >= col_space_score {
+                    if match_or_mismatch_score > 0 {
+                        cell_score = match_or_mismatch_score;
+                        cell_prev = Some((row - 1, col - 1));
+                    }
+                } else if col_space_score > 0 {
+                    cell_score = col_space_score;
+                    cell_prev = Some((row, col - 1));
+                }
+
+                score_table[row][col] = cell_score;
+                prev[row][col] = cell_prev;
+                if cell_score > score_table[high_row][high_col] {
+                    high_row = row;
+                    high_col = col;
                 }
             }
         }
-        self.score = max_score;
 
-        // Traceback to find aligned length (parity with Summary.java alignment[1].length())
-        let mut curr_i = max_i;
-        let mut curr_j = max_j;
-        let mut steps = 0;
-        while curr_i > 0 && curr_j > 0 && dp[curr_i][curr_j] > 0 {
-            let score = if s1_bytes[curr_i - 1] == s2_bytes[curr_j - 1] { self.match_score } else { self.mismatch_penalty };
-            if dp[curr_i][curr_j] == dp[curr_i - 1][curr_j - 1] + score {
-                curr_i -= 1; curr_j -= 1;
-            } else if dp[curr_i][curr_j] == dp[curr_i - 1][curr_j] + self.gap_penalty {
-                curr_i -= 1;
+        // Java traceback stops at score == 0.
+        let mut row = high_row;
+        let mut col = high_col;
+        let mut align1: Vec<u8> = Vec::new();
+        let mut align2: Vec<u8> = Vec::new();
+        while score_table[row][col] != 0 {
+            let (pr, pc) = match prev[row][col] {
+                Some(p) => p,
+                None => break,
+            };
+            if row - pr == 1 {
+                align2.push(s2[row - 1]);
             } else {
-                curr_j -= 1;
+                align2.push(b'-');
             }
-            steps += 1;
+            if col - pc == 1 {
+                align1.push(s1[col - 1]);
+            } else {
+                align1.push(b'-');
+            }
+            row = pr;
+            col = pc;
         }
-        self.aligned_len = steps;
+        self.aligned_len = align2.len() as i32;
+
+        // Java getAlignmentScore recomputes score from traceback alignments.
+        let mut total = 0i32;
+        for i in 0..align1.len() {
+            let c1 = align1[i];
+            let c2 = align2[i];
+            if c1 == b'-' || c2 == b'-' {
+                total += self.gap_penalty;
+            } else if c1 == c2 {
+                total += self.match_score;
+            } else {
+                total += self.mismatch_penalty;
+            }
+        }
+        self.score = total;
     }
 }
 
@@ -99,10 +152,11 @@ pub struct IsBSJHg2 {
 /// Helper function to mirror Java's `String.substring` behavior (end-exclusive, safe bounds).
 pub fn java_substring(s: &str, start: i32, end: i32) -> &str {
     let len = s.len() as i32;
-    let s_idx = start.max(0).min(len);
-    let e_idx = end.max(0).min(len);
-    if s_idx >= e_idx { return ""; }
-    &s[s_idx as usize..e_idx as usize]
+    assert!(start >= 0, "java_substring start<0: start={}, end={}, len={}", start, end, len);
+    assert!(end >= 0, "java_substring end<0: start={}, end={}, len={}", start, end, len);
+    assert!(start <= end, "java_substring start>end: start={}, end={}, len={}", start, end, len);
+    assert!(end <= len, "java_substring end>len: start={}, end={}, len={}", start, end, len);
+    &s[start as usize..end as usize]
 }
 
 impl IsBSJHg2 {
@@ -245,11 +299,21 @@ impl IsBSJHg2 {
         let (end_string1, end_string2, tmp_site1, tmp_site2, adjt_bp);
         if end_adjt2 >= 0 {
             tmp_site1 = site1 - end_adjt1 - 1; tmp_site2 = site2 - end_adjt1 - 1; adjt_bp = 2 + total_adjustment;
-            end_string1 = java_substring(chr_taga, site1 - end_adjt1 - 4, end_adjt2 + site1).to_string();
+            if site1 - end_adjt1 - 4 >= 0 {
+                end_string1 = java_substring(chr_taga, site1 - end_adjt1 - 4, end_adjt2 + site1).to_string();
+            } else {
+                let n_pad = (0 - (site1 - end_adjt1 - 4)) as usize;
+                end_string1 = format!("{}{}", "N".repeat(n_pad), java_substring(chr_taga, 0, end_adjt2 + site1));
+            }
             end_string2 = java_substring(chr_taga, site2 - end_adjt1 - 1, 3 + end_adjt2 + site2).to_string();
         } else {
             tmp_site1 = site1 + end_adjt2 - 1; tmp_site2 = site2 + end_adjt2 - 1; adjt_bp = 2 - total_adjustment;
-            end_string1 = java_substring(chr_taga, site1 + end_adjt2 - 4, site1 - end_adjt1).to_string();
+            if site1 + end_adjt2 - 4 >= 0 {
+                end_string1 = java_substring(chr_taga, site1 + end_adjt2 - 4, site1 - end_adjt1).to_string();
+            } else {
+                let n_pad = (0 - (site1 + end_adjt2 - 4)) as usize;
+                end_string1 = format!("{}{}", "N".repeat(n_pad), java_substring(chr_taga, 0, site1 - end_adjt1));
+            }
             end_string2 = java_substring(chr_taga, site2 + end_adjt2 - 1, 3 + site2 - end_adjt1).to_string();
         }
 
@@ -292,9 +356,8 @@ impl IsBSJHg2 {
 
                 if java_substring(circ_range_seq, 0, initial_seq1.len() as i32) == initial_seq1 &&
                    java_substring(circ_range_seq, circ_range_len - initial_seq2.len() as i32, circ_range_len) == initial_seq2 {
-                    let mut j_ok = [circ_line_arr[6].clone(), circ_line_arr[7].clone()];
                     for i in 0..=1 {
-                        if j_ok[i] != "1" {
+                        if circ_line_arr[6 + i] != "1" {
                             let linear_range;
                             if i == 1 {
                                 if site2_new - site1_new + 5 >= self.linear_range_size_min { if 2 * site1_new >= site2_new + 6 { linear_range = java_substring(chr_taga, 2 * site1_new - site2_new - 6, site1_new - 1); } else { linear_range = java_substring(chr_taga, 0, site1_new - 1); } }
@@ -303,21 +366,42 @@ impl IsBSJHg2 {
                                 if site2_new - site1_new + 5 >= self.linear_range_size_min { if 2 * site2_new - site1_new + 5 > chr_taga_len { linear_range = java_substring(chr_taga, site2_new, chr_taga_len); } else { linear_range = java_substring(chr_taga, site2_new, 2 * site2_new - site1_new + 5); } }
                                 else { if site2_new + self.linear_range_size_min > chr_taga_len { linear_range = java_substring(chr_taga, site2_new, chr_taga_len); } else { linear_range = java_substring(chr_taga, site2_new, site2_new + self.linear_range_size_min); } }
                             }
-                            j_ok[i] = self.is_in_circ_rna_1_2(str_new[i].len() as i32, &str_new[i], circ_range_seq, linear_range).to_string();
+                            circ_line_arr[6 + i] = self.is_in_circ_rna_1_2(str_new[i].len() as i32, &str_new[i], circ_range_seq, linear_range).to_string();
                         }
                     }
-                    if j_ok[0] == "1" && j_ok[1] == "1" {
+                    if circ_line_arr[6] == "1" && circ_line_arr[7] == "1" {
                         if circ_line_arr[4] != "*" && self.is_in_circ_rna_2(&circ_line_arr[4], circ_range_seq) == 0 { return None; }
                         let mut tag = 1;
                         if circ_line_arr[5].len() > 5 {
-                            let mut pem_null = "";
-                            if circ_line_arr[0] == "1" { if 2*site1_new >= site2_new+6 { pem_null = java_substring(chr_taga, 2*site1_new-site2_new-6, site1_new-1); } else { pem_null = java_substring(chr_taga, 0, site1_new-1); } }
-                            else { if 2*site2_new-site1_new+5 > chr_taga_len { pem_null = java_substring(chr_taga, site2_new, chr_taga_len); } else { pem_null = java_substring(chr_taga, site2_new, 2*site2_new-site1_new+5); } }
+                            // Java parity: preserve original branch order/conditions.
+                            let pem_null = if circ_line_arr[0] == "1" && site1_new - site1_new + 5 >= self.linear_range_size_min {
+                                if 2 * site1_new >= site2_new + 6 {
+                                    java_substring(chr_taga, 2 * site1_new - site2_new - 6, site1_new - 1)
+                                } else {
+                                    java_substring(chr_taga, 0, site1_new - 1)
+                                }
+                            } else if circ_line_arr[0] == "1" {
+                                if site1_new >= self.linear_range_size_min + 1 {
+                                    java_substring(chr_taga, site1_new - self.linear_range_size_min - 1, site1_new - 1)
+                                } else {
+                                    java_substring(chr_taga, 0, site1_new - 1)
+                                }
+                            } else if circ_line_arr[0] == "0" && site2_new - site1_new + 5 > self.linear_range_size_min {
+                                if 2 * site2_new - site1_new + 5 > chr_taga_len {
+                                    java_substring(chr_taga, site2_new, chr_taga_len)
+                                } else {
+                                    java_substring(chr_taga, site2_new, 2 * site2_new - site1_new + 5)
+                                }
+                            } else {
+                                if site2_new + self.linear_range_size_min > chr_taga_len {
+                                    java_substring(chr_taga, site2_new, chr_taga_len)
+                                } else {
+                                    java_substring(chr_taga, site2_new, site2_new + self.linear_range_size_min)
+                                }
+                            };
                             tag = self.is_in_circ_rna_3(&circ_line_arr[5], &circ_line_arr[8], circ_range_seq, pem_null);
                         }
-                        let mut final_s1 = site1_new; let mut final_s2 = site2_new;
-                        if final_s1 > final_s2 { std::mem::swap(&mut final_s1, &mut final_s2); }
-                        return Some(format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", tag, circ_line_arr[1], final_s1, final_s2, shift_arr[1], shift_arr[2], shift_arr[3], sum_q));
+                        return Some(format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", tag, circ_line_arr[1], site1_new, site2_new, shift_arr[1], shift_arr[2], shift_arr[3], sum_q));
                     }
                 }
             }
@@ -357,7 +441,7 @@ impl IsBSJHg2 {
                         if quant >= self.min_mapq_uni {
                             let initial_seq = java_substring(&str_full, len_str - self.initial_size1, len_str);
                             if java_substring(circ_range_seq, circ_range_len - self.initial_size1, circ_range_len) == initial_seq {
-                                if self.is_in_circ_rna_1_1(len_str, &str_full, circ_range_seq, linear_range) == 1 { judge_tag = "1".to_string(); } else { judge_tag = "2".to_string(); }
+                                if self.is_in_circ_rna_1_1(len_str, &str_full, circ_range_seq, linear_range) == 1 { judge_tag = "2".to_string(); } else { judge_tag = "3".to_string(); }
                             }
                         }
                         if circ_line_arr[0] == "1" { pem_null_range_seq = linear_range; } label = false;
@@ -365,7 +449,18 @@ impl IsBSJHg2 {
                     if label {
                         let initial_seq = java_substring(&str_full, len_str - self.initial_size1, len_str);
                         if java_substring(circ_range_seq, circ_range_len - self.initial_size1, circ_range_len) == initial_seq {
-                            if self.is_in_circ_rna_1_1(len_str, &str_full, circ_range_seq, linear_range) == 1 { if quant >= self.min_mapq_uni { judge_tag = "1".to_string(); } } else { return "0".to_string(); }
+                            if self.is_in_circ_rna_1_1(len_str, &str_full, circ_range_seq, linear_range) == 1 {
+                                if quant >= self.min_mapq_uni {
+                                    judge_tag = "2".to_string();
+                                    if circ_line_arr[0] == "1" {
+                                        pem_null_range_seq = linear_range;
+                                    }
+                                } else {
+                                    return "2".to_string();
+                                }
+                            } else {
+                                return "0".to_string();
+                            }
                         } else { return "0".to_string(); }
                     }
                 } else { return "0".to_string(); }
@@ -388,21 +483,35 @@ impl IsBSJHg2 {
                     if self.aligner.score >= (len_str - (len_str - 2) / 10 * 2) {
                         let initial_seq = java_substring(&str_full, 0, self.initial_size1);
                         if java_substring(circ_range_seq, 0, self.initial_size1) == initial_seq {
-                            if self.is_in_circ_rna_1_2(len_str, &str_full, circ_range_seq, linear_range) == 1 { if quant >= self.min_mapq_uni { judge_tag = "1".to_string(); } } else { judge_tag = "2".to_string(); }
+                            if self.is_in_circ_rna_1_2(len_str, &str_full, circ_range_seq, linear_range) == 1 { if quant >= self.min_mapq_uni { judge_tag = "2".to_string(); } } else { judge_tag = "3".to_string(); }
                         }
                         if circ_line_arr[0] == "0" { pem_null_range_seq = linear_range; } label = false;
                     }
                     if label {
                         let initial_seq = java_substring(&str_full, 0, self.initial_size1);
                         if java_substring(circ_range_seq, 0, self.initial_size1) == initial_seq {
-                            if self.is_in_circ_rna_1_2(len_str, &str_full, circ_range_seq, linear_range) == 1 { if quant >= self.min_mapq_uni { judge_tag = "1".to_string(); } } else { return "0".to_string(); }
+                            if self.is_in_circ_rna_1_2(len_str, &str_full, circ_range_seq, linear_range) == 1 {
+                                if quant >= self.min_mapq_uni {
+                                    judge_tag = "2".to_string();
+                                    if circ_line_arr[0] == "0" {
+                                        pem_null_range_seq = linear_range;
+                                    }
+                                } else {
+                                    return "2".to_string();
+                                }
+                            } else {
+                                return "0".to_string();
+                            }
                         } else { return "0".to_string(); }
                     }
                 } else { return "0".to_string(); }
             }
         }
         if circ_line_arr[7] != "*" && self.is_in_circ_rna_2(&circ_line_arr[7], circ_range_seq) == 0 { return "0".to_string(); }
-        if circ_line_arr[6].len() > 5 { let res = self.is_in_circ_rna_3(&circ_line_arr[6], &circ_line_arr[8], circ_range_seq, pem_null_range_seq); return format!("{}{}", res, judge_tag); }
+        if circ_line_arr[6].len() > 5 {
+            let res = self.is_in_circ_rna_3(&circ_line_arr[6], &circ_line_arr[8], circ_range_seq, pem_null_range_seq);
+            return format!("{}{}", res, judge_tag);
+        }
         format!("1{}", judge_tag)
     }
 }
@@ -415,7 +524,6 @@ mod tests {
     fn test_java_substring() {
         assert_eq!(java_substring("ABCDE", 1, 3), "BC");
         assert_eq!(java_substring("ABCDE", 0, 5), "ABCDE");
-        assert_eq!(java_substring("ABCDE", -1, 10), "ABCDE");
     }
 
     #[test]

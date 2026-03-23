@@ -37,3 +37,8 @@ node_modules/
 .npm/
 
 vendor/
+
+# --- Local Debug/Temp Workspace ---
+tmp/
+tmp_pydeps/
+tests/java_probe/bin_isbsj/
