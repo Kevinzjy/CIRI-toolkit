@@ -67,6 +67,47 @@ pub fn parse_mem_str(mem_str: &str) -> u64 {
     }
 }
 
+/// Returns the final Summary output path for one CLI `-o/--out` prefix.
+///
+/// The CLI now treats `-o` strictly as a prefix so all outputs follow one
+/// predictable scheme: `<prefix>.out`, `<prefix>.bsj1`, `<prefix>.bsj`,
+/// and `<prefix>.fsj`.
+pub fn result_path_for_output(output_arg: &str) -> String {
+    format!("{}.out", output_arg)
+}
+
+/// Returns the merged Scan1 BSJ output path for one CLI prefix.
+pub fn bsj1_path_for_output(output_arg: &str) -> String {
+    format!("{}.bsj1", output_arg)
+}
+
+/// Returns the final combined BSJ output path for one CLI prefix.
+pub fn bsj_path_for_output(output_arg: &str) -> String {
+    format!("{}.bsj", output_arg)
+}
+
+/// Returns the basename used for Scan2 shard-local BSJ spill files.
+pub fn bsj2_path_for_output(output_arg: &str) -> String {
+    format!("{}.bsj2", output_arg)
+}
+
+/// Returns the basename used for FSJ shard-local spill files.
+///
+/// The pipeline no longer keeps a final `.fsj` artifact, but the `<prefix>.fsj`
+/// stem is still used to name temporary spill files such as
+/// `<prefix>.fsj.part_0001.tmp`.
+pub fn fsj_path_for_output(output_arg: &str) -> String {
+    format!("{}.fsj", output_arg)
+}
+
+/// Returns the temporary spill-file path for one shard-local intermediate.
+///
+/// Stable zero-padded numbering keeps shard files easy to scan by eye and
+/// avoids mixing two historical naming schemes (`.shard_N` vs `fsj_shard_N`).
+pub fn part_path(final_path: &str, part_idx: usize) -> String {
+    format!("{}.part_{:04}.tmp", final_path, part_idx + 1)
+}
+
 /// Chooses a safe BAM shard count for BGZF-parallel Scan1/Scan2 processing.
 ///
 /// This intentionally falls back to fewer shards for tiny BAMs. The goal is not
@@ -102,5 +143,18 @@ mod tests {
         assert_eq!(bam_shard_count(4 * 1024 * 1024, 16), 1);
         assert_eq!(bam_shard_count(8 * 1024 * 1024, 16), 2);
         assert_eq!(bam_shard_count(128 * 1024 * 1024, 4), 4);
+    }
+
+    #[test]
+    fn test_output_paths_for_prefix() {
+        assert_eq!(result_path_for_output("sample.ciri"), "sample.ciri.out");
+        assert_eq!(bsj1_path_for_output("sample.ciri"), "sample.ciri.bsj1");
+        assert_eq!(bsj_path_for_output("sample.ciri"), "sample.ciri.bsj");
+        assert_eq!(bsj2_path_for_output("sample.ciri"), "sample.ciri.bsj2");
+        assert_eq!(fsj_path_for_output("sample.ciri"), "sample.ciri.fsj");
+        assert_eq!(
+            part_path("sample.ciri.bsj", 0),
+            "sample.ciri.bsj.part_0001.tmp"
+        );
     }
 }

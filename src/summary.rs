@@ -19,6 +19,10 @@ use crate::is_bsj_hg2::SmithWaterman;
 /// and Scan2 intermediates.
 pub struct Summary {
     pub stringency: i32,
+    /// Number of circRNA rows written in the most recent run.
+    pub circ_count: usize,
+    /// Number of unique BSJ-supporting read IDs retained in the most recent final report.
+    pub final_bsj_reads: usize,
 }
 
 /// One sortable final-result row for a chromosome.
@@ -109,7 +113,11 @@ impl Summary {
 
     /// Creates the Summary stage with a Java-compatible stringency level.
     pub fn new(stringency: i32) -> Self {
-        Self { stringency }
+        Self {
+            stringency,
+            circ_count: 0,
+            final_bsj_reads: 0,
+        }
     }
 
     /// Extracts the total genomic span covered between the outermost `M`
@@ -442,7 +450,7 @@ impl Summary {
         }
     }
 
-    /// Runs the final Summary stage and writes `<out_prefix>.result`.
+    /// Runs the final Summary stage and writes the requested report file.
     ///
     /// Inputs are assumed to already be parity-aligned with Java at the BSJ1/FSJ
     /// level; this stage only performs Java-compatible merging, stringency
@@ -450,11 +458,13 @@ impl Summary {
     pub fn run(
         &mut self,
         bsj1_file: &str,
-        out_prefix: &str,
+        result_path: &str,
         fsj_map: &HashMap<String, i32>,
         chr_tcga_map: &HashMap<String, String>,
         annotation: &Annotation,
     ) -> Result<()> {
+        self.circ_count = 0;
+        self.final_bsj_reads = 0;
         let file = File::open(bsj1_file)?;
         let reader = BufReader::new(file);
         let mut circ_map: HashMap<String, HashSet<String>> = HashMap::new();
@@ -493,6 +503,7 @@ impl Summary {
         );
 
         let mut final_results: BTreeMap<String, Vec<CircSortItem>> = BTreeMap::new();
+        let mut final_read_ids: HashSet<String> = HashSet::new();
         for (chr_start_end, lines) in &circ_map {
             let p_key: Vec<&str> = chr_start_end.split('\t').collect();
             if p_key.len() != 3 {
@@ -597,6 +608,9 @@ impl Summary {
                 Self::annotate_circ(annotation, p_key[0], start, p_key[2].parse().unwrap_or(0));
             let mut ids: Vec<String> = circ_id_set3.into_iter().collect();
             ids.sort();
+            for id in &ids {
+                final_read_ids.insert(id.clone());
+            }
             let line = format!(
                 "{}:{}|{}\t{}\t{}\t{}\t{}\t{}_{}_{}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}",
                 p_key[0],
@@ -626,16 +640,18 @@ impl Summary {
                 });
         }
 
-        let out_file = File::create(format!("{}.result", out_prefix))?;
+        let out_file = File::create(result_path)?;
         let mut writer = BufWriter::with_capacity(1024 * 1024, out_file);
         writeln!(writer, "circRNA_ID\tchr\tcircRNA_start\tcircRNA_end\t#junction_reads\tSM_MS_SMS\t#non_junction_reads\tjunction_reads_ratio\tcircRNA_type\tgene_id\tstrand\tjunction_reads_ID\tScore")?;
         for items in final_results.values_mut() {
             items.sort_by_key(|x| x.start_site);
             for item in items {
                 writeln!(writer, "{}", item.line)?;
+                self.circ_count += 1;
             }
         }
         writer.flush()?;
+        self.final_bsj_reads = final_read_ids.len();
         Ok(())
     }
 }

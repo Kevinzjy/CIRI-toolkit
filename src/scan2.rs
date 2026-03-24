@@ -1,12 +1,12 @@
 //! Scan2: second-pass rescue, candidate validation, and FSJ counting.
 //!
-//! This stage consumes the Java-compatible `*.BSJ1` output from Scan1, rebuilds
+//! This stage consumes the Java-compatible BSJ output from Scan1, rebuilds
 //! the de-duplicated candidate indexes expected by Java CIRI3, and then revisits
 //! the input alignments to rescue additional support while counting FSJ evidence.
 
 use crate::is_bsj_hg2::{report_scan2_hg_profile, IsBSJHg2};
 use crate::misd::misd;
-use crate::utils::{bam_shard_count, reverse_complement, AlignmentRecord};
+use crate::utils::{bam_shard_count, part_path, reverse_complement, AlignmentRecord};
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use memchr::memchr;
@@ -48,6 +48,10 @@ pub struct Scan2 {
     pub scan1_ids: HashSet<String>,
     /// Java Scan2 bucket size (`seqLen`) used for directional candidate traversal.
     pub seq_len: i32,
+    /// Unique read IDs rescued by Scan2 and appended to the final BSJ file.
+    pub rescued_reads: usize,
+    /// Total unique BSJ-supporting read IDs in the final merged BSJ file.
+    pub final_bsj_reads: usize,
 }
 
 #[derive(Clone)]
@@ -247,6 +251,8 @@ impl Scan2 {
             mem_limit: 2 * 1024 * 1024 * 1024,
             scan1_ids: HashSet::new(),
             seq_len,
+            rescued_reads: 0,
+            final_bsj_reads: 0,
         }
     }
 
@@ -305,8 +311,8 @@ impl Scan2 {
 
     /// Returns the temporary path used for one shard-local FSJ spill file.
     #[inline]
-    fn shard_fsj_path(output_bsj2: &str, shard_idx: usize) -> String {
-        format!("{}.fsj_shard_{}", output_bsj2, shard_idx)
+    fn shard_fsj_path(output_fsj: &str, shard_idx: usize) -> String {
+        part_path(output_fsj, shard_idx)
     }
 
     /// Writes one shard-local FSJ map to disk so the main thread can merge it
@@ -481,14 +487,31 @@ impl Scan2 {
     pub fn run(
         &mut self,
         sam_file: &str,
+        input_bsj1: &str,
+        output_bsj: &str,
         output_bsj2: &str,
+        output_fsj: &str,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
         use crate::sam_bam::{detect_format, InputFormat};
         let format = detect_format(sam_file)?;
         match format {
-            InputFormat::Sam => self.run_sam(sam_file, output_bsj2, chr_tcga_map),
-            InputFormat::Bam => self.run_bam(sam_file, output_bsj2, chr_tcga_map),
+            InputFormat::Sam => self.run_sam(
+                sam_file,
+                input_bsj1,
+                output_bsj,
+                output_bsj2,
+                output_fsj,
+                chr_tcga_map,
+            ),
+            InputFormat::Bam => self.run_bam(
+                sam_file,
+                input_bsj1,
+                output_bsj,
+                output_bsj2,
+                output_fsj,
+                chr_tcga_map,
+            ),
         }
     }
 
@@ -499,7 +522,10 @@ impl Scan2 {
     pub fn run_sam(
         &mut self,
         sam_file: &str,
+        input_bsj1: &str,
+        output_bsj: &str,
         output_bsj2: &str,
+        output_fsj: &str,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
         let run_started = Instant::now();
@@ -524,8 +550,8 @@ impl Scan2 {
         }
 
         let pb = ProgressBar::new(file_size as u64);
-        pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")?.progress_chars("#>-"));
-        pb.set_message("Scan 2: Rescuing signals & counting FSJ");
+        pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {percent:>3}% ({eta}) {msg}")?.progress_chars("#>-"));
+        pb.set_message("");
 
         (0..num_threads).into_par_iter().try_for_each(|i| {
             let start = i * shard_size;
@@ -534,8 +560,8 @@ impl Scan2 {
             } else {
                 (i + 1) * shard_size
             };
-            let shard_out = format!("{}.shard_{}", output_bsj2, i);
-            let fsj_out = Self::shard_fsj_path(output_bsj2, i);
+            let shard_out = part_path(output_bsj2, i);
+            let fsj_out = Self::shard_fsj_path(output_fsj, i);
             self.process_sam_shard_to_file(
                 &mmap,
                 start,
@@ -548,9 +574,11 @@ impl Scan2 {
             )
         })?;
 
-        pb.finish_with_message("Scan 2: Completed");
+        pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")?.progress_chars("#>-"));
+        pb.finish_with_message("Completed");
         let merge_started = Instant::now();
-        let result = self.merge_shards_and_fsj(output_bsj2, num_threads);
+        let result =
+            self.merge_shards_and_fsj(input_bsj1, output_bsj, output_bsj2, output_fsj, num_threads);
         if let Some(profile) = profile_ref {
             profile
                 .merge_ns
@@ -564,29 +592,52 @@ impl Scan2 {
         result
     }
 
-    /// Concatenates shard outputs and merges per-shard FSJ spill files.
-    fn merge_shards_and_fsj(&mut self, output_bsj2: &str, num_threads: usize) -> Result<()> {
-        let mut writer = BufWriter::with_capacity(
-            1024 * 1024,
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(output_bsj2)?,
-        );
+    /// Concatenates Scan1 and Scan2 BSJ outputs and merges per-shard FSJ spill files.
+    ///
+    /// The final `<prefix>.bsj` keeps one extra trailing column describing where
+    /// each line came from (`scan1` or `scan2`). Summary ignores the extra field
+    /// because all behaviorally relevant columns stay in their original positions.
+    fn merge_shards_and_fsj(
+        &mut self,
+        input_bsj1: &str,
+        output_bsj: &str,
+        output_bsj2: &str,
+        output_fsj: &str,
+        num_threads: usize,
+    ) -> Result<()> {
+        let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(output_bsj)?);
+        if let Ok(bsj1_file) = File::open(input_bsj1) {
+            let mut bsj1_reader = BufReader::new(bsj1_file);
+            let mut line = String::new();
+            while bsj1_reader.read_line(&mut line)? != 0 {
+                let trimmed = line.trim_end();
+                if !trimmed.is_empty() {
+                    writeln!(writer, "{}\tscan1", trimmed)?;
+                }
+                line.clear();
+            }
+        }
+        let mut rescued_ids = HashSet::new();
         for i in 0..num_threads {
-            let shard_path = format!("{}.shard_{}", output_bsj2, i);
+            let shard_path = part_path(output_bsj2, i);
             if let Ok(shard_file) = File::open(&shard_path) {
                 let mut shard_reader = BufReader::new(shard_file);
                 let mut line = String::new();
                 while shard_reader.read_line(&mut line)? != 0 {
-                    writer.write_all(line.as_bytes())?;
+                    let trimmed = line.trim_end();
+                    if !trimmed.is_empty() {
+                        if let Some(tab_idx) = trimmed.find('\t') {
+                            rescued_ids.insert(trimmed[..tab_idx].to_string());
+                        }
+                        writeln!(writer, "{}\tscan2", trimmed)?;
+                    }
                     line.clear();
                 }
             }
             let _ = std::fs::remove_file(shard_path);
         }
         for i in 0..num_threads {
-            let fsj_path = Self::shard_fsj_path(output_bsj2, i);
+            let fsj_path = Self::shard_fsj_path(output_fsj, i);
             if let Ok(fsj_file) = File::open(&fsj_path) {
                 let mut fsj_reader = BufReader::new(fsj_file);
                 let mut line = String::new();
@@ -608,6 +659,9 @@ impl Scan2 {
             let _ = std::fs::remove_file(fsj_path);
         }
         writer.flush()?;
+        self.rescued_reads = rescued_ids.len();
+        self.final_bsj_reads = self.scan1_ids.len() + self.rescued_reads;
+        let _ = std::fs::remove_file(input_bsj1);
         Ok(())
     }
 
@@ -615,7 +669,10 @@ impl Scan2 {
     pub fn run_bam(
         &mut self,
         bam_file: &str,
+        input_bsj1: &str,
+        output_bsj: &str,
         output_bsj2: &str,
+        output_fsj: &str,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
         use noodles::bam;
@@ -640,7 +697,7 @@ impl Scan2 {
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {percent:>3}% ({eta}) {msg}")?
                 .progress_chars("#>-"),
         );
-        pb.set_message("Scan 2 (BAM): starting...");
+        pb.set_message("");
         pb.enable_steady_tick(Duration::from_millis(120));
 
         unsafe {
@@ -659,8 +716,8 @@ impl Scan2 {
             } else {
                 (i + 1) * shard_size
             };
-            let shard_out = format!("{}.shard_{}", output_bsj2, i);
-            let fsj_out = Self::shard_fsj_path(output_bsj2, i);
+            let shard_out = part_path(output_bsj2, i);
+            let fsj_out = Self::shard_fsj_path(output_fsj, i);
             self.process_bam_shard_to_file(
                 &mmap,
                 start,
@@ -675,9 +732,15 @@ impl Scan2 {
         })?;
 
         pb.set_position(file_size);
-        pb.finish_with_message("Scan 2 (BAM): completed");
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")?
+                .progress_chars("#>-"),
+        );
+        pb.finish_with_message("Completed");
         let merge_started = Instant::now();
-        let result = self.merge_shards_and_fsj(output_bsj2, num_threads);
+        let result =
+            self.merge_shards_and_fsj(input_bsj1, output_bsj, output_bsj2, output_fsj, num_threads);
         if let Some(profile) = profile_ref {
             profile
                 .merge_ns

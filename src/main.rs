@@ -8,6 +8,7 @@ use anyhow::Result;
 use chrono::Local;
 use clap::Parser;
 use mimalloc::MiMalloc;
+use std::time::Instant;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -18,7 +19,10 @@ use ciri_toolkit::sam_bam::{check_bam_sorting, detect_format, InputFormat};
 use ciri_toolkit::scan1::Scan1;
 use ciri_toolkit::scan2::Scan2;
 use ciri_toolkit::summary::Summary;
-use ciri_toolkit::utils::parse_mem_str;
+use ciri_toolkit::utils::{
+    bsj1_path_for_output, bsj2_path_for_output, bsj_path_for_output, fsj_path_for_output,
+    parse_mem_str, result_path_for_output,
+};
 
 /// Parsed command-line arguments for the end-to-end pipeline.
 ///
@@ -31,7 +35,7 @@ struct Args {
     #[arg(short = 'i', long = "in")]
     in_sam: String,
 
-    /// Prefix for the output files
+    /// Output prefix; the pipeline writes `<prefix>.out/.bsj1/.bsj`
     #[arg(short = 'o', long = "out")]
     out_prefix: String,
 
@@ -80,8 +84,14 @@ fn log_info(label: &str, msg: &str) {
 
 /// Loads inputs, runs Scan1 -> Scan2 -> Summary, and writes the final report.
 fn main() -> Result<()> {
+    let run_started = Instant::now();
     let args = Args::parse();
     let mem_limit = parse_mem_str(&args.mem_per_thread);
+    let result_output = result_path_for_output(&args.out_prefix);
+    let bsj1_output = bsj1_path_for_output(&args.out_prefix);
+    let bsj_output = bsj_path_for_output(&args.out_prefix);
+    let bsj2_output = bsj2_path_for_output(&args.out_prefix);
+    let fsj_output = fsj_path_for_output(&args.out_prefix);
 
     if args.threads > 0 {
         rayon::ThreadPoolBuilder::new()
@@ -115,8 +125,7 @@ fn main() -> Result<()> {
     // Stage boundaries are logged explicitly because most benchmarking and parity
     // work is reasoned about in terms of Scan1 / Scan2 / Summary timings.
     // 3. Scan 1
-    log_info("Processing Scan 1", "Identifying Back-Spliced Junctions...");
-    let bsj1_output = format!("{}.BSJ1", args.out_prefix);
+    log_info("Running scan 1", "Identifying back-spliced junctions...");
     let mut scan1 = Scan1::new(
         args.min_mapq,
         args.min_span,
@@ -124,16 +133,17 @@ fn main() -> Result<()> {
         args.linear_range_size_min,
     );
     scan1.set_mem_limit(mem_limit);
-    scan1.run(
-        &args.in_sam,
-        &args.out_prefix,
-        &fasta.chr_tcga_map,
-        &annotation,
-    )?;
-    println!();
+    scan1.run(&args.in_sam, &bsj1_output, &fasta.chr_tcga_map, &annotation)?;
+    log_info(
+        "Scan 1 summary",
+        &format!(
+            "{} mapped reads, {} BSJ1 reads",
+            scan1.mapped_reads, scan1.bsj1_reads
+        ),
+    );
 
     // 4. Indexing
-    log_info("Index Mapping", "Constructing candidate site lookup...");
+    log_info("Loading BSJ sites", "generating candidate BSJ index...");
     let scan2_seq_len = (scan1.read_len - 12).max(1);
     // Scan1 is no longer needed once its output file and derived read length have
     // been materialized, so drop it before Scan2 to keep whole-genome RSS lower.
@@ -143,23 +153,44 @@ fn main() -> Result<()> {
     scan2.build_index(&bsj1_output)?;
 
     // 5. Scan 2
-    log_info("Processing Scan 2", "Rescuing signals & quantifying FSJ...");
-    scan2.run(&args.in_sam, &bsj1_output, &fasta.chr_tcga_map)?;
+    log_info("Running scan 2", "Curating splicing signals & counting FSJs...");
+    scan2.run(
+        &args.in_sam,
+        &bsj1_output,
+        &bsj_output,
+        &bsj2_output,
+        &fsj_output,
+        &fasta.chr_tcga_map,
+    )?;
+    log_info(
+        "Scan 2 summary",
+        &format!("{} BSJ2 reads rescued", scan2.rescued_reads),
+    );
     scan2.release_working_set();
-    println!();
 
     // 6. Finalization
-    log_info("Summarizing", "Clustering sites and filtering results...");
+    log_info("Post-processing", "Clustering sites and filtering results...");
     let mut summary = Summary::new(args.stringency);
     summary.run(
-        &bsj1_output,
-        &args.out_prefix,
+        &bsj_output,
+        &result_output,
         &scan2.fsj_map,
         &fasta.chr_tcga_map,
         &annotation,
     )?;
+    log_info(
+        "Final summary",
+        &format!(
+            "{} circRNAs, {} BSJ reads detected",
+            summary.circ_count, summary.final_bsj_reads
+        ),
+    );
 
-    log_info("Final Report", &format!("{}.result", args.out_prefix));
+    log_info("Output file", &result_output);
+    log_info(
+        "Total runtime",
+        &format!("{:.2} seconds", run_started.elapsed().as_secs_f64()),
+    );
 
     Ok(())
 }

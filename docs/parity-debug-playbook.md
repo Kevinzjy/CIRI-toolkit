@@ -133,7 +133,7 @@ CIRI_PROFILE_SCAN2=1 ./target/release/ciri-toolkit ...
 
 ## 5. 推荐排查流程（SOP）
 
-1. 运行正常模式，拿到 Rust `.result`。
+1. 运行正常模式，拿到 Rust `.out`。
 2. 用 `analyze_diff.py` 看三层差异。
 3. 从 `ONLY_*` 集合中挑 2~4 条典型 read。
 4. 开 `CIRI_TRACE_READS` 看 Scan1/Scan2 分支与 tag。
@@ -147,11 +147,11 @@ CIRI_PROFILE_SCAN2=1 ./target/release/ciri-toolkit ...
 
 针对具体 read，建议按这个顺序缩小范围：
 
-1. 在 Rust `.BSJ1` 里找 read 是否出现。
-2. 如果不在 `.BSJ1`，先查 `Scan1`：
+1. 先在 Rust 最终 `.bsj` 里找 read 是否出现，并看尾列来源是 `scan1` 还是 `scan2`。
+2. 如果不在 `.bsj`，先查 `Scan1`：
    - 看是否有 `TRACE_SCAN1_CAND`
    - 看是否进入 `TRACE_SCAN1_HG1`
-3. 如果在 `.BSJ1` 但不在 `.result`，再查 `Scan2` / `Summary`：
+3. 如果在 `.bsj` 里有，但不在最终 `.out`，再查 `Summary`：
    - 看 `TRACE_SCAN2_CAND`
    - 必要时开 `CIRI_TRACE_ALL_CANDS=1`
    - 必要时看 `TRACE_SCAN2_HG2`
@@ -171,7 +171,7 @@ CIRI_PROFILE_SCAN2=1 ./target/release/ciri-toolkit ...
 - 注释版本不一致：
   - exon 覆盖变化会直接改变 `circRNA_type`、`gene_id`，并可能影响“看起来是否支持”某些 case 的判断。
 - subset 缺少中间上下文：
-  - 若 full 与 subset 结论不同，说明该 case 依赖未进入最终 `.result` 的竞争候选或 supporting context。
+  - 若 full 与 subset 结论不同，说明该 case 依赖未进入最终 `.out` 的竞争候选或 supporting context。
 
 ## 8. 变更验收门槛
 
@@ -186,7 +186,7 @@ CIRI_PROFILE_SCAN2=1 ./target/release/ciri-toolkit ...
 ## 9. 输出与记录建议
 
 - 调试产物命名建议：
-  - `tmp/<dataset>_<short_name>.result`
+  - `tmp/<dataset>_<short_name>.out`
   - `tmp/<dataset>_<short_name>.log`
 - 每次实验记录四件事：
   - 改了什么

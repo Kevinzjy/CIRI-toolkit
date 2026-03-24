@@ -27,7 +27,8 @@
 
 ### 1. BAM 并行分片处理已恢复
 - `Scan1` 的 BAM 路径已从单线程顺序读取切回并行分片执行。
-- shard 输出会在最后 merge 成统一 `.BSJ1`。
+- shard 输出会在最后 merge 成统一 First Scan 中间文件 `<prefix>.bsj1`。
+  Second Scan 的临时补充结果使用 `<prefix>.bsj2.part_0001.tmp`，最终再合并成 `<prefix>.bsj`。
 - 这一步已经通过 `tests/chr1` 的三层零差异验证。
 
 ### 2. BAM 热循环的低风险去分配优化

@@ -3,6 +3,10 @@
 #[cfg(test)]
 mod tests {
     use crate::scan2::Scan2;
+    use crate::utils::{
+        bsj1_path_for_output, bsj2_path_for_output, bsj_path_for_output, fsj_path_for_output,
+        result_path_for_output,
+    };
     use std::fs::File;
     use tempfile::tempdir;
 
@@ -53,7 +57,11 @@ mod tests {
             .unwrap();
 
         let mut scan2 = Scan2::new(10, 5, 100);
-        let bsj1_path = format!("{}.BSJ1", out_prefix);
+        let bsj1_path = bsj1_path_for_output(&out_prefix);
+        let bsj2_path = bsj2_path_for_output(&out_prefix);
+        let bsj_path = bsj_path_for_output(&out_prefix);
+        let fsj_path = fsj_path_for_output(&out_prefix);
+        let result_path = result_path_for_output(&out_prefix);
         // Ensure the file exists if scan1 didn't find anything
         if !std::path::Path::new(&bsj1_path).exists() {
             File::create(&bsj1_path).unwrap();
@@ -62,7 +70,10 @@ mod tests {
         scan2
             .run(
                 sam_path.to_str().unwrap(),
-                &format!("{}.BSJ2", out_prefix),
+                &bsj1_path,
+                &bsj_path,
+                &bsj2_path,
+                &fsj_path,
                 &fasta.chr_tcga_map,
             )
             .unwrap();
@@ -70,15 +81,15 @@ mod tests {
         let mut summary = Summary::new(0);
         summary
             .run(
-                &bsj1_path,
-                &out_prefix,
+                &bsj_path,
+                &result_path,
                 &scan2.fsj_map,
                 &fasta.chr_tcga_map,
                 &annotation,
             )
             .unwrap();
 
-        assert!(std::path::Path::new(&format!("{}.result", out_prefix)).exists());
+        assert!(std::path::Path::new(&result_path).exists());
     }
 
     #[test]
@@ -112,12 +123,19 @@ mod tests {
             .unwrap();
 
         let mut scan2 = Scan2::new(10, 5, 100);
-        let bsj1_path = format!("{}.BSJ1", out_prefix);
+        let bsj1_path = bsj1_path_for_output(&out_prefix);
+        let bsj2_path = bsj2_path_for_output(&out_prefix);
+        let bsj_path = bsj_path_for_output(&out_prefix);
+        let fsj_path = fsj_path_for_output(&out_prefix);
+        let result_path = result_path_for_output(&out_prefix);
         scan2.build_index(&bsj1_path).unwrap();
         scan2
             .run(
                 bam_path,
-                &format!("{}.BSJ2", out_prefix),
+                &bsj1_path,
+                &bsj_path,
+                &bsj2_path,
+                &fsj_path,
                 &fasta.chr_tcga_map,
             )
             .unwrap();
@@ -125,14 +143,14 @@ mod tests {
         let mut summary = Summary::new(0);
         summary
             .run(
-                &bsj1_path,
-                &out_prefix,
+                &bsj_path,
+                &result_path,
                 &scan2.fsj_map,
                 &fasta.chr_tcga_map,
                 &annotation,
             )
             .unwrap();
 
-        assert!(std::path::Path::new(&format!("{}.result", out_prefix)).exists());
+        assert!(std::path::Path::new(&result_path).exists());
     }
 }

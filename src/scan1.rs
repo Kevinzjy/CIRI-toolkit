@@ -1,14 +1,14 @@
 //! Scan1: first-pass BSJ candidate discovery.
 //!
 //! This module owns the initial read-group scan over SAM/BAM input and emits the
-//! Java-compatible `*.BSJ1` intermediate file consumed by Scan2 and Summary.
+//! Java-compatible BSJ intermediate file consumed by Scan2 and Summary.
 //! Performance work here is deliberately limited to ingestion, sharding, and
 //! temporary allocation control; the candidate semantics still follow Java CIRI3.
 
 use crate::annotation::Annotation;
 use crate::is_bsj_hg2::{java_substring, report_scan1_hg_profile, IsBSJHg2};
 use crate::misd::misd;
-use crate::utils::{bam_shard_count, AlignmentRecord};
+use crate::utils::{bam_shard_count, part_path, AlignmentRecord};
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
@@ -42,6 +42,10 @@ pub struct Scan1 {
     pub linear_range_size_min: i32,
     pub mem_limit: u64,
     pub read_len: i32,
+    /// Total read groups observed during Scan1 input traversal.
+    pub mapped_reads: u64,
+    /// Unique read IDs emitted into the merged Scan1 BSJ file.
+    pub bsj1_reads: usize,
 }
 
 type OwnedAlignmentRecord = AlignmentRecord<'static>;
@@ -57,6 +61,18 @@ struct SamOwnedGroup {
     group: [Vec<OwnedAlignmentRecord>; 2],
     stand_map: OwnedStandMap,
     align_num: usize,
+}
+
+/// Lightweight Scan1 traversal summary used for user-facing stage logs.
+struct Scan1TraversalStats {
+    max_read_len: i32,
+    mapped_reads: u64,
+}
+
+/// One shard-local Scan1 summary.
+struct Scan1ShardStats {
+    max_read_len: i32,
+    mapped_reads: u64,
 }
 
 /// Advises the kernel that an already-processed BAM byte range can be evicted.
@@ -217,7 +233,7 @@ impl Scan1Profile {
 }
 
 impl Scan1 {
-    /// Normalizes the split-CIGAR text that gets written into `*.BSJ1`.
+    /// Normalizes the split-CIGAR text that gets written into the persisted BSJ file.
     ///
     /// Java's downstream `Summary` and `Misd` code effectively reasons about
     /// hard clips as soft clips (`H -> S`). Keeping raw `H` in the persisted
@@ -248,6 +264,8 @@ impl Scan1 {
             linear_range_size_min,
             mem_limit: 2 * 1024 * 1024 * 1024,
             read_len: 0,
+            mapped_reads: 0,
+            bsj1_reads: 0,
         }
     }
 
@@ -260,15 +278,15 @@ impl Scan1 {
     pub fn run(
         &mut self,
         sam_file: &str,
-        out_prefix: &str,
+        bsj_path: &str,
         fasta_map: &HashMap<String, String>,
         annotation: &Annotation,
     ) -> Result<HashSet<String>> {
         use crate::sam_bam::{detect_format, InputFormat};
         let format = detect_format(sam_file)?;
         match format {
-            InputFormat::Sam => self.run_sam(sam_file, out_prefix, fasta_map, annotation),
-            InputFormat::Bam => self.run_bam(sam_file, out_prefix, fasta_map, annotation),
+            InputFormat::Sam => self.run_sam(sam_file, bsj_path, fasta_map, annotation),
+            InputFormat::Bam => self.run_bam(sam_file, bsj_path, fasta_map, annotation),
         }
     }
 
@@ -280,7 +298,7 @@ impl Scan1 {
     pub fn run_sam(
         &mut self,
         sam_file: &str,
-        out_prefix: &str,
+        bsj_path: &str,
         fasta_map: &HashMap<String, String>,
         annotation: &Annotation,
     ) -> Result<HashSet<String>> {
@@ -291,15 +309,24 @@ impl Scan1 {
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {percent:>3}% ({eta}) {msg}")?
                 .progress_chars("#>-"),
         );
-        pb.set_message("Scan 1 (SAM): reading groups...");
+        pb.set_message("");
         pb.enable_steady_tick(Duration::from_millis(120));
 
-        let shard_out = format!("{}.BSJ1.shard_0", out_prefix);
-        self.read_len =
+        let shard_out = part_path(bsj_path, 0);
+        let stats =
             self.process_sam_file_to_file(sam_file, fasta_map, annotation, &pb, &shard_out)?;
+        self.read_len = stats.max_read_len;
+        self.mapped_reads = stats.mapped_reads;
 
-        pb.finish_with_message("Scan 1 (SAM): completed");
-        self.merge_and_collect_ids(out_prefix, 1)
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")?
+                .progress_chars("#>-"),
+        );
+        pb.finish_with_message("");
+        let scan1_ids = self.merge_and_collect_ids(bsj_path, 1)?;
+        self.bsj1_reads = scan1_ids.len();
+        Ok(scan1_ids)
     }
 
     /// Streams a SAM file into one shard output while batching read groups for
@@ -314,14 +341,14 @@ impl Scan1 {
         annotation: &Annotation,
         pb: &ProgressBar,
         out_path: &str,
-    ) -> Result<i32> {
+    ) -> Result<Scan1TraversalStats> {
         let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
         let batch_size = (rayon::current_num_threads().max(1) * 256).max(1024);
         let (tx, rx) =
             mpsc::sync_channel::<Vec<SamOwnedGroup>>(rayon::current_num_threads().max(2));
         let pb_clone = pb.clone();
 
-        let max_read_len = thread::scope(|scope| -> Result<i32> {
+        let stats = thread::scope(|scope| -> Result<Scan1TraversalStats> {
             let producer =
                 scope.spawn(|| self.stream_sam_group_batches(sam_file, &pb_clone, tx, batch_size));
 
@@ -335,7 +362,7 @@ impl Scan1 {
         })?;
 
         writer.flush()?;
-        Ok(max_read_len)
+        Ok(stats)
     }
 
     /// Sequentially parses SAM records and sends owned read groups to workers.
@@ -348,7 +375,7 @@ impl Scan1 {
         pb: &ProgressBar,
         tx: mpsc::SyncSender<Vec<SamOwnedGroup>>,
         batch_size: usize,
-    ) -> Result<i32> {
+    ) -> Result<Scan1TraversalStats> {
         let sam_reader = BufReader::with_capacity(1024 * 1024, File::open(sam_file)?);
         let mut reader = sam::io::Reader::new(sam_reader);
         let header = reader.read_header()?;
@@ -364,6 +391,7 @@ impl Scan1 {
         let mut batch = Vec::with_capacity(batch_size);
         let mut records_since_progress = 0usize;
         let mut last_progress_pos = reader.get_mut().stream_position()?;
+        let mut mapped_reads = 0u64;
 
         while reader.read_record(&mut record)? != 0 {
             let read_id = record
@@ -378,6 +406,7 @@ impl Scan1 {
                         &mut stand_map,
                         align_num,
                     );
+                    mapped_reads += 1;
                     if batch.len() >= batch_size {
                         tx.send(std::mem::take(&mut batch))
                             .map_err(|_| anyhow::anyhow!("SAM group consumer dropped"))?;
@@ -461,6 +490,7 @@ impl Scan1 {
                 &mut stand_map,
                 align_num,
             );
+            mapped_reads += 1;
         }
         if !batch.is_empty() {
             tx.send(batch)
@@ -472,7 +502,10 @@ impl Scan1 {
             pb.inc(final_pos - last_progress_pos);
         }
 
-        Ok(max_read_len)
+        Ok(Scan1TraversalStats {
+            max_read_len,
+            mapped_reads,
+        })
     }
 
     /// Moves the currently accumulated SAM read group into the worker batch.
@@ -539,16 +572,11 @@ impl Scan1 {
     ///
     /// The final `HashSet` is later used by Scan2 to implement Java's "skip
     /// already-assigned reads" behavior.
-    fn merge_and_collect_ids(
-        &self,
-        out_prefix: &str,
-        num_threads: usize,
-    ) -> Result<HashSet<String>> {
-        let bsj1_path = format!("{}.BSJ1", out_prefix);
-        let mut final_writer = BufWriter::with_capacity(1024 * 1024, File::create(&bsj1_path)?);
+    fn merge_and_collect_ids(&self, bsj_path: &str, num_threads: usize) -> Result<HashSet<String>> {
+        let mut final_writer = BufWriter::with_capacity(1024 * 1024, File::create(bsj_path)?);
         let mut scan1_id_map = HashSet::new();
         for i in 0..num_threads {
-            let shard_path = format!("{}.BSJ1.shard_{}", out_prefix, i);
+            let shard_path = part_path(bsj_path, i);
             if let Ok(shard_file) = File::open(&shard_path) {
                 let mut reader = BufReader::new(shard_file);
                 let mut line = String::new();
@@ -577,7 +605,7 @@ impl Scan1 {
     pub fn run_bam(
         &mut self,
         bam_file: &str,
-        out_prefix: &str,
+        bsj_path: &str,
         fasta_map: &HashMap<String, String>,
         annotation: &Annotation,
     ) -> Result<HashSet<String>> {
@@ -603,7 +631,7 @@ impl Scan1 {
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {percent:>3}% ({eta}) {msg}")?
                 .progress_chars("#>-"),
         );
-        pb.set_message("Scan 1 (BAM): starting...");
+        pb.set_message("");
         pb.enable_steady_tick(Duration::from_millis(120));
 
         unsafe {
@@ -615,7 +643,7 @@ impl Scan1 {
         }
 
         let header_ref = &header;
-        let shard_max_read_lens: Vec<i32> = (0..num_threads)
+        let shard_stats: Vec<Scan1ShardStats> = (0..num_threads)
             .into_par_iter()
             .map(|i| {
                 let start = i * shard_size;
@@ -624,7 +652,7 @@ impl Scan1 {
                 } else {
                     (i + 1) * shard_size
                 };
-                let shard_out = format!("{}.BSJ1.shard_{}", out_prefix, i);
+                let shard_out = part_path(bsj_path, i);
                 self.process_bam_shard_to_file(
                     i,
                     &mmap,
@@ -637,15 +665,24 @@ impl Scan1 {
                     &shard_out,
                     profile_ref,
                 )
-                .unwrap_or(0)
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
-        self.read_len = shard_max_read_lens.into_iter().max().unwrap_or(0);
+        self.read_len = shard_stats
+            .iter()
+            .map(|s| s.max_read_len)
+            .max()
+            .unwrap_or(0);
+        self.mapped_reads = shard_stats.iter().map(|s| s.mapped_reads).sum();
         pb.set_position(file_size);
-        pb.finish_with_message("Scan 1 (BAM): completed");
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")?
+                .progress_chars("#>-"),
+        );
+        pb.finish_with_message("Completed");
         let merge_started = Instant::now();
-        let result = self.merge_and_collect_ids(out_prefix, num_threads);
+        let result = self.merge_and_collect_ids(bsj_path, num_threads);
         if let Some(profile) = profile_ref {
             profile
                 .merge_ns
@@ -655,7 +692,9 @@ impl Scan1 {
                 .fetch_add(run_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             profile.report();
         }
-        result
+        let scan1_ids = result?;
+        self.bsj1_reads = scan1_ids.len();
+        Ok(scan1_ids)
     }
 
     /// Processes one BAM shard into a temporary BSJ1 shard file.
@@ -675,7 +714,7 @@ impl Scan1 {
         pb: &ProgressBar,
         out_path: &str,
         profile: Option<&Scan1Profile>,
-    ) -> Result<i32> {
+    ) -> Result<Scan1ShardStats> {
         use noodles::bam;
         let shard_started = profile.map(|_| Instant::now());
         let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
@@ -715,7 +754,10 @@ impl Scan1 {
             found.unwrap_or(0)
         };
         if pos >= mmap.len() {
-            return Ok(0);
+            return Ok(Scan1ShardStats {
+                max_read_len: 0,
+                mapped_reads: 0,
+            });
         }
         let mut reader = bam::io::Reader::new(&mmap[pos..]);
         if start == 0 {
@@ -732,6 +774,7 @@ impl Scan1 {
         let mut last_evicted_pos = pos;
         let eviction_threshold = 64 * 1024 * 1024;
         let mut shard_max_read_len = 0i32;
+        let mut mapped_reads = 0u64;
         let mut cigar_buf = String::with_capacity(64);
         let mut seq_buf = String::with_capacity(256);
         while reader.read_record(&mut record)? != 0 {
@@ -811,6 +854,7 @@ impl Scan1 {
                     abs_c_pos,
                 );
                 if !current_id.is_empty() {
+                    mapped_reads += 1;
                     let id_str = String::from_utf8_lossy(&current_id);
                     let non_empty_groups = group.iter().filter(|g| !g.is_empty()).count();
                     if align_num > 2 || non_empty_groups == 1 {
@@ -903,6 +947,7 @@ impl Scan1 {
             align_num += 1;
         }
         if !current_id.is_empty() {
+            mapped_reads += 1;
             let id_str = String::from_utf8_lossy(&current_id);
             if let Some((_, res_line)) = self.process_group_view(
                 &id_str,
@@ -937,7 +982,10 @@ impl Scan1 {
                 .shard_total_ns
                 .fetch_add(shard_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
-        Ok(shard_max_read_len)
+        Ok(Scan1ShardStats {
+            max_read_len: shard_max_read_len,
+            mapped_reads,
+        })
     }
 
     /// Thin profiling wrapper around the actual read-group judge.

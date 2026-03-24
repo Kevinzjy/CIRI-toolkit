@@ -28,14 +28,14 @@ cargo build --release
 ```bash
 ./target/release/ciri-toolkit \
   -i input.sam \
-  -o output_prefix \
+  -o sample.ciri \
   -r reference.fa \
   -a annotation.gtf
 ```
 
 ## 参数说明
 - `-i, --in`：输入文件（SAM 或 BAM）
-- `-o, --out`：输出前缀（生成 `.BSJ1`、`.result` 等）
+- `-o, --out`：输出前缀
 - `-r, --ref`：参考基因组 FASTA
 - `-a, --anno`：注释文件 GTF（可选）
 - `-m, --mapq`：最小 MAPQ（默认 `10`，与 Java `-U` 默认一致）
@@ -47,6 +47,19 @@ cargo build --release
 - `-M, --mem-per-thread`：每线程内存预算（如 `2G`、`512M`，默认 `512M`）
 
 > 默认参数已对齐 CIRI3，一般无需手动设置上述核心阈值。
+
+输出命名规则：
+
+- 若 `-o sample.ciri`
+  - 最终结果：`sample.ciri.out`
+  - First Scan 合并结果：`sample.ciri.bsj1`
+  - Final BSJ 合并结果：`sample.ciri.bsj`
+  - First Scan 临时文件：`sample.ciri.bsj1.part_0001.tmp`
+  - Second Scan 临时文件：`sample.ciri.bsj2.part_0001.tmp`
+  - FSJ 临时文件：`sample.ciri.fsj.part_0001.tmp`
+  - `Scan2` 合并完成后会自动删除中间的 `sample.ciri.bsj1`
+
+最终 `.bsj` 会比内部中间格式多一个尾列，标记该行来自 `scan1` 还是 `scan2`。
 
 ## 一键差异统计
 
@@ -117,7 +130,7 @@ CIRI_PROFILE_SCAN2=1 ./target/release/ciri-toolkit ...
 
 ## 输出格式
 
-最终 `.result` 为 13 列，兼容 CIRI3 常见下游分析：
+最终 `.out` 为 13 列，兼容 CIRI3 常见下游分析：
 1. `circRNA_ID`
 2. `chr`
 3. `circRNA_start`
