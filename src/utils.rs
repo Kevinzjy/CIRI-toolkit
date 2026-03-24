@@ -76,6 +76,14 @@ pub fn result_path_for_output(output_arg: &str) -> String {
     format!("{}.out", output_arg)
 }
 
+/// Returns the sidecar log path for one CLI prefix.
+///
+/// This file stores the high-level stage summaries emitted by the main pipeline
+/// so long runs can be reviewed after the terminal session ends.
+pub fn log_path_for_output(output_arg: &str) -> String {
+    format!("{}.log", output_arg)
+}
+
 /// Returns the merged Scan1 BSJ output path for one CLI prefix.
 pub fn bsj1_path_for_output(output_arg: &str) -> String {
     format!("{}.bsj1", output_arg)
@@ -148,6 +156,7 @@ mod tests {
     #[test]
     fn test_output_paths_for_prefix() {
         assert_eq!(result_path_for_output("sample.ciri"), "sample.ciri.out");
+        assert_eq!(log_path_for_output("sample.ciri"), "sample.ciri.log");
         assert_eq!(bsj1_path_for_output("sample.ciri"), "sample.ciri.bsj1");
         assert_eq!(bsj_path_for_output("sample.ciri"), "sample.ciri.bsj");
         assert_eq!(bsj2_path_for_output("sample.ciri"), "sample.ciri.bsj2");

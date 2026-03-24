@@ -8,6 +8,8 @@ use anyhow::Result;
 use chrono::Local;
 use clap::Parser;
 use mimalloc::MiMalloc;
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::time::Instant;
 
 #[global_allocator]
@@ -21,7 +23,7 @@ use ciri_toolkit::scan2::Scan2;
 use ciri_toolkit::summary::Summary;
 use ciri_toolkit::utils::{
     bsj1_path_for_output, bsj2_path_for_output, bsj_path_for_output, fsj_path_for_output,
-    parse_mem_str, result_path_for_output,
+    log_path_for_output, parse_mem_str, result_path_for_output,
 };
 
 /// Parsed command-line arguments for the end-to-end pipeline.
@@ -77,9 +79,16 @@ struct Args {
 }
 
 /// Emits one aligned, timestamped progress line.
-fn log_info(label: &str, msg: &str) {
+///
+/// Logs are mirrored to stdout and to `<prefix>.log` so the user can inspect a
+/// durable run record after the process exits.
+fn log_info(log_writer: &mut BufWriter<File>, label: &str, msg: &str) -> Result<()> {
     let now = Local::now().format("%Y-%m-%d %H:%M:%S");
-    println!("{} [INFO] {:<18}: {}", now, label, msg);
+    let line = format!("{} [INFO] {:<18}: {}", now, label, msg);
+    println!("{}", line);
+    writeln!(log_writer, "{}", line)?;
+    log_writer.flush()?;
+    Ok(())
 }
 
 /// Loads inputs, runs Scan1 -> Scan2 -> Summary, and writes the final report.
@@ -88,10 +97,12 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let mem_limit = parse_mem_str(&args.mem_per_thread);
     let result_output = result_path_for_output(&args.out_prefix);
+    let log_output = log_path_for_output(&args.out_prefix);
     let bsj1_output = bsj1_path_for_output(&args.out_prefix);
     let bsj_output = bsj_path_for_output(&args.out_prefix);
     let bsj2_output = bsj2_path_for_output(&args.out_prefix);
     let fsj_output = fsj_path_for_output(&args.out_prefix);
+    let mut log_writer = BufWriter::new(File::create(&log_output)?);
 
     if args.threads > 0 {
         rayon::ThreadPoolBuilder::new()
@@ -99,14 +110,15 @@ fn main() -> Result<()> {
             .build_global()?;
     }
 
-    log_info("Reference FASTA", &args.ref_fasta);
+    log_info(&mut log_writer, "Reference FASTA", &args.ref_fasta)?;
     let mut fasta = FastaReader::new();
     fasta.read_fasta(&args.ref_fasta)?;
 
     log_info(
+        &mut log_writer,
         "Annotation GTF",
         args.gtf.as_deref().unwrap_or("None provided"),
-    );
+    )?;
     let mut annotation = Annotation::new();
     if let Some(gtf_path) = &args.gtf {
         annotation.read_gtf(gtf_path)?;
@@ -120,12 +132,16 @@ fn main() -> Result<()> {
         }
         InputFormat::Sam => "SAM (text-based)",
     };
-    log_info("Input format", format_str);
+    log_info(&mut log_writer, "Input format", format_str)?;
 
     // Stage boundaries are logged explicitly because most benchmarking and parity
     // work is reasoned about in terms of Scan1 / Scan2 / Summary timings.
     // 3. Scan 1
-    log_info("Running scan 1", "Identifying back-spliced junctions...");
+    log_info(
+        &mut log_writer,
+        "Running scan 1",
+        "Identifying back-spliced junctions...",
+    )?;
     let mut scan1 = Scan1::new(
         args.min_mapq,
         args.min_span,
@@ -135,15 +151,20 @@ fn main() -> Result<()> {
     scan1.set_mem_limit(mem_limit);
     scan1.run(&args.in_sam, &bsj1_output, &fasta.chr_tcga_map, &annotation)?;
     log_info(
+        &mut log_writer,
         "Scan 1 summary",
         &format!(
             "{} mapped reads, {} BSJ1 reads",
             scan1.mapped_reads, scan1.bsj1_reads
         ),
-    );
+    )?;
 
     // 4. Indexing
-    log_info("Loading BSJ sites", "generating candidate BSJ index...");
+    log_info(
+        &mut log_writer,
+        "Loading BSJ sites",
+        "generating candidate BSJ index...",
+    )?;
     let scan2_seq_len = (scan1.read_len - 12).max(1);
     // Scan1 is no longer needed once its output file and derived read length have
     // been materialized, so drop it before Scan2 to keep whole-genome RSS lower.
@@ -153,7 +174,11 @@ fn main() -> Result<()> {
     scan2.build_index(&bsj1_output)?;
 
     // 5. Scan 2
-    log_info("Running scan 2", "Curating splicing signals & counting FSJs...");
+    log_info(
+        &mut log_writer,
+        "Running scan 2",
+        "Curating splicing signals & counting FSJs...",
+    )?;
     scan2.run(
         &args.in_sam,
         &bsj1_output,
@@ -163,13 +188,18 @@ fn main() -> Result<()> {
         &fasta.chr_tcga_map,
     )?;
     log_info(
+        &mut log_writer,
         "Scan 2 summary",
         &format!("{} BSJ2 reads rescued", scan2.rescued_reads),
-    );
+    )?;
     scan2.release_working_set();
 
     // 6. Finalization
-    log_info("Post-processing", "Clustering sites and filtering results...");
+    log_info(
+        &mut log_writer,
+        "Post-processing",
+        "Clustering sites and filtering results...",
+    )?;
     let mut summary = Summary::new(args.stringency);
     summary.run(
         &bsj_output,
@@ -179,18 +209,20 @@ fn main() -> Result<()> {
         &annotation,
     )?;
     log_info(
+        &mut log_writer,
         "Final summary",
         &format!(
             "{} circRNAs, {} BSJ reads detected",
             summary.circ_count, summary.final_bsj_reads
         ),
-    );
+    )?;
 
-    log_info("Output file", &result_output);
+    log_info(&mut log_writer, "Output file", &result_output)?;
     log_info(
+        &mut log_writer,
         "Total runtime",
         &format!("{:.2} seconds", run_started.elapsed().as_secs_f64()),
-    );
+    )?;
 
     Ok(())
 }

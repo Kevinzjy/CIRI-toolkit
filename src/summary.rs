@@ -3,7 +3,8 @@
 //! This pass merges nearby circRNA sites, applies Java-compatible stringency
 //! filters, and writes the final circRNA report.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
@@ -35,6 +36,38 @@ struct CircSortItem {
 }
 
 impl Summary {
+    /// Compares chromosome names using a "main chromosomes first" order.
+    ///
+    /// The old `BTreeMap` output order was pure lexicographic, which placed
+    /// scaffolds such as `GL*` and `KI*` before or between the expected main
+    /// chromosome blocks on hg38 outputs. For downstream inspection we want all
+    /// `chr*` contigs first, with canonical chromosomes ordered naturally
+    /// (`chr1..chr22, chrX, chrY, chrM/chrMT`), then the remaining `chr*`
+    /// contigs, and only after that non-`chr` scaffolds.
+    fn compare_chr_names(a: &str, b: &str) -> Ordering {
+        fn chr_rank(chr: &str) -> (u8, u8, i32, &str) {
+            if let Some(rest) = chr.strip_prefix("chr") {
+                if let Ok(n) = rest.parse::<i32>() {
+                    return (0, 0, n, "");
+                }
+                return match rest {
+                    "X" => (0, 1, 23, ""),
+                    "Y" => (0, 1, 24, ""),
+                    "M" | "MT" => (0, 1, 25, ""),
+                    _ => (0, 2, 0, rest),
+                };
+            }
+            (1, 0, 0, chr)
+        }
+
+        let ka = chr_rank(a);
+        let kb = chr_rank(b);
+        ka.0.cmp(&kb.0)
+            .then_with(|| ka.1.cmp(&kb.1))
+            .then_with(|| ka.2.cmp(&kb.2))
+            .then_with(|| ka.3.cmp(kb.3))
+    }
+
     /// Mirrors Java Summary's fallback annotation pass for non-exact exon
     /// boundary matches.
     ///
@@ -502,7 +535,7 @@ impl Summary {
             circ_map_capacity,
         );
 
-        let mut final_results: BTreeMap<String, Vec<CircSortItem>> = BTreeMap::new();
+        let mut final_results: HashMap<String, Vec<CircSortItem>> = HashMap::new();
         let mut final_read_ids: HashSet<String> = HashSet::new();
         for (chr_start_end, lines) in &circ_map {
             let p_key: Vec<&str> = chr_start_end.split('\t').collect();
@@ -643,7 +676,10 @@ impl Summary {
         let out_file = File::create(result_path)?;
         let mut writer = BufWriter::with_capacity(1024 * 1024, out_file);
         writeln!(writer, "circRNA_ID\tchr\tcircRNA_start\tcircRNA_end\t#junction_reads\tSM_MS_SMS\t#non_junction_reads\tjunction_reads_ratio\tcircRNA_type\tgene_id\tstrand\tjunction_reads_ID\tScore")?;
-        for items in final_results.values_mut() {
+        let mut chrs: Vec<String> = final_results.keys().cloned().collect();
+        chrs.sort_by(|a, b| Self::compare_chr_names(a, b));
+        for chr in chrs {
+            let items = final_results.get_mut(&chr).expect("chromosome key exists");
             items.sort_by_key(|x| x.start_site);
             for item in items {
                 writeln!(writer, "{}", item.line)?;
@@ -653,5 +689,38 @@ impl Summary {
         writer.flush()?;
         self.final_bsj_reads = final_read_ids.len();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Summary;
+
+    #[test]
+    fn test_compare_chr_names_main_chromosomes_first() {
+        let mut chrs = vec![
+            "GL000225.1".to_string(),
+            "chr10".to_string(),
+            "chr2".to_string(),
+            "KI270442.1".to_string(),
+            "chrX".to_string(),
+            "chr1".to_string(),
+            "chrM".to_string(),
+            "chrUn_KI270442v1".to_string(),
+        ];
+        chrs.sort_by(|a, b| Summary::compare_chr_names(a, b));
+        assert_eq!(
+            chrs,
+            vec![
+                "chr1",
+                "chr2",
+                "chr10",
+                "chrX",
+                "chrM",
+                "chrUn_KI270442v1",
+                "GL000225.1",
+                "KI270442.1",
+            ]
+        );
     }
 }
