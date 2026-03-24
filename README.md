@@ -8,6 +8,7 @@
   - circRNA-level：100%
   - read-level：100%
   - read-assignment-level：100%
+- **大规模 hg38 验证已收敛**：在使用与 Java 基线一致的参考与注释版本时，`BSJ reads` 已达到 100% 对齐；剩余差异优先检查注释版本、exon 覆盖与输出口径，而不是先怀疑 Scan1/Scan2 判定链。
 
 ## 主要特性
 - **Java 一致性优先**：关键判断路径按 Java CIRI3 行为对齐。
@@ -43,7 +44,7 @@ cargo build --release
 - `--max-span`：最大环长（默认 `200000`，与 Java `-Max` 默认一致）
 - `--linear-range-size-min`：线性竞争区间（默认 `50000`）
 - `-t, --threads`：线程数（默认自动）
-- `-M, --mem-per-thread`：每线程内存预算（如 `2G`、`512M`，默认 `2G`）
+- `-M, --mem-per-thread`：每线程内存预算（如 `2G`、`512M`，默认 `512M`）
 
 > 默认参数已对齐 CIRI3，一般无需手动设置上述核心阈值。
 
@@ -90,6 +91,29 @@ CIRI_TRACE_ALL_CANDS=1 \
 ```
 
 > `CIRI_TRACE_ALL_CANDS=1` 仅用于排障，不用于最终 parity 指标统计。
+
+更细的 Scan2 validator 分支追踪：
+
+```bash
+CIRI_TRACE_READS="A00785:126:HJFMGDRXX:1:1153:23086:11350" \
+CIRI_TRACE_HG2=1 \
+./target/release/ciri-toolkit \
+  -i tests/hg38/diff.subset.bam \
+  -o tmp/hg38.trace_hg2 \
+  -r tests/hg38/hg38.fa \
+  -a tests/hg38/gencode.v29.annotation.gtf \
+  -s 0 -t 4 \
+  2> tmp/hg38.trace_hg2.log
+```
+
+性能 profiling 开关：
+
+```bash
+CIRI_PROFILE_SCAN1=1 ./target/release/ciri-toolkit ...
+CIRI_PROFILE_SCAN2=1 ./target/release/ciri-toolkit ...
+```
+
+> 实际排障时优先把 `stderr` 重定向到 `tmp/*.log`，并在最终验证前关闭所有 trace/profile 环境变量。
 
 ## 输出格式
 

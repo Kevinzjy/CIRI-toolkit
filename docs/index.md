@@ -6,7 +6,7 @@
 1. `development-status.md`
    - 当前实现状态、功能基线与阶段目标。
 2. `parity-debug-playbook.md`
-   - Java 与 Rust 不一致时的标准排查手册（SOP）。
+   - Java 与 Rust 不一致时的标准排查手册（SOP），包含按具体 read trace 的命令模板。
 3. `performance-roadmap.md`
    - 在功能对齐完成后的性能优化计划与度量规范。
 4. `scan1-optimization-status.md`
@@ -22,4 +22,4 @@
 - 所有临时文件统一放在 `tmp/`，不要散落在 `tests/` 或项目根目录。
 
 ---
-最后更新：2026-03-23
+最后更新：2026-03-24

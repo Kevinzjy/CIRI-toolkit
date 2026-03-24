@@ -1,4 +1,7 @@
 //! Summary module aligned to Java `Summary.java` logic.
+//!
+//! This pass merges nearby circRNA sites, applies Java-compatible stringency
+//! filters, and writes the final circRNA report.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
@@ -9,16 +12,74 @@ use anyhow::Result;
 use crate::annotation::Annotation;
 use crate::is_bsj_hg2::SmithWaterman;
 
+/// Final clustering and reporting stage.
+///
+/// `Summary` deliberately keeps Java-shaped merge and filtering rules, because
+/// even small changes here alter the final circRNA set despite identical Scan1
+/// and Scan2 intermediates.
 pub struct Summary {
     pub stringency: i32,
 }
 
+/// One sortable final-result row for a chromosome.
+///
+/// Results are grouped by chromosome and then sorted by start coordinate to
+/// preserve the stable output order expected by existing comparisons.
 struct CircSortItem {
     start_site: i32,
     line: String,
 }
 
 impl Summary {
+    /// Mirrors Java Summary's fallback annotation pass for non-exact exon
+    /// boundary matches.
+    ///
+    /// Java first checks whether both circRNA ends hit the same exon boundary
+    /// pair exactly. If not, it falls back to scanning gene spans on the same
+    /// chromosome and labels the circRNA as `exon`, `intron`, or
+    /// `intergenic_region` based on whether both ends fall inside exon intervals.
+    fn annotate_circ(annotation: &Annotation, chr: &str, start: i32, end: i32) -> (String, String) {
+        if let (Some(v1), Some(v2)) = (
+            annotation
+                .chr_exon_start_map
+                .get(&format!("{}\t{}", chr, start)),
+            annotation
+                .chr_exon_end_map
+                .get(&format!("{}\t{}", chr, end)),
+        ) {
+            if let (Some((g1, _)), Some((g2, _))) = (v1.split_once('\t'), v2.split_once('\t')) {
+                if g1 == g2 {
+                    return ("exon".to_string(), g1.to_string());
+                }
+            }
+        }
+
+        if let Some(genes) = annotation.chr_gene_map.get(chr) {
+            for gene in genes {
+                if start < gene.start {
+                    break;
+                }
+                if end > gene.end {
+                    continue;
+                }
+                if let Some(exons) = annotation.gene_exon_map.get(&gene.gene_id) {
+                    let start_in_exon = exons
+                        .iter()
+                        .any(|&(exon_start, exon_end)| exon_start <= start && exon_end >= start);
+                    let end_in_exon = exons
+                        .iter()
+                        .any(|&(exon_start, exon_end)| exon_start <= end && exon_end >= end);
+                    if start_in_exon && end_in_exon {
+                        return ("exon".to_string(), gene.gene_id.clone());
+                    }
+                    return ("intron".to_string(), gene.gene_id.clone());
+                }
+            }
+        }
+
+        ("intergenic_region".to_string(), "NA".to_string())
+    }
+
     #[inline]
     /// Mirrors Java `String.hashCode()` for deterministic bucket ordering parity.
     fn java_string_hash(s: &str) -> i32 {
@@ -46,10 +107,13 @@ impl Summary {
         cap.max(1)
     }
 
+    /// Creates the Summary stage with a Java-compatible stringency level.
     pub fn new(stringency: i32) -> Self {
         Self { stringency }
     }
 
+    /// Extracts the total genomic span covered between the outermost `M`
+    /// operations of a split CIGAR fragment.
     fn cigar_len_between_ms(cigar: &str) -> i32 {
         let ops: Vec<char> = cigar.chars().filter(|c| c.is_ascii_alphabetic()).collect();
         let nums: Vec<i32> = {
@@ -89,6 +153,8 @@ impl Summary {
         sum
     }
 
+    /// Updates the `[SM, MS, SMS]`-style CIGAR pattern counters used in the final
+    /// report.
     fn update_cigar_counts(cigar: &str, counts: &mut [i32; 3]) {
         let t: String = cigar.chars().filter(|x| x.is_ascii_alphabetic()).collect();
         if t == "M" {
@@ -102,6 +168,12 @@ impl Summary {
         }
     }
 
+    /// Merges circRNA groups that share the same start site when sequence support
+    /// indicates they are equivalent.
+    ///
+    /// The Java-style HashSet bucket reconstruction is intentional: the merge
+    /// winner depends on traversal order, so parity requires deterministic
+    /// emulation of Java iteration.
     fn merge_same_start(
         circ_map: &mut HashMap<String, HashSet<String>>,
         chr_tcga_map: &HashMap<String, String>,
@@ -166,8 +238,16 @@ impl Summary {
                 }
             }
 
-            let up: Vec<usize> = score.iter().enumerate().filter_map(|(i, &v)| if v > 0 { Some(i) } else { None }).collect();
-            let mut zero: Vec<usize> = score.iter().enumerate().filter_map(|(i, &v)| if v == 0 { Some(i) } else { None }).collect();
+            let up: Vec<usize> = score
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &v)| if v > 0 { Some(i) } else { None })
+                .collect();
+            let mut zero: Vec<usize> = score
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &v)| if v == 0 { Some(i) } else { None })
+                .collect();
 
             for up_idx in up {
                 let mut remove_list = Vec::new();
@@ -192,12 +272,16 @@ impl Summary {
                     let seq2 = &chr_seq[s2..e2u];
                     aligner.set_seq(seq1, seq2);
                     aligner.align();
-                    let pass_score = aligner.score >= seq1.len() as i32 - 2 - ((seq1.len() as i32 - 1) / 10) * 2;
+                    let pass_score =
+                        aligner.score >= seq1.len() as i32 - 2 - ((seq1.len() as i32 - 1) / 10) * 2;
                     let pass_len = aligner.aligned_len > seq1.len() as i32 - 2;
                     if pass_score && pass_len {
                         let up_name = &circ_names[up_idx];
                         let z_name = &circ_names[z_idx];
-                        if let (Some(set_up), Some(set_z)) = (circ_map.get(up_name).cloned(), circ_map.get(z_name).cloned()) {
+                        if let (Some(set_up), Some(set_z)) = (
+                            circ_map.get(up_name).cloned(),
+                            circ_map.get(z_name).cloned(),
+                        ) {
                             let mut merged = set_up;
                             merged.extend(set_z);
                             circ_map.insert(up_name.clone(), merged);
@@ -211,27 +295,62 @@ impl Summary {
         }
     }
 
+    /// Merges circRNA groups that share the same end site under the same sequence
+    /// similarity rule used for `merge_same_start`.
     fn merge_same_end(
         circ_map: &mut HashMap<String, HashSet<String>>,
         chr_tcga_map: &HashMap<String, String>,
+        circ_insertion: &[String],
+        circ_map_capacity: usize,
     ) {
-        let mut circ_end_map: HashMap<String, HashSet<String>> = HashMap::new();
-        for k in circ_map.keys() {
-            let p: Vec<&str> = k.split('\t').collect();
-            if p.len() != 3 {
-                continue;
+        let mut circ_end_seen: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut circ_end_insertion: HashMap<String, Vec<String>> = HashMap::new();
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); circ_map_capacity.max(1)];
+        for (idx, key) in circ_insertion.iter().enumerate() {
+            let spread = Self::java_hash_spread(Self::java_string_hash(key));
+            let bucket_idx = (spread as usize) & (circ_map_capacity.max(1) - 1);
+            buckets[bucket_idx].push(idx);
+        }
+        for bucket in buckets {
+            for idx in bucket {
+                let k = &circ_insertion[idx];
+                if !circ_map.contains_key(k) {
+                    continue;
+                }
+                let p: Vec<&str> = k.split('\t').collect();
+                if p.len() != 3 {
+                    continue;
+                }
+                let key = format!("{}\t{}", p[0], p[2]);
+                let seen = circ_end_seen.entry(key.clone()).or_default();
+                if seen.insert(k.clone()) {
+                    circ_end_insertion.entry(key).or_default().push(k.clone());
+                }
             }
-            let key = format!("{}\t{}", p[0], p[2]);
-            circ_end_map.entry(key).or_default().insert(k.clone());
         }
 
         let mut aligner = SmithWaterman::new(1, -1, -3);
-        for (chr_end, group_set) in circ_end_map {
-            if group_set.len() <= 1 {
+        for (chr_end, insertion_list) in circ_end_insertion {
+            if insertion_list.len() <= 1 {
                 continue;
             }
-            let mut circ_names: Vec<String> = group_set.into_iter().collect();
-            circ_names.retain(|k| circ_map.contains_key(k));
+            // Java parity: circEndMap stores HashSet<String>. Reconstruct the
+            // same bucket-order iteration that Java's HashSet would expose for
+            // this same-end group, because the first positive-score circ that
+            // encounters a zero-score circ wins the merge.
+            let cap = Self::java_hashset_capacity(insertion_list.len());
+            let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); cap];
+            for (idx, s) in insertion_list.iter().enumerate() {
+                let spread = Self::java_hash_spread(Self::java_string_hash(s));
+                let bucket_idx = (spread as usize) & (cap - 1);
+                buckets[bucket_idx].push(idx);
+            }
+            let circ_names: Vec<String> = buckets
+                .into_iter()
+                .flat_map(|bucket| bucket.into_iter())
+                .map(|idx| insertion_list[idx].clone())
+                .filter(|k| circ_map.contains_key(k))
+                .collect();
             if circ_names.len() <= 1 {
                 continue;
             }
@@ -268,8 +387,16 @@ impl Summary {
                 }
             }
 
-            let up: Vec<usize> = score.iter().enumerate().filter_map(|(i, &v)| if v > 0 { Some(i) } else { None }).collect();
-            let mut zero: Vec<usize> = score.iter().enumerate().filter_map(|(i, &v)| if v == 0 { Some(i) } else { None }).collect();
+            let up: Vec<usize> = score
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &v)| if v > 0 { Some(i) } else { None })
+                .collect();
+            let mut zero: Vec<usize> = score
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &v)| if v == 0 { Some(i) } else { None })
+                .collect();
 
             for up_idx in up {
                 let mut remove_list = Vec::new();
@@ -292,12 +419,16 @@ impl Summary {
                     let seq2 = &chr_seq[s2 as usize..e2 as usize];
                     aligner.set_seq(seq1, seq2);
                     aligner.align();
-                    let pass_score = aligner.score >= seq1.len() as i32 - 2 - ((seq1.len() as i32 - 1) / 10) * 2;
+                    let pass_score =
+                        aligner.score >= seq1.len() as i32 - 2 - ((seq1.len() as i32 - 1) / 10) * 2;
                     let pass_len = aligner.aligned_len > seq1.len() as i32 - 2;
                     if pass_score && pass_len {
                         let up_name = &circ_names[up_idx];
                         let z_name = &circ_names[z_idx];
-                        if let (Some(set_up), Some(set_z)) = (circ_map.get(up_name).cloned(), circ_map.get(z_name).cloned()) {
+                        if let (Some(set_up), Some(set_z)) = (
+                            circ_map.get(up_name).cloned(),
+                            circ_map.get(z_name).cloned(),
+                        ) {
                             let mut merged = set_up;
                             merged.extend(set_z);
                             circ_map.insert(up_name.clone(), merged);
@@ -311,6 +442,11 @@ impl Summary {
         }
     }
 
+    /// Runs the final Summary stage and writes `<out_prefix>.result`.
+    ///
+    /// Inputs are assumed to already be parity-aligned with Java at the BSJ1/FSJ
+    /// level; this stage only performs Java-compatible merging, stringency
+    /// filtering, annotation labeling, and output ordering.
     pub fn run(
         &mut self,
         bsj1_file: &str,
@@ -324,6 +460,8 @@ impl Summary {
         let mut circ_map: HashMap<String, HashSet<String>> = HashMap::new();
         let mut circ_start_seen: HashMap<String, HashSet<String>> = HashMap::new();
         let mut circ_start_insertion: HashMap<String, Vec<String>> = HashMap::new();
+        let mut circ_seen: HashSet<String> = HashSet::new();
+        let mut circ_insertion: Vec<String> = Vec::new();
         for line_res in reader.lines() {
             let line = line_res?;
             let p: Vec<&str> = line.split('\t').collect();
@@ -331,7 +469,13 @@ impl Summary {
                 continue;
             }
             let key = format!("{}\t{}\t{}", p[3], p[4], p[5]);
-            circ_map.entry(key.clone()).or_default().insert(line.clone());
+            circ_map
+                .entry(key.clone())
+                .or_default()
+                .insert(line.clone());
+            if circ_seen.insert(key.clone()) {
+                circ_insertion.push(key.clone());
+            }
             let start_key = format!("{}\t{}", p[3], p[4]);
             let seen = circ_start_seen.entry(start_key.clone()).or_default();
             if seen.insert(key.clone()) {
@@ -340,7 +484,13 @@ impl Summary {
         }
 
         Self::merge_same_start(&mut circ_map, chr_tcga_map, &circ_start_insertion);
-        Self::merge_same_end(&mut circ_map, chr_tcga_map);
+        let circ_map_capacity = Self::java_hashset_capacity(circ_insertion.len());
+        Self::merge_same_end(
+            &mut circ_map,
+            chr_tcga_map,
+            &circ_insertion,
+            circ_map_capacity,
+        );
 
         let mut final_results: BTreeMap<String, Vec<CircSortItem>> = BTreeMap::new();
         for (chr_start_end, lines) in &circ_map {
@@ -413,13 +563,22 @@ impl Summary {
             let tp_reads3 = circ_id_set3.len() as i32;
 
             let passed = if self.stringency == 2 {
-                ((tp_reads > 19 * fp_reads || fp_reads <= 1) && tp_reads > non_reads + fp_reads && cigar_set.len() >= 3 && tp_reads >= 2)
-                    || (tag > 0 && false_cigar_set3.is_empty() && cigar_set3.len() >= 3 && tp_reads3 >= 2)
+                ((tp_reads > 19 * fp_reads || fp_reads <= 1)
+                    && tp_reads > non_reads + fp_reads
+                    && cigar_set.len() >= 3
+                    && tp_reads >= 2)
+                    || (tag > 0
+                        && false_cigar_set3.is_empty()
+                        && cigar_set3.len() >= 3
+                        && tp_reads3 >= 2)
             } else if self.stringency == 1 {
-                ((tp_reads > 19 * fp_reads || false_cigar_set.len() <= 2) && tp_reads > non_reads + fp_reads && tp_reads >= 2)
+                ((tp_reads > 19 * fp_reads || false_cigar_set.len() <= 2)
+                    && tp_reads > non_reads + fp_reads
+                    && tp_reads >= 2)
                     || (tag > 0 && false_cigar_set3.is_empty() && tp_reads3 >= 2)
             } else {
-                ((tp_reads > 19 * fp_reads || false_cigar_set.len() <= 2) && tp_reads > non_reads + fp_reads)
+                ((tp_reads > 19 * fp_reads || false_cigar_set.len() <= 2)
+                    && tp_reads > non_reads + fp_reads)
                     || (tag > 0 && false_cigar_set3.is_empty() && tp_reads3 >= 2)
             };
 
@@ -434,19 +593,8 @@ impl Summary {
                 0.0
             };
             let start = p_key[1].parse::<i32>().unwrap_or(0);
-            let mut circ_type = "intergenic_region".to_string();
-            let mut gene_id = "NA".to_string();
-            if let (Some(v1), Some(v2)) = (
-                annotation.chr_exon_start_map.get(&format!("{}\t{}", p_key[0], p_key[1])),
-                annotation.chr_exon_end_map.get(&format!("{}\t{}", p_key[0], p_key[2])),
-            ) {
-                if let (Some((g1, _)), Some((g2, _))) = (v1.split_once('\t'), v2.split_once('\t')) {
-                    if g1 == g2 {
-                        circ_type = "exon".to_string();
-                        gene_id = g1.to_string();
-                    }
-                }
-            }
+            let (circ_type, gene_id) =
+                Self::annotate_circ(annotation, p_key[0], start, p_key[2].parse().unwrap_or(0));
             let mut ids: Vec<String> = circ_id_set3.into_iter().collect();
             ids.sort();
             let line = format!(
@@ -469,7 +617,13 @@ impl Summary {
                 ids.join(","),
                 tag
             );
-            final_results.entry(p_key[0].to_string()).or_default().push(CircSortItem { start_site: start, line });
+            final_results
+                .entry(p_key[0].to_string())
+                .or_default()
+                .push(CircSortItem {
+                    start_site: start,
+                    line,
+                });
         }
 
         let out_file = File::create(format!("{}.result", out_prefix))?;

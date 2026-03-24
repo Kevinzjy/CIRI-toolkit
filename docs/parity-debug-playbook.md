@@ -21,6 +21,14 @@
 
 建议每次调试都固定上述数据，以减少噪音变量。
 
+whole-genome / hg38 复核时，还需要先锁定：
+
+- 参考 FASTA 版本一致
+- 注释 GTF 版本一致
+- exon 覆盖与 Java 基线一致
+
+最近的 hg38 排查已经证明：注释版本差异本身就足以制造表面上的 parity gap。
+
 ## 3. 三层差异检查
 
 使用统一脚本一次性看三层指标：
@@ -61,6 +69,7 @@ CIRI_TRACE_READS="simulate:7037,simulate:7050" \
 - `TRACE_SCAN1_CAND`
 - `TRACE_SCAN1_HG1`
 - `TRACE_SCAN2_CAND`
+- `TRACE_SCAN1_SHARD`（BAM 分片边界）
 
 ### 4.2 扫描 Scan2 全候选（仅诊断）
 
@@ -80,6 +89,48 @@ CIRI_TRACE_ALL_CANDS=1 \
 - `CIRI_TRACE_ALL_CANDS=1` 会改变 traced read 的候选遍历行为（用于看全量分支）。
 - 该模式只用于定位问题，不用于最终 parity 统计。
 
+### 4.3 追踪 Scan2 validator 细分分支
+
+当需要确认某条 read 在 `is_bsj_hg2` 里到底卡在哪个阶段时，打开 `CIRI_TRACE_HG2=1`：
+
+```bash
+CIRI_TRACE_READS="A00785:126:HJFMGDRXX:1:1153:23086:11350" \
+CIRI_TRACE_HG2=1 \
+./target/release/ciri-toolkit \
+  -i tests/hg38/diff.subset.bam \
+  -o tmp/hg38.trace_hg2 \
+  -r tests/hg38/hg38.fa \
+  -a tests/hg38/gencode.v29.annotation.gtf \
+  -s 0 -t 4 \
+  2> tmp/hg38.trace_hg2.log
+```
+
+关键标签：
+
+- `TRACE_SCAN2_HG2`
+- `stage=enter`
+- `stage=sm_*` / `stage=ms_*`
+- `stage=circ2_fail`
+- `stage=pass`
+
+这类日志适合判断：是 seed 检查失败、linear competition 失败，还是 circ 序列验证失败。
+
+### 4.4 打开 release profiling
+
+用于定位热点，不用于比较结果正确性：
+
+```bash
+CIRI_PROFILE_SCAN1=1 ./target/release/ciri-toolkit ...
+CIRI_PROFILE_SCAN2=1 ./target/release/ciri-toolkit ...
+```
+
+关键输出：
+
+- `PROFILE_SCAN1`
+- `PROFILE_SCAN1_HG1`
+- `PROFILE_SCAN2`
+- `PROFILE_SCAN2_HG2`
+
 ## 5. 推荐排查流程（SOP）
 
 1. 运行正常模式，拿到 Rust `.result`。
@@ -87,11 +138,26 @@ CIRI_TRACE_ALL_CANDS=1 \
 3. 从 `ONLY_*` 集合中挑 2~4 条典型 read。
 4. 开 `CIRI_TRACE_READS` 看 Scan1/Scan2 分支与 tag。
 5. 如怀疑候选顺序问题，再开 `CIRI_TRACE_ALL_CANDS=1`。
-6. 在 Java 源码中对应位置做逐分支比对（变量级）。
-7. 只做一个最小改动，立即复测三层指标。
-8. 关闭所有 trace 环境变量，做最终验证。
+6. 如怀疑 `is_bsj_hg2` 内部分支，再开 `CIRI_TRACE_HG2=1`。
+7. 在 Java 源码中对应位置做逐分支比对（变量级）。
+8. 只做一个最小改动，立即复测三层指标。
+9. 关闭所有 trace/profile 环境变量，做最终验证。
 
-## 6. 常见根因清单（本项目已验证）
+## 6. 单条 read 定位建议
+
+针对具体 read，建议按这个顺序缩小范围：
+
+1. 在 Rust `.BSJ1` 里找 read 是否出现。
+2. 如果不在 `.BSJ1`，先查 `Scan1`：
+   - 看是否有 `TRACE_SCAN1_CAND`
+   - 看是否进入 `TRACE_SCAN1_HG1`
+3. 如果在 `.BSJ1` 但不在 `.result`，再查 `Scan2` / `Summary`：
+   - 看 `TRACE_SCAN2_CAND`
+   - 必要时开 `CIRI_TRACE_ALL_CANDS=1`
+   - 必要时看 `TRACE_SCAN2_HG2`
+4. 如果 subset 与 full 结论不一致，优先怀疑“缺了中间竞争上下文”，不要直接判定算法错误。
+
+## 7. 常见根因清单（本项目已验证）
 
 - Scan2 索引来源不一致：
   - Java：`BSJ1 -> chrCircSiteMap(HashSet) -> siteArray/siteMap`
@@ -102,8 +168,12 @@ CIRI_TRACE_ALL_CANDS=1 \
   - 应按“当前 alignment strand”逐条判断，而非按 segment 固定方向。
 - 候选遍历顺序不一致：
   - Java 是桶门控 + 方向遍历：`num1` 逆序，`num2` 正序。
+- 注释版本不一致：
+  - exon 覆盖变化会直接改变 `circRNA_type`、`gene_id`，并可能影响“看起来是否支持”某些 case 的判断。
+- subset 缺少中间上下文：
+  - 若 full 与 subset 结论不同，说明该 case 依赖未进入最终 `.result` 的竞争候选或 supporting context。
 
-## 7. 变更验收门槛
+## 8. 变更验收门槛
 
 每次提交前至少满足：
 
@@ -113,10 +183,11 @@ CIRI_TRACE_ALL_CANDS=1 \
 
 并附上命令与摘要指标，确保可复现。
 
-## 8. 输出与记录建议
+## 9. 输出与记录建议
 
 - 调试产物命名建议：
-  - `tests/chr1/CIRI-rs_step_<short_name>.result`
+  - `tmp/<dataset>_<short_name>.result`
+  - `tmp/<dataset>_<short_name>.log`
 - 每次实验记录四件事：
   - 改了什么
   - 为什么改
