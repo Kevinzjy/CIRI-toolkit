@@ -6,6 +6,9 @@
 
 use crate::is_bsj_hg2::{report_scan2_hg_profile, IsBSJHg2};
 use crate::misd::misd;
+use crate::runtime::{
+    emit_debug_line, emit_perf_line, scan2_profile_enabled, should_trace_read, with_trace_hg2_scope,
+};
 use crate::utils::{bam_shard_count, part_path, reverse_complement, AlignmentRecord};
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -99,23 +102,8 @@ fn advise_dontneed(mmap: &Mmap, offset: usize, len: usize) {
     }
 }
 
-/// Returns whether a read is selected for targeted Scan2 tracing.
-#[inline]
-fn should_trace_read(read_id: &str) -> bool {
-    // Optional targeted trace hook for parity debugging.
-    // Enabled only when CIRI_TRACE_READS is explicitly set.
-    if let Ok(raw) = std::env::var("CIRI_TRACE_READS") {
-        for token in raw.split(',') {
-            let t = token.trim();
-            if !t.is_empty() && t == read_id {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Optional Scan2 profiler used only when `CIRI_PROFILE_SCAN2` is enabled.
+/// Optional Scan2 profiler used when CLI `--perf` or legacy
+/// `CIRI_PROFILE_SCAN2=1` is enabled.
 ///
 /// The counters stay intentionally coarse so the profiler can be left inside the
 /// candidate hot path without materially perturbing release timings.
@@ -136,7 +124,7 @@ pub(crate) struct Scan2Profile {
 impl Scan2Profile {
     /// Checks whether release profiling is enabled for the current Scan2 run.
     fn enabled_from_env() -> bool {
-        matches!(std::env::var("CIRI_PROFILE_SCAN2"), Ok(v) if !v.is_empty() && v != "0")
+        scan2_profile_enabled()
     }
 
     /// Emits the aggregated Scan2 timing summary.
@@ -160,7 +148,7 @@ impl Scan2Profile {
                 part as f64 * 100.0 / whole as f64
             }
         };
-        eprintln!(
+        emit_perf_line(&format!(
             "[PROFILE_SCAN2] wall_ms={:.3} shard_work_ms={:.3} merge_ms={:.3} records={} groups={} candidate_checks={} candidate_hits={}",
             wall_total_ns as f64 / 1_000_000.0,
             shard_total_ns as f64 / 1_000_000.0,
@@ -169,8 +157,8 @@ impl Scan2Profile {
             groups,
             candidate_checks,
             candidate_hits,
-        );
-        eprintln!(
+        ));
+        emit_perf_line(&format!(
             "[PROFILE_SCAN2] shard_breakdown_ms group_process={:.3} ({:.1}%) validator={:.3} ({:.1}% of group) write={:.3} ({:.1}%) other={:.3} ({:.1}%)",
             group_process_ns as f64 / 1_000_000.0,
             pct(group_process_ns, shard_total_ns),
@@ -180,7 +168,7 @@ impl Scan2Profile {
             pct(write_ns, shard_total_ns),
             other_shard_ns as f64 / 1_000_000.0,
             pct(other_shard_ns, shard_total_ns),
-        );
+        ));
     }
 }
 
@@ -309,6 +297,13 @@ impl Scan2 {
     /// This function intentionally mirrors Java's unique-site indexing semantics:
     /// the traversal order of candidates must match Java, because Scan2 returns on
     /// the first valid non-`2` tag it encounters.
+    ///
+    /// Two details here are easy to "simplify" incorrectly:
+    /// - Scan2 de-duplicates by circ site payload before building the index, so
+    ///   repeated BSJ1 rows for the same circ do not create extra candidates.
+    /// - The insertion order is preserved through `order`, then reused after the
+    ///   final per-bucket sort, because Java's `HashSet -> ArrayList` path still
+    ///   leaves a stable first-hit order once the same inputs are replayed.
     pub fn build_index(&mut self, bsj1_file: &str) -> Result<()> {
         // Java parity: Scan2 index is built from unique circ sites, not all BSJ1 rows.
         // Equivalent Java flow:
@@ -408,6 +403,11 @@ impl Scan2 {
     /// and forward traversal on `num2`. The broader lower-bound scan is cheaper
     /// to write but not Java-compatible, and it over-counts FSJs on chr1 while
     /// leaving BSJ rescue unchanged.
+    ///
+    /// `style` is kept in Java's original encoding (`0`, `1`, `-1`, `10`) on
+    /// purpose. Those magic-looking values control which bucket edge is treated
+    /// as inclusive for full-match, MS, SM, and SMS alignments, and normalizing
+    /// them into a more abstract enum made earlier parity checks harder to audit.
     fn collect_fsj_keys_in_range(
         &self,
         chr: &str,
@@ -591,6 +591,11 @@ impl Scan2 {
     /// The final `<prefix>.bsj` keeps one extra trailing column describing where
     /// each line came from (`scan1` or `scan2`). Summary ignores the extra field
     /// because all behaviorally relevant columns stay in their original positions.
+    ///
+    /// `rescued_reads` and `final_bsj_reads` are stage-level accounting only.
+    /// The user-facing "final BSJ reads" summary is recomputed later from the
+    /// clustered `.out`, because Summary can still merge circ families without
+    /// changing the raw `.bsj` membership.
     fn merge_shards_and_fsj(
         &mut self,
         input_bsj1: &str,
@@ -833,14 +838,15 @@ impl Scan2 {
                 profile.records.fetch_add(1, Ordering::Relaxed);
             }
             let curr_c_pos = reader.get_ref().virtual_position().compressed() as usize;
-            pb.inc((curr_c_pos - last_compressed_pos) as u64);
+            pb.inc(curr_c_pos.saturating_sub(last_compressed_pos) as u64);
             last_compressed_pos = curr_c_pos;
 
-            if curr_c_pos - (last_evicted_pos - pos) > eviction_threshold {
+            let evicted_rel = last_evicted_pos.saturating_sub(pos);
+            if curr_c_pos.saturating_sub(evicted_rel) > eviction_threshold {
                 advise_dontneed(
                     mmap,
                     last_evicted_pos,
-                    curr_c_pos - (last_evicted_pos - pos),
+                    curr_c_pos.saturating_sub(evicted_rel),
                 );
                 last_evicted_pos = pos + curr_c_pos;
             }
@@ -942,7 +948,9 @@ impl Scan2 {
                 // time the iterator switches between R1 and R2 within the same
                 // read group. Keeping every earlier alignment for that mate looks
                 // harmless, but it changes which candidate payloads contribute to
-                // `temFSJId` on complex supplementary-heavy reads.
+                // `temFSJId` on complex supplementary-heavy reads and was one of
+                // the reasons full hg38 FSJ counting drifted while chr1 stayed
+                // clean. This overwrite is therefore intentional and verified.
                 alignments.retain(|a| {
                     let idx = if a.flag & 0x40 != 0 { 1 } else { 0 };
                     idx != s_idx
@@ -950,7 +958,10 @@ impl Scan2 {
                 // Java parity: `standMap` is overwritten on mate switches with the
                 // current record's sequence; it is not a "longest-sequence wins"
                 // cache in Scan2. This only affects Scan2 candidate validation,
-                // not Scan1 representative-sequence handling.
+                // not Scan1 representative-sequence handling. The distinction is
+                // easy to miss because Scan1 does keep the longest representative
+                // sequence, but carrying that policy into Scan2 perturbs FSJ-only
+                // behavior on supplementary-heavy BAM families.
                 if !seq.is_empty() && seq != "*" {
                     stand_map.insert(s_idx, (st_c, Cow::Owned(seq.clone())));
                 }
@@ -987,12 +998,9 @@ impl Scan2 {
                     .fetch_add(write_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
         }
-        if last_compressed_pos > (last_evicted_pos - pos) {
-            advise_dontneed(
-                mmap,
-                last_evicted_pos,
-                last_compressed_pos - (last_evicted_pos - pos),
-            );
+        let evicted_rel = last_evicted_pos.saturating_sub(pos);
+        if last_compressed_pos > evicted_rel {
+            advise_dontneed(mmap, last_evicted_pos, last_compressed_pos - evicted_rel);
         }
         writer.flush()?;
         if let (Some(profile), Some(shard_started)) = (profile, shard_started) {
@@ -1116,6 +1124,8 @@ impl Scan2 {
                     let idx = if a.flag & 0x40 != 0 { 1 } else { 0 };
                     idx != s_idx
                 });
+                // SAM keeps the same overwrite semantics as BAM so both formats
+                // feed identical Scan2 mate context into `is_bsj_hg2`.
                 if !seq.is_empty() && seq != "*" {
                     stand_map.insert(s_idx, (st_c, Cow::Borrowed(seq)));
                 }
@@ -1176,6 +1186,9 @@ impl Scan2 {
                 .or_insert_with(Vec::new)
                 .push(aln);
         }
+        // Java counts FSJ support per read group, not per alignment record. The
+        // temporary set intentionally de-duplicates all linear evidence gathered
+        // from one read before the local shard counter is incremented.
         let mut tem_fsj_keys = HashSet::new();
         for seg_idx in [0_i32, 1_i32] {
             let Some(seg_alns) = segments.get(&seg_idx) else {
@@ -1297,8 +1310,9 @@ impl Scan2 {
                                 aln.mapq.to_string(),
                             ];
                             let validator_started = profile.map(|_| Instant::now());
-                            let tag =
-                                is_bsj_hg2.is_bsj_hg2(&circ_c, chr_tcga_map.get(chr).unwrap());
+                            let tag = with_trace_hg2_scope(trace_read, || {
+                                is_bsj_hg2.is_bsj_hg2(&circ_c, chr_tcga_map.get(chr).unwrap())
+                            });
                             if let Some(profile) = profile {
                                 profile.candidate_checks.fetch_add(1, Ordering::Relaxed);
                                 if let Some(validator_started) = validator_started {
@@ -1309,7 +1323,7 @@ impl Scan2 {
                                 }
                             }
                             if trace_read {
-                                eprintln!(
+                                emit_debug_line(&format!(
                                     "[TRACE_SCAN2_CAND] id={} type=sm seg={} aln_pos={} chr={} site1={} site2={} cand_site={} cigar={} mapq={} s2_ok={} str_len={} pair_len={} tag={}",
                                     id,
                                     seg_idx,
@@ -1324,9 +1338,15 @@ impl Scan2 {
                                     circ_c[5].len(),
                                     circ_c[6].len(),
                                     tag
-                                );
+                                ));
                             }
                             if tag == "0" {
+                                // Java treats validator tag `0` as "this linear
+                                // candidate is not a rescuable BSJ, but it still
+                                // supports the circ as an FSJ competitor". These
+                                // insertions are one of the main places where
+                                // BSJ parity can already be perfect while FSJ
+                                // counts still drift.
                                 tem_fsj_keys
                                     .insert(format!("{}\t{}\t{}", chr, cand.data[0], cand.data[1]));
                                 Ok(false)
@@ -1478,8 +1498,9 @@ impl Scan2 {
                                 aln.mapq.to_string(),
                             ];
                             let validator_started = profile.map(|_| Instant::now());
-                            let tag =
-                                is_bsj_hg2.is_bsj_hg2(&circ_c, chr_tcga_map.get(chr).unwrap());
+                            let tag = with_trace_hg2_scope(trace_read, || {
+                                is_bsj_hg2.is_bsj_hg2(&circ_c, chr_tcga_map.get(chr).unwrap())
+                            });
                             if let Some(profile) = profile {
                                 profile.candidate_checks.fetch_add(1, Ordering::Relaxed);
                                 if let Some(validator_started) = validator_started {
@@ -1490,7 +1511,7 @@ impl Scan2 {
                                 }
                             }
                             if trace_read {
-                                eprintln!(
+                                emit_debug_line(&format!(
                                     "[TRACE_SCAN2_CAND] id={} type=ms seg={} aln_pos={} chr={} site1={} site2={} cand_site={} cigar={} mapq={} s2_ok={} str_len={} pair_len={} tag={}",
                                     id,
                                     seg_idx,
@@ -1505,7 +1526,7 @@ impl Scan2 {
                                     circ_c[5].len(),
                                     circ_c[6].len(),
                                     tag
-                                );
+                                ));
                             }
                             if tag == "0" {
                                 tem_fsj_keys
@@ -1569,6 +1590,9 @@ impl Scan2 {
                         }
                     }
                 }
+                // Besides explicit tag==0 additions above, every linear segment
+                // also contributes bucket-gated FSJ overlaps from its covered
+                // genomic span, exactly like Java `GetFSJClass.getFSJ(...)`.
                 let start_tem = aln.pos + 6;
                 let end_tem = aln.pos + c[3] - 7;
                 self.collect_fsj_keys_in_range(chr, start_tem, end_tem, c[0], &mut tem_fsj_keys);

@@ -5,12 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog, adapted to the current release flow of
 `CIRI-toolkit`.
 
-## [Unreleased]
+## [0.1.1] - 2026-03-24
 
 ### Added
 - Added `tests/analyze_diff.py` FSJ parity reporting for shared circRNAs.
 - Added `<prefix>.log` as a first-class pipeline output so stage summaries and
   runtime information are preserved outside the terminal session.
+- Added CLI `--debug <read_id_list>` to trace selected reads through the
+  pipeline and write the detailed trace to `<prefix>.debug.log`.
+- Added CLI `--perf` to emit Scan1/Scan2 profiling summaries to
+  `<prefix>.perf.log`.
 - Added source labels to the final `<prefix>.bsj` output so each BSJ-supporting
   read records whether it was emitted by `scan1` or `scan2`.
 
@@ -28,6 +32,8 @@ The format is based on Keep a Changelog, adapted to the current release flow of
   - Scan1 mapped reads and BSJ1 reads
   - Scan2 rescued BSJ2 reads
   - final circRNA count, final BSJ read count, and total runtime
+- Increased comment coverage around the parity-sensitive Scan2/FSJ path and the
+  output/logging conventions that were established through repeated validation.
 - Updated final circRNA sorting so canonical `chr*` chromosomes are emitted
   before scaffold/contig names such as `GL*` and `KI*`.
 - Refined Scan2 BAM parity with Java CIRI3:

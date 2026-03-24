@@ -72,6 +72,9 @@ pub fn parse_mem_str(mem_str: &str) -> u64 {
 /// The CLI now treats `-o` strictly as a prefix so all outputs follow one
 /// predictable scheme: `<prefix>.out`, `<prefix>.bsj1`, `<prefix>.bsj`,
 /// and `<prefix>.fsj`.
+///
+/// Keeping the naming centralized here avoids another round of drift between
+/// CLI help, logging, temporary-file cleanup, and test fixtures.
 pub fn result_path_for_output(output_arg: &str) -> String {
     format!("{}.out", output_arg)
 }
@@ -82,6 +85,23 @@ pub fn result_path_for_output(output_arg: &str) -> String {
 /// so long runs can be reviewed after the terminal session ends.
 pub fn log_path_for_output(output_arg: &str) -> String {
     format!("{}.log", output_arg)
+}
+
+/// Returns the targeted debug trace path for one CLI prefix.
+///
+/// `--debug` writes verbose per-read processing traces here so they do not get
+/// mixed into the always-on stage summary log.
+pub fn debug_path_for_output(output_arg: &str) -> String {
+    format!("{}.debug.log", output_arg)
+}
+
+/// Returns the profiling report path for one CLI prefix.
+///
+/// `--perf` is intentionally a boolean switch, so profiling output always lands
+/// in a predictable sibling file without forcing the user to invent another
+/// path on the command line.
+pub fn perf_path_for_output(output_arg: &str) -> String {
+    format!("{}.perf.log", output_arg)
 }
 
 /// Returns the merged Scan1 BSJ output path for one CLI prefix.

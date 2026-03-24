@@ -8,6 +8,7 @@
 use crate::annotation::Annotation;
 use crate::is_bsj_hg2::{java_substring, report_scan1_hg_profile, IsBSJHg2};
 use crate::misd::misd;
+use crate::runtime::{emit_debug_line, emit_perf_line, scan1_profile_enabled, should_trace_read};
 use crate::utils::{bam_shard_count, part_path, AlignmentRecord};
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -94,30 +95,12 @@ fn advise_dontneed_aligned(mmap: &Mmap, offset: usize, len: usize) {
     }
 }
 
-/// Returns whether a read is selected for targeted parity tracing.
-///
-/// The hook is intentionally cheap so it can stay in hot paths without affecting
-/// normal runs when `CIRI_TRACE_READS` is unset.
-#[inline]
-fn should_trace_read(read_id: &str) -> bool {
-    // Optional targeted trace hook for parity debugging.
-    // Enabled only when CIRI_TRACE_READS is explicitly set.
-    if let Ok(raw) = std::env::var("CIRI_TRACE_READS") {
-        for token in raw.split(',') {
-            let t = token.trim();
-            if !t.is_empty() && t == read_id {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Emits shard-boundary trace lines for targeted BAM parity debugging.
 ///
-/// This stays behind `CIRI_TRACE_READS` so it can remain in the codebase without
-/// affecting normal runs. The output is intentionally narrow: only shard
-/// ownership decisions around read-group boundaries are logged.
+/// This stays behind the same targeted read-selection logic used by `--debug`
+/// and `CIRI_TRACE_READS`, so it can remain in the codebase without affecting
+/// normal runs. The output is intentionally narrow: only shard ownership
+/// decisions around read-group boundaries are logged.
 fn trace_bam_shard_event(
     shard_idx: usize,
     read_id: &str,
@@ -128,10 +111,10 @@ fn trace_bam_shard_event(
     abs_c_pos: usize,
 ) {
     if should_trace_read(read_id) {
-        eprintln!(
+        emit_debug_line(&format!(
             "[TRACE_SCAN1_SHARD] shard={} stage={} id={} start={} block_start={} end={} abs_c_pos={}",
             shard_idx, stage, read_id, start, block_start, end, abs_c_pos
-        );
+        ));
     }
 }
 
@@ -158,7 +141,8 @@ fn update_best_stand_seq<'a>(
     }
 }
 
-/// Optional Scan1 profiler used only when `CIRI_PROFILE_SCAN1` is enabled.
+/// Optional Scan1 profiler used when CLI `--perf` or legacy
+/// `CIRI_PROFILE_SCAN1=1` is enabled.
 ///
 /// The counters are coarse on purpose: they are cheap enough to leave in the hot
 /// path, but still isolate whether time is spent in group assembly, BSJ judgment,
@@ -180,7 +164,7 @@ struct Scan1Profile {
 impl Scan1Profile {
     /// Checks whether release profiling is enabled for the current run.
     fn enabled_from_env() -> bool {
-        matches!(std::env::var("CIRI_PROFILE_SCAN1"), Ok(v) if !v.is_empty() && v != "0")
+        scan1_profile_enabled()
     }
 
     /// Emits the aggregated Scan1 timing summary.
@@ -207,7 +191,7 @@ impl Scan1Profile {
                 part as f64 * 100.0 / whole as f64
             }
         };
-        eprintln!(
+        emit_perf_line(&format!(
             "[PROFILE_SCAN1] wall_ms={:.3} shard_work_ms={:.3} merge_ms={:.3} records={} groups={} hg1_calls={} hg1_hits={}",
             wall_total_ns as f64 / 1_000_000.0,
             shard_total_ns as f64 / 1_000_000.0,
@@ -216,8 +200,8 @@ impl Scan1Profile {
             groups,
             hg1_calls,
             hg1_hits
-        );
-        eprintln!(
+        ));
+        emit_perf_line(&format!(
             "[PROFILE_SCAN1] shard_breakdown_ms group_process={:.3} ({:.1}%) bsj_judge={:.3} ({:.1}% of group) write={:.3} ({:.1}%) other={:.3} ({:.1}%)",
             group_process_ns as f64 / 1_000_000.0,
             pct(group_process_ns, shard_total_ns),
@@ -227,7 +211,7 @@ impl Scan1Profile {
             pct(write_ns, shard_total_ns),
             other_shard_ns as f64 / 1_000_000.0,
             pct(other_shard_ns, shard_total_ns),
-        );
+        ));
         report_scan1_hg_profile();
     }
 }
@@ -1253,7 +1237,7 @@ impl Scan1 {
                             adj2.to_string(),
                         ];
                         if trace_read {
-                            eprintln!(
+                            emit_debug_line(&format!(
                                 "[TRACE_SCAN1_CAND] id={} n={} al1=({}, {}, {}, {}) al2=({}, {}, {}, {}) c1={:?} c2={:?} s1_n={} s2_n={} adj1={} adj2={} q=({},{},{}) s4_ok={} line_arr6_8={}/{}/{}",
                                 read_id,
                                 n,
@@ -1278,7 +1262,7 @@ impl Scan1 {
                                 line_arr[6],
                                 line_arr[7],
                                 line_arr[8]
-                            );
+                            ));
                         }
                         if let Some(chr_seq) = fasta_map.get(al1.chrom.as_ref()) {
                             let hg1_started = profile.map(|_| Instant::now());
@@ -1304,7 +1288,7 @@ impl Scan1 {
                                 }
                             }
                             if trace_read {
-                                eprintln!(
+                                emit_debug_line(&format!(
                                     "[TRACE_SCAN1_HG1] id={} result={} post_line_arr6_8={}/{}/{} sites={}->{}",
                                     read_id,
                                     if res.is_some() { "Some" } else { "None" },
@@ -1313,7 +1297,7 @@ impl Scan1 {
                                     line_arr[8],
                                     line_arr[9],
                                     line_arr[10]
-                                );
+                                ));
                             }
                             if let Some(res) = res {
                                 let cigar1 = Self::normalize_bsj_cigar(al1.cigar.as_ref());

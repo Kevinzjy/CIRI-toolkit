@@ -6,6 +6,11 @@
 
 后续将加入对CIRI-AS/CIRI-full功能的整合，实现环形RNA的高效分析
 
+## 依赖
+
+- rust >= 1.85.0 (Tested with 4d91de4e4 2025-02-17)
+- gcc >= 5
+
 ## 安装与构建
 
 ```bash
@@ -21,19 +26,25 @@ cargo build --release
 ## 快速开始
 
 ```bash
-./target/release/ciri-toolkit \
-  -i input.bam \
-  -o sample.ciri \
-  -r reference.fa \
-  -a annotation.gtf
+# Step1. Run bwa-mem
+bwa mem -t <threads> -T 19 <bwa_index> <R1> <R2> > | samtools view -bS -@ <threads> - > <bam_file>
+
+# Step2. Run ciri-toolkit
+ciri-toolkit \
+  -i <bam_file> \
+  -o <prefix> \
+  -r <reference_fasta> \
+  -a <annotation_gtf> \
+  -t <threads> \
+  -s 0 
 ```
 
-常见全转录组数据示例：
+常见环形RNA测序数据示例：
 
 ```bash
 ./target/release/ciri-toolkit \
   -i RNA015434_S1.bam \
-  -o RNA015434 \
+  -o RNA015434_S1.ciri \
   -r /data/public/database/gencode/hg38/_BWAindex/hg38.fa \
   -a /data/public/database/gencode/hg38/gencode.v44.annotation.gtf \
   -s 0 \
@@ -52,6 +63,8 @@ cargo build --release
 - `--linear-range-size-min`：线性竞争区间（默认 `50000`）
 - `-t, --threads`：线程数（默认为CPU可用核心数）
 - `-M, --mem-per-thread`：每线程内存预算（如 `2G`、`512M`，默认 `512M`）
+- `--debug`：逗号分隔的 read ID 列表，输出详细追踪到 `<prefix>.debug.log`
+- `--perf`：开启 profiling，自动写到 `<prefix>.perf.log`
 
 > 默认参数已对齐 CIRI3，推荐使用 `-s 0` 输出所有潜在 circRNA 后手动过滤，其他参数一般无需手动设置。
 

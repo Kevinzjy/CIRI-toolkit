@@ -4,6 +4,10 @@
 //! identification, and linear competition checks to distinguish BSJs from linear splicing noise.
 
 use crate::index_compare::IndexCompare;
+use crate::runtime::{
+    emit_debug_line, emit_perf_line, scan1_profile_enabled, scan2_profile_enabled,
+    trace_hg2_enabled,
+};
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -88,26 +92,14 @@ static HG2_PROFILE: Hg2Profile = Hg2Profile {
     circ3_calls: AtomicU64::new(0),
 };
 
-/// Checks whether Scan1 validator profiling is enabled.
-#[inline]
-fn scan1_profile_enabled() -> bool {
-    matches!(std::env::var("CIRI_PROFILE_SCAN1"), Ok(v) if !v.is_empty() && v != "0")
-}
-
-/// Checks whether Scan2 validator profiling is enabled.
-#[inline]
-fn scan2_profile_enabled() -> bool {
-    matches!(std::env::var("CIRI_PROFILE_SCAN2"), Ok(v) if !v.is_empty() && v != "0")
-}
-
 /// Checks whether verbose `is_bsj_hg2` stage tracing is enabled.
 ///
 /// This trace is intentionally separate from `CIRI_TRACE_ALL_CANDS`: the latter
 /// changes candidate traversal so developers can inspect the full search space,
-/// while `CIRI_TRACE_HG2` keeps the original traversal and only annotates which
-/// validator branch accepted or rejected a traced candidate.
+/// while `--debug` / `CIRI_TRACE_HG2` keep the original traversal and only
+/// annotate which validator branch accepted or rejected a traced candidate.
 fn trace_scan2_hg2_enabled() -> bool {
-    matches!(std::env::var("CIRI_TRACE_HG2"), Ok(v) if !v.is_empty() && v != "0")
+    trace_hg2_enabled()
 }
 
 /// Emits one targeted `is_bsj_hg2` branch trace line.
@@ -120,7 +112,7 @@ fn trace_scan2_hg2(stage: &str, circ_line_arr: &[String], extra: &str) {
     if !trace_scan2_hg2_enabled() {
         return;
     }
-    eprintln!(
+    emit_debug_line(&format!(
         "[TRACE_SCAN2_HG2] stage={} type={} strand={} chr={} site1={} site2={} mapq={} s2_ok={} str_len={} pair_len={} str3_len={} {}",
         stage,
         circ_line_arr[2],
@@ -134,7 +126,7 @@ fn trace_scan2_hg2(stage: &str, circ_line_arr: &[String], extra: &str) {
         circ_line_arr[6].len(),
         circ_line_arr[7].len(),
         extra,
-    );
+    ));
 }
 
 /// Adds elapsed nanoseconds to one profiling counter.
@@ -192,11 +184,11 @@ pub fn report_scan1_hg_profile() {
             part as f64 * 100.0 / whole as f64
         }
     };
-    eprintln!(
+    emit_perf_line(&format!(
         "[PROFILE_SCAN1_HG1] calls={} hits={} shift_entries={} sw_calls={}",
         hg1_calls, hg1_hits, shift_entries, sw_calls
-    );
-    eprintln!(
+    ));
+    emit_perf_line(&format!(
         "[PROFILE_SCAN1_HG1] total_ms={:.3} index_compare_ms={:.3} ({:.1}%, calls={}) exon_lookup_ms={:.3} ({:.1}%, calls={}) shift_prepare_ms={:.3} ({:.1}%, calls={}) linear_check_ms={:.3} ({:.1}%, calls={}) circ2_ms={:.3} ({:.1}%, calls={}) circ3_ms={:.3} ({:.1}%, calls={}) other_ms={:.3} ({:.1}%) sw_ms={:.3}",
         hg1_total_ns as f64 / 1_000_000.0,
         index_compare_ns as f64 / 1_000_000.0,
@@ -220,7 +212,7 @@ pub fn report_scan1_hg_profile() {
         other_ns as f64 / 1_000_000.0,
         pct(other_ns, hg1_total_ns),
         sw_ns as f64 / 1_000_000.0,
-    );
+    ));
 }
 
 /// Prints the collected Scan2 validator profile.
@@ -253,11 +245,11 @@ pub fn report_scan2_hg_profile() {
             part as f64 * 100.0 / whole as f64
         }
     };
-    eprintln!(
+    emit_perf_line(&format!(
         "[PROFILE_SCAN2_HG2] calls={} sw_calls={} linear11_calls={} linear12_calls={} circ2_calls={} circ3_calls={}",
         hg2_calls, sw_calls, linear11_calls, linear12_calls, circ2_calls, circ3_calls
-    );
-    eprintln!(
+    ));
+    emit_perf_line(&format!(
         "[PROFILE_SCAN2_HG2] total_ms={:.3} sw_ms={:.3} ({:.1}%) linear11_ms={:.3} ({:.1}%) linear12_ms={:.3} ({:.1}%) circ2_ms={:.3} ({:.1}%) circ3_ms={:.3} ({:.1}%) other_ms={:.3} ({:.1}%)",
         hg2_total_ns as f64 / 1_000_000.0,
         sw_ns as f64 / 1_000_000.0,
@@ -272,7 +264,7 @@ pub fn report_scan2_hg_profile() {
         pct(circ3_ns, hg2_total_ns),
         other_ns as f64 / 1_000_000.0,
         pct(other_ns, hg2_total_ns),
-    );
+    ));
 }
 
 /// Smith-Waterman local alignment implementation with traceback.

@@ -59,14 +59,24 @@ python tests/analyze_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.resu
 
 ### 4.1 追踪指定 read
 
+推荐入口是 CLI `--debug`，环境变量方式保留给临时调试或脚本兼容。
+
 ```bash
-CIRI_TRACE_READS="simulate:7037,simulate:7050" \
 ./target/release/ciri-toolkit \
   -i tests/chr1/test.bam \
   -o tests/chr1/CIRI-rs.trace \
   -r tests/chr1/chr1.fa \
   -a tests/chr1/chr1.gtf \
+  --debug "simulate:7037,simulate:7050" \
   -t 16
+```
+
+详细 trace 会写到 `tests/chr1/CIRI-rs.trace.debug.log`。
+
+兼容旧入口：
+
+```bash
+CIRI_TRACE_READS="simulate:7037,simulate:7050" ./target/release/ciri-toolkit ...
 ```
 
 输出到 `stderr`，关键标签：
@@ -122,7 +132,15 @@ CIRI_TRACE_HG2=1 \
 
 ### 4.4 打开 release profiling
 
-用于定位热点，不用于比较结果正确性：
+用于定位热点，不用于比较结果正确性。推荐入口是 `--perf`：
+
+```bash
+./target/release/ciri-toolkit -i input.bam -o sample ... --perf
+```
+
+profiling 结果会自动写到 `sample.perf.log`。
+
+兼容旧入口：
 
 ```bash
 CIRI_PROFILE_SCAN1=1 ./target/release/ciri-toolkit ...
