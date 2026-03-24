@@ -28,10 +28,14 @@ whole-genome / hg38 复核时，还需要先锁定：
 - exon 覆盖与 Java 基线一致
 
 最近的 hg38 排查已经证明：注释版本差异本身就足以制造表面上的 parity gap。
+当前推荐的 hg38 复核口径：
+
+- FASTA：`/data/public/database/gencode/hg38/_BWAindex/hg38.fa`
+- GTF：`/data/public/database/gencode/hg38/gencode.v44.annotation.gtf`
 
 ## 3. 三层差异检查
 
-使用统一脚本一次性看三层指标：
+使用统一脚本一次性看四层指标：
 
 ```bash
 python tests/analyze_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.result \
@@ -43,6 +47,7 @@ python tests/analyze_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.resu
 - circRNA-level：circ 位点集合是否一致
 - read-level：read ID 集合是否一致
 - read-assignment-level：`(circRNA_ID, read_ID)` 是否一致
+- fsj-level：共享 circ 的 `#non_junction_reads` 是否一致
 
 排查优先级建议：
 
@@ -100,7 +105,7 @@ CIRI_TRACE_HG2=1 \
   -i tests/hg38/diff.subset.bam \
   -o tmp/hg38.trace_hg2 \
   -r tests/hg38/hg38.fa \
-  -a tests/hg38/gencode.v29.annotation.gtf \
+  -a /data/public/database/gencode/hg38/gencode.v44.annotation.gtf \
   -s 0 -t 4 \
   2> tmp/hg38.trace_hg2.log
 ```
@@ -170,6 +175,8 @@ CIRI_PROFILE_SCAN2=1 ./target/release/ciri-toolkit ...
   - Java 是桶门控 + 方向遍历：`num1` 逆序，`num2` 正序。
 - 注释版本不一致：
   - exon 覆盖变化会直接改变 `circRNA_type`、`gene_id`，并可能影响“看起来是否支持”某些 case 的判断。
+- 全量与 subset 结论不同：
+  - 若 subset 上 `FSJ` 已对齐、但 full run 仍有 residual，优先怀疑剩余 `BSJ1/Scan2` family context 差异，而不是先重写 FSJ helper。
 - subset 缺少中间上下文：
   - 若 full 与 subset 结论不同，说明该 case 依赖未进入最终 `.out` 的竞争候选或 supporting context。
 

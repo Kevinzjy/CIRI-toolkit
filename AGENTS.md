@@ -77,9 +77,11 @@
 - circRNA 层面：100%
 - 读段 ID（read ID）层面：100%
 - 读段归属（read-assignment）层面：100%
+- FSJ 计数层面：100%
 
 ## 当前阶段定义（2026-03）
 - **阶段结论**：功能对齐已完成，当前版本可作为首个正式功能版本。
+- **全量 hg38 口径**：使用 `/data/public/database/gencode/hg38/gencode.v44.annotation.gtf` 与 Java 基线一致地复核 whole-genome parity。
 - **版本目标**：在不改变任何判定结果的前提下，继续推进性能优化（优先 Scan1/Scan2 I/O 路径）。
 - **变更红线**：
   - 任何优化提交都必须通过 `tests/analyze_diff.py` 三层零差异检查。

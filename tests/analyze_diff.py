@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Quickly compare CIRI results at circRNA and read levels."""
+"""Quickly compare CIRI results at circRNA, read, assignment, and FSJ levels."""
 
 from __future__ import annotations
 
@@ -7,11 +7,14 @@ import argparse
 from pathlib import Path
 
 
-def load_result_sets(path: Path) -> tuple[set[str], set[str], set[tuple[str, str]]]:
-    """Load circRNA IDs, read IDs, and (circRNA_ID, read_ID) assignments."""
+def load_result(
+    path: Path,
+) -> tuple[set[str], set[str], set[tuple[str, str]], dict[str, int]]:
+    """Load circRNA IDs, read IDs, assignments, and per-circ FSJ counts."""
     circ_ids: set[str] = set()
     read_ids: set[str] = set()
     read_assignments: set[tuple[str, str]] = set()
+    fsj_counts: dict[str, int] = {}
 
     with path.open("r", encoding="utf-8") as f:
         for i, line in enumerate(f):
@@ -23,6 +26,8 @@ def load_result_sets(path: Path) -> tuple[set[str], set[str], set[tuple[str, str
             fields = line.split("\t")
             circ_id = fields[0]
             circ_ids.add(circ_id)
+            if len(fields) > 6:
+                fsj_counts[circ_id] = int(fields[6])
             if len(fields) > 11 and fields[11]:
                 for read_id in fields[11].split(","):
                     if not read_id:
@@ -30,7 +35,7 @@ def load_result_sets(path: Path) -> tuple[set[str], set[str], set[tuple[str, str
                     read_ids.add(read_id)
                     read_assignments.add((circ_id, read_id))
 
-    return circ_ids, read_ids, read_assignments
+    return circ_ids, read_ids, read_assignments, fsj_counts
 
 
 def print_pr(prefix: str, common_n: int, pred_n: int, truth_n: int) -> None:
@@ -44,6 +49,27 @@ def print_pr(prefix: str, common_n: int, pred_n: int, truth_n: int) -> None:
         print(f"{prefix}_precision={common_n / pred_n:.4f}")
     if truth_n > 0:
         print(f"{prefix}_recall={common_n / truth_n:.4f}")
+
+
+def print_fsj_stats(
+    java_fsj: dict[str, int],
+    rust_fsj: dict[str, int],
+    shared_circs: set[str],
+) -> list[tuple[str, int, int, int]]:
+    """Print FSJ agreement statistics for circRNAs shared by both outputs."""
+    diffs = []
+    for circ_id in sorted(shared_circs):
+        java_count = java_fsj.get(circ_id, 0)
+        rust_count = rust_fsj.get(circ_id, 0)
+        if java_count != rust_count:
+            diffs.append((circ_id, java_count, rust_count, rust_count - java_count))
+
+    print(f"fsj_shared_circ={len(shared_circs)}")
+    print(f"fsj_same={len(shared_circs) - len(diffs)}")
+    print(f"fsj_diff={len(diffs)}")
+    print(f"fsj_java_total_shared={sum(java_fsj.get(c, 0) for c in shared_circs)}")
+    print(f"fsj_rust_total_shared={sum(rust_fsj.get(c, 0) for c in shared_circs)}")
+    return diffs
 
 
 def main() -> None:
@@ -65,10 +91,15 @@ def main() -> None:
         action="store_true",
         help="Print full (circRNA_ID, read_ID) assignment differences.",
     )
+    parser.add_argument(
+        "--show-fsj-diff",
+        action="store_true",
+        help="Print per-circ FSJ count differences for circRNAs shared by both files.",
+    )
     args = parser.parse_args()
 
-    java_circ_ids, java_read_ids, java_assignments = load_result_sets(args.java_result)
-    rust_circ_ids, rust_read_ids, rust_assignments = load_result_sets(args.rust_result)
+    java_circ_ids, java_read_ids, java_assignments, java_fsj = load_result(args.java_result)
+    rust_circ_ids, rust_read_ids, rust_assignments, rust_fsj = load_result(args.rust_result)
 
     circ_common = java_circ_ids & rust_circ_ids
     circ_only_java = java_circ_ids - rust_circ_ids
@@ -100,6 +131,7 @@ def main() -> None:
         pred_n=len(rust_assignments),
         truth_n=len(java_assignments),
     )
+    fsj_diffs = print_fsj_stats(java_fsj, rust_fsj, circ_common)
 
     if args.show_ids:
         print("ONLY_JAVA_IDS")
@@ -124,6 +156,11 @@ def main() -> None:
         print("ONLY_RUST_READ_ASSIGNMENTS")
         for circ_id, read_id in sorted(assignment_only_rust):
             print(f"{circ_id}\t{read_id}")
+
+    if args.show_fsj_diff:
+        print("FSJ_DIFF")
+        for circ_id, java_count, rust_count, delta in fsj_diffs:
+            print(f"{circ_id}\t{java_count}\t{rust_count}\t{delta}")
 
 
 if __name__ == "__main__":

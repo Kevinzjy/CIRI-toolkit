@@ -115,28 +115,6 @@ fn should_trace_read(read_id: &str) -> bool {
     false
 }
 
-/// Keeps the longest observed representative sequence for one mate.
-///
-/// Scan2 reuses the same read-level representative sequence model as Scan1.
-/// Hard-clipped alignments can carry only a truncated `SEQ`, while another
-/// alignment of the same mate may still expose the full soft-clipped read
-/// sequence. Using the longest available `SEQ` avoids rescuing candidates
-/// against a shortened template that never existed in Java's effective logic.
-#[inline]
-fn update_best_stand_seq<'a>(
-    stand_map: &mut HashMap<i32, (char, Cow<'a, str>)>,
-    s_idx: i32,
-    st_c: char,
-    seq: Cow<'a, str>,
-) {
-    match stand_map.get(&s_idx) {
-        Some((_, existing_seq)) if existing_seq.len() >= seq.len() => {}
-        _ => {
-            stand_map.insert(s_idx, (st_c, seq));
-        }
-    }
-}
-
 /// Optional Scan2 profiler used only when `CIRI_PROFILE_SCAN2` is enabled.
 ///
 /// The counters stay intentionally coarse so the profiler can be left inside the
@@ -425,9 +403,11 @@ impl Scan2 {
 
     /// Collects FSJ keys overlapped by a linear alignment span.
     ///
-    /// The logic follows Java's site-bucket gating rather than scanning every
-    /// candidate on a chromosome. That keeps FSJ counting cheap enough that the
-    /// remaining Scan2 cost is dominated by BSJ rescue.
+    /// This mirrors Java `GetFSJClass.getFSJ(...)`: only the two buckets touched
+    /// by `[start_tem, end_tem]` are scanned, with reverse traversal on `num1`
+    /// and forward traversal on `num2`. The broader lower-bound scan is cheaper
+    /// to write but not Java-compatible, and it over-counts FSJs on chr1 while
+    /// leaving BSJ rescue unchanged.
     fn collect_fsj_keys_in_range(
         &self,
         chr: &str,
@@ -436,48 +416,62 @@ impl Scan2 {
         style: i32,
         out: &mut HashSet<String>,
     ) {
-        let lb = |list: &Vec<CandidateBreakpoint>, key: i32| -> usize {
-            let mut lo = 0usize;
-            let mut hi = list.len();
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                if list[mid].site < key {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
+        let bucket_size = self.seq_len.max(1);
+        let num1 = start_tem / bucket_size;
+        let num2 = end_tem / bucket_size;
+        if let Some(list1) = self.index1.get(chr) {
+            if self.site_array1.get(chr).is_some_and(|s| s.contains(&num1)) {
+                let (l1, r1) = Self::bucket_range(list1, num1, bucket_size);
+                for idx in (l1..r1).rev() {
+                    let cand = &list1[idx];
+                    if cand.site >= start_tem {
+                        if cand.site <= end_tem || style == 10 || style == 1 {
+                            out.insert(format!("{}\t{}\t{}", chr, cand.data[0], cand.data[1]));
+                        }
+                    } else {
+                        break;
+                    }
                 }
             }
-            lo
-        };
-        if let Some(list1) = self.index1.get(chr) {
-            let mut i = lb(list1, start_tem);
-            while i < list1.len() && list1[i].site <= end_tem {
-                let cand = &list1[i];
-                out.insert(format!("{}\t{}\t{}", chr, cand.data[0], cand.data[1]));
-                i += 1;
-            }
-            if style == 10 || style == 1 {
-                let mut j = i;
-                while j < list1.len() && list1[j].site <= end_tem + 6 {
-                    let cand = &list1[j];
-                    out.insert(format!("{}\t{}\t{}", chr, cand.data[0], cand.data[1]));
-                    j += 1;
+            if num2 != num1 && self.site_array1.get(chr).is_some_and(|s| s.contains(&num2)) {
+                let (l2, r2) = Self::bucket_range(list1, num2, bucket_size);
+                for idx in l2..r2 {
+                    let cand = &list1[idx];
+                    if cand.site <= end_tem {
+                        if cand.site >= start_tem || style == 10 || style == -1 {
+                            out.insert(format!("{}\t{}\t{}", chr, cand.data[0], cand.data[1]));
+                        }
+                    } else {
+                        break;
+                    }
                 }
             }
         }
         if let Some(list2) = self.index2.get(chr) {
-            let mut i = lb(list2, start_tem);
-            while i < list2.len() && list2[i].site <= end_tem {
-                let cand = &list2[i];
-                out.insert(format!("{}\t{}\t{}", chr, cand.data[0], cand.data[1]));
-                i += 1;
+            if self.site_array2.get(chr).is_some_and(|s| s.contains(&num1)) {
+                let (l1, r1) = Self::bucket_range(list2, num1, bucket_size);
+                for idx in (l1..r1).rev() {
+                    let cand = &list2[idx];
+                    if cand.site >= start_tem {
+                        if cand.site <= end_tem || style == 10 || style == 1 {
+                            out.insert(format!("{}\t{}\t{}", chr, cand.data[0], cand.data[1]));
+                        }
+                    } else {
+                        break;
+                    }
+                }
             }
-            if style == 10 || style == -1 {
-                let mut j = i;
-                while j < list2.len() && list2[j].site <= end_tem + 6 {
-                    let cand = &list2[j];
-                    out.insert(format!("{}\t{}\t{}", chr, cand.data[0], cand.data[1]));
-                    j += 1;
+            if num2 != num1 && self.site_array2.get(chr).is_some_and(|s| s.contains(&num2)) {
+                let (l2, r2) = Self::bucket_range(list2, num2, bucket_size);
+                for idx in l2..r2 {
+                    let cand = &list2[idx];
+                    if cand.site <= end_tem {
+                        if cand.site >= start_tem || style == 10 || style == -1 {
+                            out.insert(format!("{}\t{}\t{}", chr, cand.data[0], cand.data[1]));
+                        }
+                    } else {
+                        break;
+                    }
                 }
             }
         }
@@ -821,6 +815,7 @@ impl Scan2 {
         let mut current_id: Vec<u8> = Vec::new();
         let mut alignments: Vec<AlignmentRecord> = Vec::with_capacity(16);
         let mut stand_map: HashMap<i32, (char, Cow<str>)> = HashMap::with_capacity(4);
+        let mut one_read_key: i32 = -1;
         let mut crossed_start = start == 0;
         let mut leading_partial_id: Option<Vec<u8>> = None;
         let mut last_compressed_pos = block_start.saturating_sub(pos);
@@ -903,6 +898,7 @@ impl Scan2 {
                 current_id = read_id.to_vec();
                 alignments.clear();
                 stand_map.clear();
+                one_read_key = -1;
             }
 
             let flag = i32::from(u16::from(record.flags()));
@@ -938,10 +934,26 @@ impl Scan2 {
                 seq_buf.push(char::from(b));
             }
             let seq = seq_buf.clone();
-            if !seq.is_empty() && seq != "*" {
-                let s_idx = if flag & 0x40 != 0 { 1 } else { 0 };
-                let st_c = if flag & 0x10 != 0 { '1' } else { '0' };
-                update_best_stand_seq(&mut stand_map, s_idx, st_c, Cow::Owned(seq.clone()));
+            let s_idx = if flag & 0x40 != 0 { 1 } else { 0 };
+            let st_c = if flag & 0x10 != 0 { '1' } else { '0' };
+            if s_idx != one_read_key {
+                one_read_key = s_idx;
+                // Java parity: BAM Scan2 rebuilds the per-mate alignment list each
+                // time the iterator switches between R1 and R2 within the same
+                // read group. Keeping every earlier alignment for that mate looks
+                // harmless, but it changes which candidate payloads contribute to
+                // `temFSJId` on complex supplementary-heavy reads.
+                alignments.retain(|a| {
+                    let idx = if a.flag & 0x40 != 0 { 1 } else { 0 };
+                    idx != s_idx
+                });
+                // Java parity: `standMap` is overwritten on mate switches with the
+                // current record's sequence; it is not a "longest-sequence wins"
+                // cache in Scan2. This only affects Scan2 candidate validation,
+                // not Scan1 representative-sequence handling.
+                if !seq.is_empty() && seq != "*" {
+                    stand_map.insert(s_idx, (st_c, Cow::Owned(seq.clone())));
+                }
             }
             alignments.push(AlignmentRecord {
                 flag,
@@ -1097,16 +1109,16 @@ impl Scan2 {
             cols.next();
             let seq = unsafe { std::str::from_utf8_unchecked(cols.next().unwrap_or(b"*")).trim() };
             let s_idx = if flag & 0x40 != 0 { 1 } else { 0 };
+            let st_c = if flag & 0x10 != 0 { '1' } else { '0' };
             if s_idx != one_read_key {
                 one_read_key = s_idx;
                 alignments.retain(|a| {
                     let idx = if a.flag & 0x40 != 0 { 1 } else { 0 };
                     idx != s_idx
                 });
-            }
-            if !seq.is_empty() && seq != "*" {
-                let st_c = if flag & 0x10 != 0 { '1' } else { '0' };
-                update_best_stand_seq(&mut stand_map, s_idx, st_c, Cow::Borrowed(seq));
+                if !seq.is_empty() && seq != "*" {
+                    stand_map.insert(s_idx, (st_c, Cow::Borrowed(seq)));
+                }
             }
             alignments.push(AlignmentRecord {
                 flag,

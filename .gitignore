@@ -12,33 +12,16 @@
 *.swo
 
 # --- Project Specific (Test Outputs) ---
+vendor/
+
+# --- Local Debug/Temp Workspace ---
+tmp/
+
 # Ignore intermediate back-spliced junction (BSJ) files
-tests/*.BSJ1
-vendor/*.BSJ1
-
-# Ignore final identification results and logs
-tests/*.result
-tests/*.log
-vendor/*.result
-
-# Ignore specific test run artifacts and ID lists
-tests/rust_final*
-tests/perf_test*
-tests/CIRI-rs_result.txt.result
-tests/java_final_ids.txt
-tests/rust_final_ids.txt
-tests/missed_reads_sample.txt
 tests/chr1*
-tests/test*
+tests/hg38*
 
 # --- Backup and Temporary Files ---
 *.rs.bk
 node_modules/
 .npm/
-
-vendor/
-
-# --- Local Debug/Temp Workspace ---
-tmp/
-tmp_pydeps/
-tests/java_probe/bin_isbsj/

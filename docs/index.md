@@ -2,11 +2,16 @@
 
 本目录用于维护项目状态、排查流程与性能优化路线，文档命名统一使用小写 kebab-case。
 
+说明：
+
+- `README.md` 面向最终用户，只保留安装、运行、参数和输出说明。
+- 开发、排障、性能、验证相关内容统一维护在 `docs/`。
+
 ## 推荐阅读顺序
 1. `development-status.md`
-   - 当前实现状态、功能基线与阶段目标。
+   - 当前实现状态、功能基线、hg38/v44 验证结论与阶段目标。
 2. `parity-debug-playbook.md`
-   - Java 与 Rust 不一致时的标准排查手册（SOP），包含按具体 read trace 的命令模板。
+   - Java 与 Rust 不一致时的标准排查手册（SOP），包含按具体 read trace 的命令模板与 FSJ 对齐检查口径。
 3. `performance-roadmap.md`
    - 在功能对齐完成后的性能优化计划与度量规范。
 4. `scan1-optimization-status.md`

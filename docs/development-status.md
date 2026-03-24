@@ -23,8 +23,12 @@ CIRI-toolkit 是 CIRI3（Java）的 Rust 复现版本，目标是在保持判定
 
 ## 最新验证结论（2026-03）
 - `tests/chr1` 基线继续保持三层 100% 对齐。
-- 大规模 hg38 验证表明：当 Rust 与 Java 使用一致的参考 FASTA / GTF 版本时，`BSJ reads` 已达到 100% 对齐。
-- 最近排查的残余差异主要来自注释版本差异，尤其是 exon 覆盖是否包含对应位点；这类差异不应误判为 Scan1/Scan2 核心逻辑偏移。
+- 大规模 hg38 验证表明：当 Rust 与 Java 使用一致的参考 FASTA / GTF 版本时，`BSJ reads` 与 `FSJ counts` 已完成全量对齐。
+- 当前推荐的 hg38 对齐口径为：
+  - FASTA：`/data/public/database/gencode/hg38/_BWAindex/hg38.fa`
+  - GTF：`/data/public/database/gencode/hg38/gencode.v44.annotation.gtf`
+- 最近排查表明：注释版本差异，尤其是 exon 覆盖是否包含对应位点，本身就足以制造表面上的 parity gap；这类差异不应误判为 Scan1/Scan2 核心逻辑偏移。
+- 全量 hg38 仍保留极少数 family-level 残余差异，但逐例复核后 Rust 的局部判定更合理；这些 case 作为 Java context-sensitive artifact 归档，不再阻塞当前版本发布。
 - 因此，全量 parity 复核时必须先锁定以下环境：
   - 相同 FASTA 版本
   - 相同 GTF 版本
@@ -40,6 +44,7 @@ python tests/analyze_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.resu
 
 ## 架构要点（已落地）
 - Scan2 使用 Java 语义一致的去重索引与桶遍历顺序。
+- Scan2 的 FSJ 统计现已对齐 Java `GetFSJClass.getFSJ(...)` 的 bucket-gating 与 BAM mate-run 语义。
 - Summary 在关键路径中对齐 Java 容器迭代行为，避免首命中差异。
 - 大文件路径采用 mmap/分片与批量写出策略，兼顾吞吐与内存占用。
 - SAM/BAM 两条输入路径最终落到相同的判定语义上，避免格式差异带来的输出漂移。
