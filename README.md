@@ -97,10 +97,10 @@ ciri-toolkit \
 
 开发、对齐排障、性能优化与验证说明统一放在 `docs/`：
 
-- 文档导航：`docs/index.md`
-- 项目状态：`docs/development-status.md`
-- 对齐排障手册：`docs/parity-debug-playbook.md`
-- 性能优化路线：`docs/performance-roadmap.md`
+- 文档导航：`docs/00-index.md`
+- 项目状态：`docs/01-development-status.md`
+- 对齐排障手册：`docs/02-parity-debug-playbook.md`
+- 性能优化总结：`docs/03-performance-optimization.md`
 
 ---
 最后更新：2026-03-24

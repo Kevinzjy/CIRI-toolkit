@@ -58,8 +58,8 @@
   - `CIRI_TRACE_ALL_CANDS=1`：仅用于调试时查看被追踪读段（traced read）的 Scan2 全候选
 - 调试结束后必须关闭追踪（trace）环境变量，再跑最终验证。
 - 详细操作手册见：
-  - `docs/parity-debug-playbook.md`
-  - `docs/index.md`
+  - `docs/02-parity-debug-playbook.md`
+  - `docs/00-index.md`
 
 ## 临时文件规范
 - 所有临时脚本输出、探针产物、一次性依赖下载统一放在 `tmp/` 目录下。
