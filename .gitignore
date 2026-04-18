@@ -25,3 +25,9 @@ tests/hg38*
 *.rs.bk
 node_modules/
 .npm/
+
+# Codex
+.codex
+
+# Compiled binary
+ciri-toolkit

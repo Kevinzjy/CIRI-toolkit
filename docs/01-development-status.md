@@ -8,6 +8,9 @@ CIRI-toolkit 是 CIRI3（Java）的 Rust 复现版本，目标是在保持判定
 ## 相关文档
 - 调试手册：`docs/02-parity-debug-playbook.md`
 - 性能总结：`docs/03-performance-optimization.md`
+- RO feature 计划：`docs/05-ro-feature-plan.md`
+- CIRI-AS 拆解：`docs/CIRI-AS.md`
+- CIRI-full 拆解：`docs/CIRI-full.md`
 - 文档导航：`docs/00-index.md`
 
 ## 当前状态（Functional v1）
@@ -64,9 +67,19 @@ python tests/analyze_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.resu
   - `CIRI_PROFILE_SCAN2=1`
 - 详细命令、日志标签与 SOP 见 `docs/02-parity-debug-playbook.md`。
 
+## 后续开发计划
+- 在当前 CIRI3 核心流程稳定的基础上，后续规划支持 circRNA full-length structure / isoform usage 相关能力。
+- CIRI-AS / CIRI-full 尚未经过本项目同等级别的严格验证和性能优化，后续不以完整复刻其所有输出为目标；它们主要作为算法思路来源和风险清单。
+- 当前优先实现 RO feature 的第一阶段：在 `Scan1` read group 层识别 paired-end reads 的 RO 序列，输出 `<prefix>.ro.fq` 和 `<prefix>.ro.tsv`，并标注 `5p_ro / 3p_ro / bidirectional_ro / full_length_candidate` 等 sequence-level 类型。
+- 第一阶段 RO sidecar 输出不得改变现有 `.bsj1/.bsj/.out`；只有在 RO remap、RO Scan1/Scan2、origin read 去重和回归验证完成后，才考虑把 RO evidence 合并进主 BSJ 判定。
+- 后续 full-length isoform reconstruction 的目标输出是同一 BSJ 下的不同 isoform 结构及样本 usage ratio，而不是 CIRI-AS/CIRI-full 的历史中间文件。
+- 新增模块仍应遵守小步验证原则：默认关闭、sidecar 输出优先、主流程 parity 不回退。
+
 ## 开发规范
 - 后续代码改动应继续遵守已沉淀的 hg38 排障结论、Java parity 约束与关键注释说明，避免在重构或优化中重新引入回归。
 - 后续若再进行性能优化或结构调整，仍必须执行完整 parity 校验，出现差异即先回到行为对齐。
+- RO feature 实现前应先阅读 `docs/05-ro-feature-plan.md`；新增 `src/ro.rs`、Scan1 RO 接入点、原始方向 `seq/qual` 恢复、RO writer 与 part 文件合并逻辑，必须补齐 Rust 文档注释，说明职责边界、输出稳定性和不影响主流程 parity 的原因。
+- CIRI-AS / CIRI-full 相关实现当前不以完整 parity 为目标，任何取舍必须写入对应设计文档，避免后续误把历史输出当作强制兼容契约。
 
 ---
-最后更新：2026-03-30
+最后更新：2026-04-18

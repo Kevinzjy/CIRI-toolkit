@@ -9,12 +9,21 @@
 - **先对齐再优化**：仅在行为一致后再做性能优化。
 - **测试覆盖关键逻辑**：BSJ 识别、CIGAR 分类、Scan2 救援（rescue）、Summary 合并与严格度（stringency）过滤都应有验证。
 - **小步快跑、每步验证**：每次改动后都要立刻做差异比较。
+- **扩展模块不反向污染主流程**：CIRI-AS / CIRI-full / RO feature 等扩展能力默认作为 sidecar 或后处理推进，未完成验证前不得改变 `Scan1 -> Scan2 -> Summary` 的既有输出。
 
 ## 技术架构约束
 - **SAM/BAM**：使用 `noodles-sam` 和 `noodles-bam`。
 - **FASTA/GTF 解析**：使用 `needletail` 和 `noodles-gtf`。
 - **两遍扫描流程**：遵循 CIRI3 两遍扫描架构（Scan1 -> Scan2 -> Summary）。
 - **过滤条件**：严格按 `Summary.java` 的严格度（stringency）逻辑实现。
+
+## 扩展模块策略（CIRI-AS / CIRI-full / RO）
+- **CIRI3 parity 与扩展功能分层**：`vendor/CIRI3` 仍是核心 BSJ 检测行为标准；`vendor/CIRI-AS` 与 `vendor/CIRI-full` 当前只作为算法参考和风险清单，不要求完整复刻所有历史输出。
+- **RO feature 第一阶段目标**：优先在 `Scan1` read group 层识别 paired-end reads 的 RO 序列，输出 `<prefix>.ro.fq` 与 `<prefix>.ro.tsv`，并标注 `5p_ro / 3p_ro / bidirectional_ro / full_length_candidate` 等 sequence-level 类型。
+- **RO sidecar 红线**：第一阶段 RO 输出不得改变 `.bsj1`、`.bsj`、`.out`；`--ro-feature` 关闭时应保持主流程字节级或三层 diff 完全一致。
+- **RO 证据边界**：Scan1 阶段的 RO overlap 不是 BSJ 证据，也不是 CIRI-full 的 `Full/Part` 结构判定；只有经过后续 RO remap、RO Scan1/Scan2、origin read 去重和回归验证后，才可考虑合并进主 BSJ 判定。
+- **原始方向隔离**：RO detector 需要 read pair 的原始测序方向序列和质量值；不得复用或改写服务 Java parity 的 alignment-oriented `stand_map` 语义。
+- **文档优先**：RO、isoform、CIRI-AS/CIRI-full 相关设计变更必须同步更新 `docs/05-ro-feature-plan.md` 以及必要的状态文档，再进入代码实现。
 
 ## 代码注释规范
 - **Rust 文档化注释是强约束**：`src/` 下新增或修改的模块、结构体、函数都应补齐规范的 Rust 文档注释。
@@ -87,6 +96,12 @@
   - 任何优化提交都必须通过 `tests/analyze_diff.py` 三层零差异检查。
   - 若出现差异，先回到行为对齐再谈性能。
   - 不允许以“统计上接近”替代“逐条一致”。
+
+## 当前扩展阶段定义（2026-04）
+- **阶段目标**：实现 RO1 思路的 sidecar 功能，在 `Scan1` 过程中生成 `<prefix>.ro.fq` 和 `<prefix>.ro.tsv`。
+- **实现范围**：只做 RO read pair 检测、merged RO read 输出和 RO metadata 记录；暂不做 BWA remap、RO BAM、RO-assisted Scan2 或 isoform usage。
+- **验证要求**：新增 RO 单元测试；`--ro-feature` 关闭时执行既有 parity 检查；`--ro-feature` 开启时主结果仍不变，只额外生成 RO sidecar 文件。
+- **注释要求**：新增 `src/ro.rs`、Scan1 RO 接入点、原始方向 seq/qual 恢复、shard-local RO writer 和输出合并逻辑，都必须有说明职责边界与不能误改的 Rust 文档注释。
 
 ## 交付前检查清单
 - 关闭所有 trace 环境变量后执行一次完整流程。

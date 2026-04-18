@@ -16,13 +16,20 @@
    - 性能优化阶段的统一总结、测量规范、维护约束，以及 Scan1 profiling 专项记录。
 4. `04-BSJ_scoring.md`
    - BSJ 重评分模型的专题设计笔记，属于探索性方案，不代表当前主流程实现。
+5. `05-ro-feature-plan.md`
+   - RO feature、`.ro.fq` sidecar 输出、后续 RO remap / second scanning / isoform reconstruction 的阶段性计划。
+6. `CIRI-AS.md`
+   - CIRI-AS 上游脚本功能拆解；当前作为 circRNA 内部结构识别思路参考，不作为完整 parity 目标。
+7. `CIRI-full.md`
+   - CIRI-full 上游 Java 模块拆解；当前重点复用 RO1/RO2 思路，不复刻全部历史输出。
 
 ## 维护规则
 - 状态类信息写入 `01-development-status.md`。
 - 可执行调试命令与排障步骤写入 `02-parity-debug-playbook.md`。
 - 性能约束、测量规范、优化总结与 profiling 记录统一写入 `03-performance-optimization.md`。
+- RO feature、full-length isoform reconstruction 的阶段性设计写入 `05-ro-feature-plan.md`，CIRI-AS/CIRI-full 拆解文档只保留上游算法参考。
 - 避免跨文档重复维护同一检查清单。
 - 所有临时文件统一放在 `tmp/`，不要散落在 `tests/` 或项目根目录。
 
 ---
-最后更新：2026-03-30
+最后更新：2026-04-18
