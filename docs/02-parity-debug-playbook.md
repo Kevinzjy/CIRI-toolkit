@@ -62,7 +62,7 @@ python tests/analyze_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.resu
 推荐入口是 CLI `--debug`，环境变量方式保留给临时调试或脚本兼容。
 
 ```bash
-./target/release/ciri-toolkit \
+./target/release/ciri \
   -i tests/chr1/test.bam \
   -o tests/chr1/CIRI-rs.trace \
   -r tests/chr1/chr1.fa \
@@ -76,7 +76,7 @@ python tests/analyze_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.resu
 兼容旧入口：
 
 ```bash
-CIRI_TRACE_READS="simulate:7037,simulate:7050" ./target/release/ciri-toolkit ...
+CIRI_TRACE_READS="simulate:7037,simulate:7050" ./target/release/ciri ...
 ```
 
 输出到 `stderr`，关键标签：
@@ -91,7 +91,7 @@ CIRI_TRACE_READS="simulate:7037,simulate:7050" ./target/release/ciri-toolkit ...
 ```bash
 CIRI_TRACE_READS="simulate:398600" \
 CIRI_TRACE_ALL_CANDS=1 \
-./target/release/ciri-toolkit \
+./target/release/ciri \
   -i tests/chr1/test.bam \
   -o tests/chr1/CIRI-rs.trace_all \
   -r tests/chr1/chr1.fa \
@@ -111,7 +111,7 @@ CIRI_TRACE_ALL_CANDS=1 \
 ```bash
 CIRI_TRACE_READS="A00785:126:HJFMGDRXX:1:1153:23086:11350" \
 CIRI_TRACE_HG2=1 \
-./target/release/ciri-toolkit \
+./target/release/ciri \
   -i tests/hg38/diff.subset.bam \
   -o tmp/hg38.trace_hg2 \
   -r tests/hg38/hg38.fa \
@@ -135,7 +135,7 @@ CIRI_TRACE_HG2=1 \
 用于定位热点，不用于比较结果正确性。推荐入口是 `--perf`：
 
 ```bash
-./target/release/ciri-toolkit -i input.bam -o sample ... --perf
+./target/release/ciri -i input.bam -o sample ... --perf
 ```
 
 profiling 结果会自动写到 `sample.perf.log`。
@@ -143,8 +143,8 @@ profiling 结果会自动写到 `sample.perf.log`。
 兼容旧入口：
 
 ```bash
-CIRI_PROFILE_SCAN1=1 ./target/release/ciri-toolkit ...
-CIRI_PROFILE_SCAN2=1 ./target/release/ciri-toolkit ...
+CIRI_PROFILE_SCAN1=1 ./target/release/ciri ...
+CIRI_PROFILE_SCAN2=1 ./target/release/ciri ...
 ```
 
 关键输出：

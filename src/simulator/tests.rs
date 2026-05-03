@@ -1,0 +1,270 @@
+use pretty_assertions::assert_eq;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use super::{
+    run, sample_circular_insert_len, sample_insert_len, select_fastq_compressor_from_availability,
+    FastqCompressor, Lcg64, SimulateArgs,
+};
+
+const ISOFORM_HEADER: &str = "circ_id\tchrom\tstart\tend\tstrand\tgene_id\ttranscript_id\tcoverage\tread_cnt\tbsj_read_cnt\tisoform_cnt\tisoform_exons\tisoform_len\tisoform_read_cnt\tisoform_bsj_read_cnt";
+const READS_HEADER: &str = "read_id\tcirc_id\tchrom\tstart\tend\tstrand\tisoform_id\tis_circular\tis_bsj\tr1_segments\tr1_is_bsj\tr2_segments\tr2_is_bsj";
+
+fn base_args() -> SimulateArgs {
+    SimulateArgs {
+        ref_fasta: "unused.fa".to_string(),
+        gtf: "unused.gtf".to_string(),
+        out_prefix: "unused".to_string(),
+        chrom: None,
+        circ_count: 1,
+        circ_coverage: 10.0,
+        linear_coverage: 0.1,
+        scale: 0.5,
+        read_len: 150,
+        insert_len: 260,
+        insert_sd: 40.0,
+        insert_len_minor: 420,
+        insert_sd_minor: 60.0,
+        minor_insert_fraction: 0.10,
+        error_rate: 0.002,
+        exon_exclusive_rate: 0.25,
+        seed: 5,
+    }
+}
+
+#[test]
+fn selects_gzip_when_pigz_is_unavailable() {
+    assert_eq!(
+        select_fastq_compressor_from_availability(false, true).unwrap(),
+        FastqCompressor::Gzip
+    );
+}
+
+#[test]
+fn fails_when_no_fastq_compressor_exists() {
+    let err = select_fastq_compressor_from_availability(false, false).unwrap_err();
+    assert!(err.to_string().contains("neither pigz nor gzip"));
+}
+
+#[test]
+fn short_circ_sampling_biases_insert_toward_circ_length() {
+    let args = base_args();
+    let mut circ_rng = Lcg64::new(7);
+    let mut generic_rng = Lcg64::new(7);
+    let short_circ_len = 220usize;
+    let samples = 2048usize;
+
+    let circ_mean = (0..samples)
+        .map(|_| sample_circular_insert_len(short_circ_len, &args, &mut circ_rng) as f64)
+        .sum::<f64>()
+        / samples as f64;
+    let generic_mean = (0..samples)
+        .map(|_| sample_insert_len(&args, &mut generic_rng) as f64)
+        .sum::<f64>()
+        / samples as f64;
+
+    assert!(
+        circ_mean < generic_mean - 20.0,
+        "short circ insert mean should shift below generic PE mixture: circ_mean={circ_mean}, generic_mean={generic_mean}"
+    );
+    assert!(
+        (circ_mean - short_circ_len as f64).abs() < 30.0,
+        "short circ insert mean should stay close to circ length: circ_mean={circ_mean}, circ_len={short_circ_len}"
+    );
+}
+
+#[test]
+fn long_circ_sampling_matches_generic_insert_distribution() {
+    let args = base_args();
+    let mut circ_rng = Lcg64::new(11);
+    let mut generic_rng = Lcg64::new(11);
+
+    for _ in 0..256 {
+        assert_eq!(
+            sample_circular_insert_len(480, &args, &mut circ_rng),
+            sample_insert_len(&args, &mut generic_rng)
+        );
+    }
+}
+
+#[test]
+fn simulator_output_contract_is_stable() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let temp_dir = tempfile::tempdir().expect("create temporary simulator output directory");
+    let prefix = temp_dir.path().join("sim_contract");
+
+    let summary = run(SimulateArgs {
+        ref_fasta: workspace
+            .join("vendor/CIRI_simulator/chr1.fa")
+            .to_string_lossy()
+            .into_owned(),
+        gtf: workspace
+            .join("vendor/CIRI_simulator/chr1.gtf")
+            .to_string_lossy()
+            .into_owned(),
+        out_prefix: prefix.to_string_lossy().into_owned(),
+        chrom: Some("chr1".to_string()),
+        circ_count: 10,
+        circ_coverage: 8.0,
+        linear_coverage: 0.01,
+        scale: 0.5,
+        read_len: 80,
+        insert_len: 320,
+        insert_sd: 60.0,
+        insert_len_minor: 550,
+        insert_sd_minor: 80.0,
+        minor_insert_fraction: 0.10,
+        error_rate: 0.002,
+        exon_exclusive_rate: 0.25,
+        seed: 5,
+    })
+    .expect("run simulator");
+
+    assert_output_file_set(temp_dir.path());
+
+    let isoforms = read_tsv(&prefix.with_extension("isoforms.tsv"), ISOFORM_HEADER);
+    let reads = read_tsv(&prefix.with_extension("reads.tsv"), READS_HEADER);
+    let annotation = fs::read_to_string(prefix.with_extension("annotation.gtf"))
+        .expect("read filtered annotation");
+
+    assert_eq!(isoforms.len(), 10);
+    assert!(annotation.lines().all(|line| {
+        let fields: Vec<&str> = line.split('\t').collect();
+        fields.len() >= 3 && matches!(fields[2], "gene" | "transcript" | "exon")
+    }));
+
+    let circ_read_pairs_from_isoforms: usize = isoforms.iter().map(|row| parse_usize(row, 8)).sum();
+    let bsj_read_pairs_from_isoforms: usize = isoforms.iter().map(|row| parse_usize(row, 9)).sum();
+    let isoform_count: usize = isoforms.iter().map(|row| parse_usize(row, 10)).sum();
+    let circ_read_pairs = reads.iter().filter(|row| row[1] != "NA").count();
+    let linear_read_pairs = reads.iter().filter(|row| row[1] == "NA").count();
+    let bsj_read_pairs = reads.iter().filter(|row| row[8] == "1").count();
+    let bsj_reads = reads
+        .iter()
+        .map(|row| parse_usize(row, 10) + parse_usize(row, 12))
+        .sum::<usize>();
+
+    assert_eq!(circ_read_pairs_from_isoforms, circ_read_pairs);
+    assert_eq!(bsj_read_pairs_from_isoforms, bsj_read_pairs);
+    assert_eq!(linear_read_pairs, reads.len() - circ_read_pairs);
+    for row in &reads {
+        assert_eq!(
+            parse_usize(row, 8),
+            parse_usize(row, 10) | parse_usize(row, 12)
+        );
+        if row[1] == "NA" {
+            assert_eq!(row[3], "NA");
+            assert_eq!(row[4], "NA");
+            assert_eq!(row[6], "NA");
+            assert_eq!(row[7], "0");
+            assert_eq!(row[8], "0");
+        }
+        if row[10] == "1" {
+            assert!(row[9].contains("<bsj>"));
+        }
+        if row[12] == "1" {
+            assert!(row[11].contains("<bsj>"));
+        }
+        assert!(!row[9].contains("chr"));
+        assert!(!row[11].contains("chr"));
+    }
+
+    assert_eq!(
+        fastq_record_count(&prefix.with_file_name("sim_contract_1.fq.gz")),
+        reads.len()
+    );
+    assert_eq!(
+        fastq_record_count(&prefix.with_file_name("sim_contract_2.fq.gz")),
+        reads.len()
+    );
+
+    assert_eq!(summary.circ_count, isoforms.len());
+    assert_eq!(summary.isoform_count, isoform_count);
+    assert_eq!(summary.total_read_pairs, reads.len());
+    assert_eq!(summary.circ_read_pairs, circ_read_pairs);
+    assert_eq!(summary.linear_read_pairs, linear_read_pairs);
+    assert_eq!(summary.bsj_reads, bsj_reads);
+    assert_eq!(summary.bsj_read_pairs, bsj_read_pairs);
+
+    let expected_summary = format!(
+        "Simulated {} circRNAs, {isoform_count} circular isoforms\n\
+         Total {} read pairs, {circ_read_pairs} circRNA read pairs, {linear_read_pairs} linear read pairs\n\
+         BSJ feature: {bsj_reads} reads / {bsj_read_pairs} read pairs",
+        isoforms.len(),
+        reads.len(),
+    );
+    assert_eq!(summary.to_string(), expected_summary);
+}
+
+fn assert_output_file_set(output_dir: &Path) {
+    let mut names: Vec<String> = fs::read_dir(output_dir)
+        .expect("read simulator output directory")
+        .map(|entry| {
+            entry
+                .expect("read simulator output entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+
+    let expected = vec![
+        "sim_contract.annotation.gtf",
+        "sim_contract.isoforms.tsv",
+        "sim_contract.reads.tsv",
+        "sim_contract_1.fq.gz",
+        "sim_contract_2.fq.gz",
+    ];
+    assert_eq!(names, expected);
+}
+
+fn read_tsv(path: &Path, expected_header: &str) -> Vec<Vec<String>> {
+    let content =
+        fs::read_to_string(path).unwrap_or_else(|err| panic!("read TSV {}: {err}", path.display()));
+    let mut lines = content.lines();
+    assert_eq!(
+        lines.next().unwrap_or_default(),
+        expected_header,
+        "unexpected header in {}",
+        path.display()
+    );
+    lines
+        .map(|line| line.split('\t').map(str::to_owned).collect())
+        .collect()
+}
+
+fn parse_usize(row: &[String], idx: usize) -> usize {
+    row[idx]
+        .parse()
+        .unwrap_or_else(|err| panic!("parse usize from column {idx} value {:?}: {err}", row[idx]))
+}
+
+fn fastq_record_count(path: &Path) -> usize {
+    let content = read_fastq_text(path);
+    let line_count = content.lines().count();
+    assert_eq!(line_count % 4, 0, "FASTQ line count must be divisible by 4");
+    line_count / 4
+}
+
+fn read_fastq_text(path: &Path) -> String {
+    if path.extension().and_then(|ext| ext.to_str()) == Some("gz") {
+        let output = Command::new("gzip")
+            .arg("-dc")
+            .arg(path)
+            .output()
+            .unwrap_or_else(|err| panic!("run gzip -dc {}: {err}", path.display()));
+        assert!(
+            output.status.success(),
+            "gzip -dc {} exited with {}",
+            path.display(),
+            output.status
+        );
+        String::from_utf8(output.stdout)
+            .unwrap_or_else(|err| panic!("decode FASTQ {} as UTF-8: {err}", path.display()))
+    } else {
+        fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("read FASTQ {}: {err}", path.display()))
+    }
+}

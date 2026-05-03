@@ -2,6 +2,16 @@
 name = "ciri-toolkit"
 version = "0.1.1"
 edition = "2021"
+autobins = false
+default-run = "ciri"
+
+[[bin]]
+name = "ciri"
+path = "src/bin/ciri.rs"
+
+[[bin]]
+name = "ciri-simulator"
+path = "src/bin/ciri-simulator.rs"
 
 [dependencies]
 # Bioinformatic file parsing

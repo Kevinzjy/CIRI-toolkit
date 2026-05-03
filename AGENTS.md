@@ -62,6 +62,7 @@
   - circRNA 层面
   - 读段 ID（read ID）层面
   - 读段归属（read-assignment）层面
+- 除非正在做必须依赖 debug build 的单元级调试，否则涉及真实 SAM/BAM fixture、CIRI3/CIRI-AS parity 或性能观察的流程应使用 `--release` 模式运行，以避免 debug build 的额外耗时干扰迭代。
 - 可选定向追踪：
   - `CIRI_TRACE_READS`：按读段 ID（read ID）定向追踪
   - `CIRI_TRACE_ALL_CANDS=1`：仅用于调试时查看被追踪读段（traced read）的 Scan2 全候选

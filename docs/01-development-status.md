@@ -9,6 +9,8 @@ CIRI-toolkit 是 CIRI3（Java）的 Rust 复现版本，目标是在保持判定
 - 调试手册：`docs/02-parity-debug-playbook.md`
 - 性能总结：`docs/03-performance-optimization.md`
 - RO feature 计划：`docs/05-ro-feature-plan.md`
+- 模拟数据与 truth 输出设计：`docs/06-simulation-truth-design.md`
+- CIRI-AS-style full-length 结构识别设计：`docs/07-full-length-reconstruction.md`
 - CIRI-AS 拆解：`docs/CIRI-AS.md`
 - CIRI-full 拆解：`docs/CIRI-full.md`
 - 文档导航：`docs/00-index.md`
@@ -68,18 +70,20 @@ python tests/analyze_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.resu
 - 详细命令、日志标签与 SOP 见 `docs/02-parity-debug-playbook.md`。
 
 ## 后续开发计划
-- 在当前 CIRI3 核心流程稳定的基础上，后续规划支持 circRNA full-length structure / isoform usage 相关能力。
-- CIRI-AS / CIRI-full 尚未经过本项目同等级别的严格验证和性能优化，后续不以完整复刻其所有输出为目标；它们主要作为算法思路来源和风险清单。
-- 当前优先实现 RO feature 的第一阶段：在 `Scan1` read group 层识别 paired-end reads 的 RO 序列，输出 `<prefix>.ro.fq` 和 `<prefix>.ro.tsv`，并标注 `5p_ro / 3p_ro / bidirectional_ro / full_length_candidate` 等 sequence-level 类型。
-- 第一阶段 RO sidecar 输出不得改变现有 `.bsj1/.bsj/.out`；只有在 RO remap、RO Scan1/Scan2、origin read 去重和回归验证完成后，才考虑把 RO evidence 合并进主 BSJ 判定。
-- 后续 full-length isoform reconstruction 的目标输出是同一 BSJ 下的不同 isoform 结构及样本 usage ratio，而不是 CIRI-AS/CIRI-full 的历史中间文件。
+- 当前优先路线转为 CIRI-AS-style internal structure / full-length reconstruction：以 Summary confirmed BSJ 为锚点，在后处理阶段重扫原 BAM/SAM，收集 circ span 内 internal splice、coverage、mate link 和 boundary evidence。
+- 第一版 full-length reconstruction 不依赖 RO remap，不新增 circ seed，不改变 baseline `.bsj1/.bsj/.out`；目标 sidecar 输出是 `<prefix>.full.bundle.tsv`、`<prefix>.isoforms` 和 `<prefix>.fa`。
+- CIRI-AS / CIRI-full 尚未经过本项目同等级别的严格验证和性能优化，后续不以完整复刻其所有历史输出为目标；CIRI-AS 主要提供内部结构识别思路，CIRI-full/RO 暂作为未来 side evidence 风险清单。
+- CIRI-AS sidecar 的 splice signal 阶段已明确采用 annotation-aware motif / strand / offset tie-break：当 annotation exon boundary 支持某个解释时，优先于 Perl v1.2 的 `AC/CT elsif AG/GT` 与 hash-order offset 行为；这是有意偏离 Perl 输出、追求稳定和边界可解释性的设计选择。
+- CIRI-AS sidecar 已实现 `<prefix>.list` 的 cirexon 主路径：基于内部 splice clusters、BSJ read mapping range、junction-read coverage 与 `exon_coverage_validation_single` 风格过滤输出 cirexon start/end、support、coverage median 和 ICF 标记。
+- 当前 full-length 目标不是 AS event taxonomy，而是识别同一 BSJ 下的具体 isoform path；`--as` 已输出 `<prefix>.isoforms`、`<prefix>.isoform_summary` 与 `<prefix>.fa`，`<prefix>_AS.list` 保持 header-only 历史兼容占位。
+- 独立 Rust 模拟器已作为开发 fixture 基础接入，通过 `ciri-simulator` 生成 paired FASTQ、linear-only `<prefix>.annotation.gtf`、circ/isoform-level `<prefix>.isoforms.tsv` 和 read-pair-level `<prefix>.reads.tsv`，用于后续 internal structure 和 full-length path 验证。
 - 新增模块仍应遵守小步验证原则：默认关闭、sidecar 输出优先、主流程 parity 不回退。
 
 ## 开发规范
 - 后续代码改动应继续遵守已沉淀的 hg38 排障结论、Java parity 约束与关键注释说明，避免在重构或优化中重新引入回归。
 - 后续若再进行性能优化或结构调整，仍必须执行完整 parity 校验，出现差异即先回到行为对齐。
-- RO feature 实现前应先阅读 `docs/05-ro-feature-plan.md`；新增 `src/ro.rs`、Scan1 RO 接入点、原始方向 `seq/qual` 恢复、RO writer 与 part 文件合并逻辑，必须补齐 Rust 文档注释，说明职责边界、输出稳定性和不影响主流程 parity 的原因。
-- CIRI-AS / CIRI-full 相关实现当前不以完整 parity 为目标，任何取舍必须写入对应设计文档，避免后续误把历史输出当作强制兼容契约。
+- full-length reconstruction 实现前应先阅读 `docs/07-full-length-reconstruction.md`；新增 bundle、graph、FASTA 输出等模块必须补齐 Rust 文档注释，说明职责边界、证据层级和不影响主流程 parity 的原因。
+- CIRI-AS / CIRI-full 相关实现当前不以完整 parity 为目标，任何取舍必须写入对应设计文档，避免后续误把历史输出当作强制兼容契约；尤其是 annotation-aware offset/strand 判断这类有意偏离，必须在代码注释和 `docs/CIRI-AS.md` 同步维护。
 
 ---
-最后更新：2026-04-18
+最后更新：2026-05-03

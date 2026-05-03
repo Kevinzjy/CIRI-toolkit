@@ -1,28 +1,25 @@
-//! CLI entry point for the `ciri-toolkit` binary.
+//! User-facing CLI entry point for the `ciri` binary.
 //!
-//! The binary is intentionally thin: it wires together the reference loaders and
-//! the three pipeline stages, while the behaviorally sensitive logic stays in the
-//! library modules for easier testing and parity verification.
+//! This module owns argument parsing and orchestration for the user pipeline.
+//! Keeping it separate from `src/bin/ciri.rs` lets the binary remain a thin
+//! wrapper while the behaviorally sensitive logic stays testable in the library.
 
 use anyhow::Result;
 use chrono::Local;
 use clap::Parser;
-use mimalloc::MiMalloc;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::time::Instant;
 
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
-
-use ciri_toolkit::annotation::Annotation;
-use ciri_toolkit::fasta::FastaReader;
-use ciri_toolkit::runtime::init_runtime;
-use ciri_toolkit::sam_bam::{check_bam_sorting, detect_format, InputFormat};
-use ciri_toolkit::scan1::Scan1;
-use ciri_toolkit::scan2::Scan2;
-use ciri_toolkit::summary::Summary;
-use ciri_toolkit::utils::{
+use crate::annotation::Annotation;
+use crate::ciri_as::{run_ciri_as, AsConfig};
+use crate::fasta::FastaReader;
+use crate::runtime::init_runtime;
+use crate::sam_bam::{check_bam_sorting, detect_format, InputFormat};
+use crate::scan1::Scan1;
+use crate::scan2::Scan2;
+use crate::summary::Summary;
+use crate::utils::{
     bsj1_path_for_output, bsj2_path_for_output, bsj_path_for_output, debug_path_for_output,
     fsj_path_for_output, log_path_for_output, parse_mem_str, perf_path_for_output,
     result_path_for_output,
@@ -33,7 +30,12 @@ use ciri_toolkit::utils::{
 /// Defaults are kept aligned with CIRI3 unless there is explicit evidence that a
 /// different value is required for parity.
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about = "Run the CIRI Rust analysis pipeline",
+    long_about = None
+)]
 struct Args {
     /// Path to the input SAM/BAM file
     #[arg(short = 'i', long = "in")]
@@ -88,6 +90,19 @@ struct Args {
     /// Enable profiling and write the report to `<prefix>.perf.log`.
     #[arg(long = "perf", default_value_t = false)]
     perf: bool,
+
+    /// Run CIRI-AS-style internal splice-junction reconstruction as a sidecar.
+    ///
+    /// This consumes the final Summary circRNA table and original SAM/BAM after
+    /// CIRI3 detection completes. It does not alter `.bsj1`, `.bsj`, or `.out`.
+    #[arg(long = "as", default_value_t = false)]
+    as_sidecar: bool,
+
+    /// Output prefix for CIRI-AS sidecar files.
+    ///
+    /// When omitted, CIRI-AS files use `<ciri-output-prefix>.as`.
+    #[arg(long = "as-out")]
+    as_out_prefix: Option<String>,
 }
 
 /// Emits one aligned, timestamped progress line.
@@ -103,8 +118,13 @@ fn log_info(log_writer: &mut BufWriter<File>, label: &str, msg: &str) -> Result<
     Ok(())
 }
 
-/// Loads inputs, runs Scan1 -> Scan2 -> Summary, and writes the final report.
-fn main() -> Result<()> {
+/// Loads inputs, runs Scan1 -> Scan2 -> Summary, and writes outputs.
+///
+/// The current `ciri` entry keeps the historical direct CIRI3-style arguments
+/// instead of forcing a `detect` subcommand, so existing parity commands remain
+/// usable while CIRI-AS-style internal structure reconstruction is developed as
+/// an explicit post-Summary sidecar.
+pub fn main() -> Result<()> {
     let run_started = Instant::now();
     let args = Args::parse();
     let mem_limit = parse_mem_str(&args.mem_per_thread);
@@ -248,6 +268,34 @@ fn main() -> Result<()> {
     )?;
 
     log_info(&mut log_writer, "Output file", &result_output)?;
+
+    if args.as_sidecar {
+        let as_prefix = args
+            .as_out_prefix
+            .clone()
+            .unwrap_or_else(|| format!("{}.as", args.out_prefix));
+        log_info(
+            &mut log_writer,
+            "Running CIRI-AS",
+            "Detecting internal splice junctions as a sidecar...",
+        )?;
+        run_ciri_as(AsConfig {
+            input_path: &args.in_sam,
+            circ_path: &result_output,
+            out_prefix: &as_prefix,
+            reference: &fasta.chr_tcga_map,
+            annotation: args.gtf.as_ref().map(|_| &annotation),
+        })?;
+        log_info(
+            &mut log_writer,
+            "CIRI-AS output",
+            &format!(
+                "{}(_splice.list/.list/.isoforms/.isoform_summary/.fa/_AS.list)",
+                as_prefix
+            ),
+        )?;
+    }
+
     log_info(
         &mut log_writer,
         "Total runtime",

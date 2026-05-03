@@ -6,6 +6,8 @@
 //! parity-oriented optimization against the Java reference implementation.
 
 pub mod annotation;
+pub mod ciri_as;
+pub mod cli;
 pub mod fasta;
 pub mod index_compare;
 pub mod is_bsj_hg2;
@@ -14,6 +16,7 @@ pub mod runtime;
 pub mod sam_bam;
 pub mod scan1;
 pub mod scan2;
+pub mod simulator;
 pub mod summary;
 pub mod tests;
 pub mod utils;

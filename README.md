@@ -1,10 +1,10 @@
 # CIRI-toolkit（Rust）
 
-`CIRI-toolkit` 是 CIRI3 的高性能 Rust 升级版，实现了高速BAM/SAM处理，低内存的同时保证结果的高度一致性。
+`CIRI-toolkit` 是 CIRI3 的高性能 Rust 实现，实现了高速 BAM/SAM 处理，低内存的同时保证核心 BSJ 检测结果与 Java 版本高度一致。
 
 实测 ~80G BAM (~300G SAM) 文件，CIRI3 总用时 80min (scan1 67min + scan2 14min)。CIRI-toolkit 用时 6 min (1.25min + 4.5min)；提速>10x
 
-后续将加入对CIRI-AS/CIRI-full功能的整合，实现环形RNA的高效分析
+后续将优先沿 CIRI-AS 思路加入 circRNA 内部结构与 full-length isoform 后处理能力；RO 相关能力保留为后续 side evidence 方向。
 
 ## 依赖
 
@@ -20,7 +20,8 @@ cargo build --release
 编译后的可执行文件位于：
 
 ```bash
-./target/release/ciri-toolkit
+./target/release/ciri
+./target/release/ciri-simulator
 ```
 
 ## 快速开始
@@ -29,8 +30,8 @@ cargo build --release
 # Step1. Run bwa-mem
 bwa mem -t <threads> -T 19 <bwa_index> <R1> <R2> > | samtools view -bS -@ <threads> - > <bam_file>
 
-# Step2. Run ciri-toolkit
-ciri-toolkit \
+# Step2. Run ciri
+ciri \
   -i <bam_file> \
   -o <prefix> \
   -r <reference_fasta> \
@@ -42,7 +43,7 @@ ciri-toolkit \
 常见环形RNA测序数据示例：
 
 ```bash
-./target/release/ciri-toolkit \
+./target/release/ciri \
   -i RNA015434_S1.bam \
   -o RNA015434_S1.ciri \
   -r /data/public/database/gencode/hg38/_BWAindex/hg38.fa \
@@ -67,6 +68,30 @@ ciri-toolkit \
 - `--perf`：开启 profiling，自动写到 `<prefix>.perf.log`
 
 > 默认参数已对齐 CIRI3，推荐使用 `-s 0` 输出所有潜在 circRNA 后手动过滤，其他参数一般无需手动设置。
+
+`ciri` 是主分析入口。`ciri-simulator` 是开发用模拟器，用于生成 paired FASTQ、linear annotation 和结构化 truth TSV。
+
+`ciri-simulator` 示例：
+
+```bash
+./target/release/ciri-simulator \
+  -r <reference_fasta> \
+  -a <source_gtf> \
+  -o <prefix> \
+  --circ-count 100 \
+  --circ-coverage 10 \
+  --linear-coverage 0.1 \
+  --exon-exclusive-rate 0.25 \
+  --seed 5
+```
+
+模拟器正式输出：
+
+- `<prefix>_1.fq.gz`
+- `<prefix>_2.fq.gz`
+- `<prefix>.annotation.gtf`
+- `<prefix>.isoforms.tsv`
+- `<prefix>.reads.tsv`
 
 ## 输出文件
 
@@ -101,6 +126,8 @@ ciri-toolkit \
 - 项目状态：`docs/01-development-status.md`
 - 对齐排障手册：`docs/02-parity-debug-playbook.md`
 - 性能优化总结：`docs/03-performance-optimization.md`
+- 模拟数据与 truth 输出设计：`docs/06-simulation-truth-design.md`
+- CIRI-AS-style full-length 结构识别设计：`docs/07-full-length-reconstruction.md`
 
 ---
 最后更新：2026-03-24

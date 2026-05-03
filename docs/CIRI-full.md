@@ -593,7 +593,7 @@ struct FullMergeRecord {
 建议将 CIRI-full 暴露为独立子命令或主命令可选阶段。为了不干扰当前 CIRI3 parity，优先采用独立子命令：
 
 ```text
-ciri-toolkit full pipeline \
+ciri full pipeline \
   -1 <read1.fq.gz> \
   -2 <read2.fq.gz> \
   -r <ref.fa> \
@@ -602,21 +602,21 @@ ciri-toolkit full pipeline \
   -d <workdir> \
   -t <threads>
 
-ciri-toolkit full ro1 \
+ciri full ro1 \
   -1 <read1.fq.gz> \
   -2 <read2.fq.gz> \
   -o <prefix> \
   --min-identity 95 \
   --min-overlap 13
 
-ciri-toolkit full ro2 \
+ciri full ro2 \
   -r <ref.fa> \
   -s <ro.sam|ro.bam> \
   -l <read_length> \
   -o <prefix> \
   --range 100000
 
-ciri-toolkit full merge \
+ciri full merge \
   -c <ciri.out> \
   --as <prefix_jav.list> \
   --ro <prefix_ro2_info.list> \
