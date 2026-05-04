@@ -12,6 +12,7 @@ use anyhow::Result;
 
 use crate::annotation::Annotation;
 use crate::is_bsj_hg2::SmithWaterman;
+use crate::utils::{bsj_is_summary_priority, bsj_payload_start};
 
 /// Final clustering and reporting stage.
 ///
@@ -496,33 +497,61 @@ impl Summary {
         chr_tcga_map: &HashMap<String, String>,
         annotation: &Annotation,
     ) -> Result<()> {
+        self.run_from_bsj_files(&[bsj1_file], result_path, fsj_map, chr_tcga_map, annotation)
+    }
+
+    /// Runs Summary over one or more BSJ protocol files in the supplied order.
+    ///
+    /// Mate-level BSJ rows carry `mate_label` and `priority`; only `priority=1`
+    /// is converted back to the legacy payload consumed by the Java-compatible
+    /// merge and stringency logic.
+    pub fn run_from_bsj_files(
+        &mut self,
+        bsj_files: &[&str],
+        result_path: &str,
+        fsj_map: &HashMap<String, i32>,
+        chr_tcga_map: &HashMap<String, String>,
+        annotation: &Annotation,
+    ) -> Result<()> {
         self.circ_count = 0;
         self.final_bsj_reads = 0;
-        let file = File::open(bsj1_file)?;
-        let reader = BufReader::new(file);
         let mut circ_map: HashMap<String, HashSet<String>> = HashMap::new();
         let mut circ_start_seen: HashMap<String, HashSet<String>> = HashMap::new();
         let mut circ_start_insertion: HashMap<String, Vec<String>> = HashMap::new();
         let mut circ_seen: HashSet<String> = HashSet::new();
         let mut circ_insertion: Vec<String> = Vec::new();
-        for line_res in reader.lines() {
-            let line = line_res?;
-            let p: Vec<&str> = line.split('\t').collect();
-            if p.len() < 8 {
-                continue;
-            }
-            let key = format!("{}\t{}\t{}", p[3], p[4], p[5]);
-            circ_map
-                .entry(key.clone())
-                .or_default()
-                .insert(line.clone());
-            if circ_seen.insert(key.clone()) {
-                circ_insertion.push(key.clone());
-            }
-            let start_key = format!("{}\t{}", p[3], p[4]);
-            let seen = circ_start_seen.entry(start_key.clone()).or_default();
-            if seen.insert(key.clone()) {
-                circ_start_insertion.entry(start_key).or_default().push(key);
+        for bsj_file in bsj_files {
+            let file = File::open(bsj_file)?;
+            let reader = BufReader::new(file);
+            for line_res in reader.lines() {
+                let line = line_res?;
+                let p: Vec<&str> = line.split('\t').collect();
+                if p.len() < 8 || !bsj_is_summary_priority(&p) {
+                    continue;
+                }
+                let payload_start = bsj_payload_start(&p);
+                if p.len() <= payload_start + 8 {
+                    continue;
+                }
+                let legacy_line = if payload_start == 1 {
+                    line.clone()
+                } else {
+                    format!("{}\t{}", p[0], p[payload_start..].join("\t"))
+                };
+                let legacy: Vec<&str> = legacy_line.split('\t').collect();
+                let key = format!("{}\t{}\t{}", legacy[3], legacy[4], legacy[5]);
+                circ_map
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(legacy_line.clone());
+                if circ_seen.insert(key.clone()) {
+                    circ_insertion.push(key.clone());
+                }
+                let start_key = format!("{}\t{}", legacy[3], legacy[4]);
+                let seen = circ_start_seen.entry(start_key.clone()).or_default();
+                if seen.insert(key.clone()) {
+                    circ_start_insertion.entry(start_key).or_default().push(key);
+                }
             }
         }
 

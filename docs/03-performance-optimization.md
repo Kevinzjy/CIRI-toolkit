@@ -24,7 +24,7 @@
 参考命令：
 
 ```bash
-python tests/analyze_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.result \
+python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.result \
   --show-read-ids --show-read-assignments
 ```
 
@@ -74,15 +74,16 @@ python tests/analyze_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.resu
   - First scan：约 22s
   - Second scan：约 22s
 - 当前性能验证口径：`cargo run --release -- ... -t 16`
-- 当前一致性验证口径：`python tests/analyze_diff.py tests/chr1/CIRI3_result.txt <rust_result>`
+- 当前一致性验证口径：`python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt <rust_result>`
 
 ### 已完成的 Scan1 优化
 
 #### 1. BAM 并行分片处理已恢复
 - `Scan1` 的 BAM 路径已从单线程顺序读取切回并行分片执行。
 - shard 输出会在最后 merge 成统一 First Scan 中间文件 `<prefix>.bsj1`。
-  Second Scan 的临时补充结果使用 `<prefix>.bsj2.part_0001.tmp`，最终再合并成 `<prefix>.bsj`。
-- 这一步已经通过 `tests/chr1` 的三层零差异验证。
+  Second Scan 的 shard 输出会 merge 成 `<prefix>.bsj2`。
+- 最终 `<prefix>.bsj` 由 `<prefix>.bsj1 + <prefix>.bsj2` 在 Summary 之后排序生成；当前不再额外重扫输入，也不再生成 `<prefix>.scan1.tmp`、`<prefix>.scan2.tmp` 或 `<prefix>.bsj.raw.tmp`。
+- 这一步已经通过 `tests/chr1` 的 circ/read/read-assignment/FSJ 四层零差异验证。
 
 #### 2. BAM 热循环的低风险去分配优化
 位置：[src/scan1.rs](/data/zhangjy/workspace/CIRI-toolkit/src/scan1.rs)

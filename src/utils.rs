@@ -114,6 +114,37 @@ pub fn bsj_path_for_output(output_arg: &str) -> String {
     format!("{}.bsj", output_arg)
 }
 
+/// Returns whether a field is the mate label used by the expanded BSJ protocol.
+///
+/// The parser helpers below deliberately accept both the historical CIRI3-style
+/// BSJ rows and the new mate-level rows. That compatibility keeps `Summary` and
+/// `Scan2` focused on their parity logic instead of scattering column-offset
+/// checks across hot code paths.
+pub fn is_bsj_mate_label(value: &str) -> bool {
+    value == "R1" || value == "R2"
+}
+
+/// Returns the first field index of the legacy BSJ payload.
+///
+/// Old rows start with `read_id, cigar, tag...`; new rows start with
+/// `read_id, mate_label, priority, cigar, tag...`.
+pub fn bsj_payload_start(parts: &[&str]) -> usize {
+    if parts.len() >= 3 && is_bsj_mate_label(parts[1]) && (parts[2] == "0" || parts[2] == "1") {
+        3
+    } else {
+        1
+    }
+}
+
+/// Returns whether a BSJ row should participate in the Java-compatible summary.
+///
+/// Historical rows have no explicit priority and are therefore treated as
+/// summary-priority rows. New mate-level rows must use `priority=1`.
+pub fn bsj_is_summary_priority(parts: &[&str]) -> bool {
+    let payload_start = bsj_payload_start(parts);
+    payload_start == 1 || parts.get(2).is_some_and(|priority| *priority == "1")
+}
+
 /// Returns the basename used for Scan2 shard-local BSJ spill files.
 pub fn bsj2_path_for_output(output_arg: &str) -> String {
     format!("{}.bsj2", output_arg)

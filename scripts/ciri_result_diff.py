@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Quickly compare CIRI results at circRNA, read, assignment, and FSJ levels."""
+"""Compare two CIRI `.out`/`.result` files at circ/read/assignment/FSJ levels.
+
+Use this when validating baseline CIRI3 parity between a reference result
+(`Java`, old Rust baseline, etc.) and the current Rust output. The script is not
+for segments truth evaluation; see `ciri_segments_eval.py` for that.
+"""
 
 from __future__ import annotations
 
@@ -16,9 +21,9 @@ def load_result(
     read_assignments: set[tuple[str, str]] = set()
     fsj_counts: dict[str, int] = {}
 
-    with path.open("r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if i == 0:
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle):
+            if line_no == 0:
                 continue
             line = line.strip()
             if not line:
@@ -39,7 +44,7 @@ def load_result(
 
 
 def print_pr(prefix: str, common_n: int, pred_n: int, truth_n: int) -> None:
-    """Print precision/recall for a label prefix."""
+    """Print precision/recall for one comparison layer."""
     print(f"{prefix}_java={truth_n}")
     print(f"{prefix}_rust={pred_n}")
     print(f"{prefix}_common={common_n}")
@@ -56,7 +61,7 @@ def print_fsj_stats(
     rust_fsj: dict[str, int],
     shared_circs: set[str],
 ) -> list[tuple[str, int, int, int]]:
-    """Print FSJ agreement statistics for circRNAs shared by both outputs."""
+    """Print FSJ agreement statistics for shared circRNAs."""
     diffs = []
     for circ_id in sorted(shared_circs):
         java_count = java_fsj.get(circ_id, 0)
@@ -67,19 +72,21 @@ def print_fsj_stats(
     print(f"fsj_shared_circ={len(shared_circs)}")
     print(f"fsj_same={len(shared_circs) - len(diffs)}")
     print(f"fsj_diff={len(diffs)}")
-    print(f"fsj_java_total_shared={sum(java_fsj.get(c, 0) for c in shared_circs)}")
-    print(f"fsj_rust_total_shared={sum(rust_fsj.get(c, 0) for c in shared_circs)}")
+    print(f"fsj_java_total_shared={sum(java_fsj.get(circ_id, 0) for circ_id in shared_circs)}")
+    print(f"fsj_rust_total_shared={sum(rust_fsj.get(circ_id, 0) for circ_id in shared_circs)}")
     return diffs
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compare two CIRI .result files.")
+    parser = argparse.ArgumentParser(
+        description="Compare two CIRI .out/.result files for circ/read/assignment/FSJ parity."
+    )
     parser.add_argument("java_result", type=Path, help="Reference result file (e.g. Java)")
     parser.add_argument("rust_result", type=Path, help="Current result file (e.g. Rust)")
     parser.add_argument(
         "--show-ids",
         action="store_true",
-        help="Print full ID lists for only_java / only_rust.",
+        help="Print full circRNA ID lists for only_java / only_rust.",
     )
     parser.add_argument(
         "--show-read-ids",
@@ -94,7 +101,7 @@ def main() -> None:
     parser.add_argument(
         "--show-fsj-diff",
         action="store_true",
-        help="Print per-circ FSJ count differences for circRNAs shared by both files.",
+        help="Print per-circ FSJ differences for shared circRNAs.",
     )
     args = parser.parse_args()
 
@@ -113,23 +120,13 @@ def main() -> None:
     assignment_only_java = java_assignments - rust_assignments
     assignment_only_rust = rust_assignments - java_assignments
 
-    print_pr(
-        "circ",
-        common_n=len(circ_common),
-        pred_n=len(rust_circ_ids),
-        truth_n=len(java_circ_ids),
-    )
-    print_pr(
-        "read",
-        common_n=len(read_common),
-        pred_n=len(rust_read_ids),
-        truth_n=len(java_read_ids),
-    )
+    print_pr("circ", len(circ_common), len(rust_circ_ids), len(java_circ_ids))
+    print_pr("read", len(read_common), len(rust_read_ids), len(java_read_ids))
     print_pr(
         "read_assignment",
-        common_n=len(assignment_common),
-        pred_n=len(rust_assignments),
-        truth_n=len(java_assignments),
+        len(assignment_common),
+        len(rust_assignments),
+        len(java_assignments),
     )
     fsj_diffs = print_fsj_stats(java_fsj, rust_fsj, circ_common)
 

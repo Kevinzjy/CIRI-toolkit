@@ -100,6 +100,9 @@ ciri \
 - 环形RNA识别结果：`<prefix>.out`
 - 运行日志：`<prefix>.log`
 - BSJ reads 比对情况：`<prefix>.bsj`
+- Scan1 mate-level 中间证据：`<prefix>.bsj1`
+- Scan2 mate-level 中间证据：`<prefix>.bsj2`
+- read-level circRNA segment 解释：`<prefix>.segments`
 
 ## 结果格式
 
@@ -118,6 +121,17 @@ ciri \
 12. `junction_reads_ID`
 13. `Score`
 
+最终 `.bsj` 为无 header TSV，前 3 列用于区分 read pair 与 mate-level evidence：
+
+```text
+read_id  mate_label  priority  <CIGAR payload>  <判定结果 payload>  source_stage
+```
+
+- `mate_label` 为 `R1` 或 `R2`。
+- `priority=1` 表示该行参与 `.out` 的 CIRI3-compatible Summary。
+- `priority=0` 表示同一 read pair 的附加 mate-level BSJ evidence；它会保留给后续内部 splice site 识别，但不会增加 `.out` 的 junction read count。
+- `source_stage` 为 `scan1` 或 `scan2`。
+
 ## 开发文档
 
 开发、对齐排障、性能优化与验证说明统一放在 `docs/`：
@@ -130,4 +144,4 @@ ciri \
 - CIRI-AS-style full-length 结构识别设计：`docs/07-full-length-reconstruction.md`
 
 ---
-最后更新：2026-03-24
+最后更新：2026-05-04

@@ -266,11 +266,52 @@ impl Scan1 {
         fasta_map: &HashMap<String, String>,
         annotation: &Annotation,
     ) -> Result<HashSet<String>> {
+        self.run_with_display(sam_file, bsj_path, None, fasta_map, annotation)
+    }
+
+    /// Dispatches to the SAM or BAM implementation and optionally writes the
+    /// display-only Scan1 rows during the same grouped scan.
+    pub fn run_with_display(
+        &mut self,
+        sam_file: &str,
+        bsj_path: &str,
+        display_path: Option<&str>,
+        fasta_map: &HashMap<String, String>,
+        annotation: &Annotation,
+    ) -> Result<HashSet<String>> {
         use crate::sam_bam::{detect_format, InputFormat};
         let format = detect_format(sam_file)?;
         match format {
-            InputFormat::Sam => self.run_sam(sam_file, bsj_path, fasta_map, annotation),
-            InputFormat::Bam => self.run_bam(sam_file, bsj_path, fasta_map, annotation),
+            InputFormat::Sam => {
+                self.run_sam_with_display(sam_file, bsj_path, display_path, fasta_map, annotation)
+            }
+            InputFormat::Bam => {
+                self.run_bam_with_display(sam_file, bsj_path, display_path, fasta_map, annotation)
+            }
+        }
+    }
+
+    /// Runs Scan1 and writes the expanded mate-level `.bsj1` protocol.
+    ///
+    /// The Java-compatible first-hit row is preserved as `priority=1`; extra
+    /// mate-level hits are written as `priority=0` so downstream display and
+    /// internal-splice stages can see them without changing Summary semantics.
+    pub fn run_with_priority(
+        &mut self,
+        sam_file: &str,
+        bsj_path: &str,
+        fasta_map: &HashMap<String, String>,
+        annotation: &Annotation,
+    ) -> Result<HashSet<String>> {
+        use crate::sam_bam::{detect_format, InputFormat};
+        let format = detect_format(sam_file)?;
+        match format {
+            InputFormat::Sam => {
+                self.run_sam_with_priority(sam_file, bsj_path, fasta_map, annotation)
+            }
+            InputFormat::Bam => {
+                self.run_bam_with_priority(sam_file, bsj_path, fasta_map, annotation)
+            }
         }
     }
 
@@ -280,6 +321,65 @@ impl Scan1 {
     /// the read-group level. This was chosen deliberately because an earlier
     /// hand-written text fast path was faster but produced SAM/BAM mismatches.
     pub fn run_sam(
+        &mut self,
+        sam_file: &str,
+        bsj_path: &str,
+        fasta_map: &HashMap<String, String>,
+        annotation: &Annotation,
+    ) -> Result<HashSet<String>> {
+        self.run_sam_with_display(sam_file, bsj_path, None, fasta_map, annotation)
+    }
+
+    /// Runs Scan1 on SAM input and optionally emits display rows in the same pass.
+    fn run_sam_with_display(
+        &mut self,
+        sam_file: &str,
+        bsj_path: &str,
+        display_path: Option<&str>,
+        fasta_map: &HashMap<String, String>,
+        annotation: &Annotation,
+    ) -> Result<HashSet<String>> {
+        let file_size = std::fs::metadata(sam_file)?.len();
+        let pb = ProgressBar::new(file_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {percent:>3}% ({eta}) {msg}")?
+                .progress_chars("#>-"),
+        );
+        pb.set_message("");
+        pb.enable_steady_tick(Duration::from_millis(120));
+
+        let shard_out = part_path(bsj_path, 0);
+        let display_shard_out = display_path.map(|path| part_path(path, 0));
+        let stats = self.process_sam_file_to_file(
+            sam_file,
+            fasta_map,
+            annotation,
+            &pb,
+            &shard_out,
+            display_shard_out.as_deref(),
+            false,
+        )?;
+        self.read_len = stats.max_read_len;
+        self.mapped_reads = stats.mapped_reads;
+
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")?
+                .progress_chars("#>-"),
+        );
+        pb.finish_with_message("");
+        let scan1_ids = self.merge_and_collect_ids(bsj_path, 1)?;
+        if let Some(path) = display_path {
+            let _ = self.merge_display_shards(path, 1)?;
+        }
+        self.bsj1_reads = scan1_ids.len();
+        Ok(scan1_ids)
+    }
+
+    /// Runs the SAM Scan1 path while writing mate-level priority rows directly
+    /// into `.bsj1`.
+    fn run_sam_with_priority(
         &mut self,
         sam_file: &str,
         bsj_path: &str,
@@ -297,8 +397,9 @@ impl Scan1 {
         pb.enable_steady_tick(Duration::from_millis(120));
 
         let shard_out = part_path(bsj_path, 0);
-        let stats =
-            self.process_sam_file_to_file(sam_file, fasta_map, annotation, &pb, &shard_out)?;
+        let stats = self.process_sam_file_to_file(
+            sam_file, fasta_map, annotation, &pb, &shard_out, None, true,
+        )?;
         self.read_len = stats.max_read_len;
         self.mapped_reads = stats.mapped_reads;
 
@@ -325,8 +426,15 @@ impl Scan1 {
         annotation: &Annotation,
         pb: &ProgressBar,
         out_path: &str,
+        display_out_path: Option<&str>,
+        priority_inline: bool,
     ) -> Result<Scan1TraversalStats> {
         let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
+        let mut display_writer = if let Some(path) = display_out_path {
+            Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
+        } else {
+            None
+        };
         let batch_size = (rayon::current_num_threads().max(1) * 256).max(1024);
         let (tx, rx) =
             mpsc::sync_channel::<Vec<SamOwnedGroup>>(rayon::current_num_threads().max(2));
@@ -337,7 +445,14 @@ impl Scan1 {
                 scope.spawn(|| self.stream_sam_group_batches(sam_file, &pb_clone, tx, batch_size));
 
             for mut batch in rx {
-                self.process_sam_group_batch(&mut writer, &mut batch, fasta_map, annotation)?;
+                self.process_sam_group_batch(
+                    &mut writer,
+                    display_writer.as_mut(),
+                    &mut batch,
+                    fasta_map,
+                    annotation,
+                    priority_inline,
+                )?;
             }
 
             producer
@@ -346,6 +461,9 @@ impl Scan1 {
         })?;
 
         writer.flush()?;
+        if let Some(writer) = display_writer.as_mut() {
+            writer.flush()?;
+        }
         Ok(stats)
     }
 
@@ -518,34 +636,65 @@ impl Scan1 {
     fn process_sam_group_batch(
         &self,
         writer: &mut BufWriter<File>,
+        mut display_writer: Option<&mut BufWriter<File>>,
         batch: &mut Vec<SamOwnedGroup>,
         fasta_map: &HashMap<String, String>,
         annotation: &Annotation,
+        priority_inline: bool,
     ) -> Result<()> {
         let groups = std::mem::take(batch);
-        let results: Vec<Option<String>> = groups
+        let results: Vec<(Option<(String, String)>, Vec<String>)> = groups
             .into_par_iter()
             .map(|owned| {
                 let non_empty_groups = owned.group.iter().filter(|g| !g.is_empty()).count();
                 if owned.align_num <= 2 && non_empty_groups != 1 {
-                    return None;
+                    return (None, Vec::new());
                 }
                 let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
-                self.process_group_view(
-                    &owned.read_id,
-                    &owned.group,
-                    &owned.stand_map,
-                    fasta_map,
-                    annotation,
-                    &mut validator,
-                    None,
-                )
-                .map(|(_, res_line)| res_line)
+                let main = self
+                    .process_group_view(
+                        &owned.read_id,
+                        &owned.group,
+                        &owned.stand_map,
+                        fasta_map,
+                        annotation,
+                        &mut validator,
+                        None,
+                    )
+                    .map(|(_, mate_label, res_line)| (mate_label, res_line));
+                let mut display_validator =
+                    IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
+                let display = if priority_inline || display_writer.is_some() {
+                    self.process_group_view_display(
+                        &owned.read_id,
+                        &owned.group,
+                        &owned.stand_map,
+                        fasta_map,
+                        annotation,
+                        &mut display_validator,
+                    )
+                } else {
+                    Vec::new()
+                };
+                (main, display)
             })
             .collect();
 
-        for res_line in results.into_iter().flatten() {
-            writeln!(writer, "{}", res_line)?;
+        for (main, display) in results {
+            if priority_inline {
+                for line in Self::prioritize_scan1_display_lines(main, display) {
+                    writeln!(writer, "{}", line)?;
+                }
+            } else {
+                if let Some((_, res_line)) = main {
+                    writeln!(writer, "{}", res_line)?;
+                }
+                if let Some(display_writer) = display_writer.as_deref_mut() {
+                    for line in display {
+                        writeln!(display_writer, "{}", line)?;
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -569,9 +718,12 @@ impl Scan1 {
                     if reader.read_line(&mut line)? == 0 {
                         break;
                     }
-                    let tab_idx = line.find('\t').unwrap_or(0);
-                    if tab_idx > 0 {
-                        scan1_id_map.insert(line[..tab_idx].to_string());
+                    let trimmed = line.trim_end();
+                    let parts: Vec<&str> = trimmed.split('\t').collect();
+                    if !parts.is_empty() && crate::utils::bsj_is_summary_priority(&parts) {
+                        scan1_id_map.insert(parts[0].to_string());
+                    }
+                    if !trimmed.is_empty() {
                         final_writer.write_all(line.as_bytes())?;
                     }
                 }
@@ -580,6 +732,67 @@ impl Scan1 {
         }
         final_writer.flush()?;
         Ok(scan1_id_map)
+    }
+
+    /// Converts mate-level Scan1 display rows into the persisted `.bsj1` protocol.
+    ///
+    /// The main row is selected by the Java-compatible first-hit path and gets
+    /// `priority=1`. Additional mate rows stay visible for downstream evidence
+    /// collection but are marked `priority=0` so Summary can ignore them.
+    fn prioritize_scan1_display_lines(
+        main: Option<(String, String)>,
+        display: Vec<String>,
+    ) -> Vec<String> {
+        let Some((main_mate, main_line)) = main else {
+            return display
+                .into_iter()
+                .filter_map(|line| Self::with_priority_from_display_line(&line, "0"))
+                .collect();
+        };
+        let Some((main_id, main_payload)) = main_line.split_once('\t') else {
+            return Vec::new();
+        };
+        let main_key = format!("{}\t{}\t{}", main_id, main_mate, main_payload);
+        let mut wrote_main = false;
+        let mut rows = Vec::new();
+        for line in display {
+            if let Some((key, priority_line)) = Self::priority_display_key_and_line(&line, "0") {
+                if key == main_key && !wrote_main {
+                    if let Some(priority_line) = Self::with_priority_from_display_line(&line, "1") {
+                        rows.push(priority_line);
+                    }
+                    wrote_main = true;
+                } else {
+                    rows.push(priority_line);
+                }
+            }
+        }
+        if !wrote_main {
+            rows.push(format!("{}\t{}\t1\t{}", main_id, main_mate, main_payload));
+        }
+        rows
+    }
+
+    /// Adds a `priority` field to a display row of the form
+    /// `read_id, mate_label, legacy_payload...`.
+    fn with_priority_from_display_line(line: &str, priority: &str) -> Option<String> {
+        let mut parts = line.splitn(3, '\t');
+        let read_id = parts.next()?;
+        let mate_label = parts.next()?;
+        let payload = parts.next()?;
+        Some(format!("{read_id}\t{mate_label}\t{priority}\t{payload}"))
+    }
+
+    /// Builds the comparison key used to match the first-hit row to display rows.
+    fn priority_display_key_and_line(line: &str, priority: &str) -> Option<(String, String)> {
+        let mut parts = line.splitn(3, '\t');
+        let read_id = parts.next()?;
+        let mate_label = parts.next()?;
+        let payload = parts.next()?;
+        Some((
+            format!("{read_id}\t{mate_label}\t{payload}"),
+            format!("{read_id}\t{mate_label}\t{priority}\t{payload}"),
+        ))
     }
 
     /// Runs Scan1 on BAM input using independent compressed-byte shards.
@@ -592,6 +805,49 @@ impl Scan1 {
         bsj_path: &str,
         fasta_map: &HashMap<String, String>,
         annotation: &Annotation,
+    ) -> Result<HashSet<String>> {
+        self.run_bam_with_display(bam_file, bsj_path, None, fasta_map, annotation)
+    }
+
+    /// Runs the BAM Scan1 path while writing mate-level priority rows directly
+    /// into `.bsj1`.
+    fn run_bam_with_priority(
+        &mut self,
+        bam_file: &str,
+        bsj_path: &str,
+        fasta_map: &HashMap<String, String>,
+        annotation: &Annotation,
+    ) -> Result<HashSet<String>> {
+        self.run_bam_with_display_impl(bam_file, bsj_path, None, fasta_map, annotation, true)
+    }
+
+    /// Runs Scan1 on BAM input and optionally emits display rows in the same pass.
+    fn run_bam_with_display(
+        &mut self,
+        bam_file: &str,
+        bsj_path: &str,
+        display_path: Option<&str>,
+        fasta_map: &HashMap<String, String>,
+        annotation: &Annotation,
+    ) -> Result<HashSet<String>> {
+        self.run_bam_with_display_impl(
+            bam_file,
+            bsj_path,
+            display_path,
+            fasta_map,
+            annotation,
+            false,
+        )
+    }
+
+    fn run_bam_with_display_impl(
+        &mut self,
+        bam_file: &str,
+        bsj_path: &str,
+        display_path: Option<&str>,
+        fasta_map: &HashMap<String, String>,
+        annotation: &Annotation,
+        priority_inline: bool,
     ) -> Result<HashSet<String>> {
         use noodles::bam;
         let run_started = Instant::now();
@@ -637,6 +893,7 @@ impl Scan1 {
                     (i + 1) * shard_size
                 };
                 let shard_out = part_path(bsj_path, i);
+                let display_shard_out = display_path.map(|path| part_path(path, i));
                 self.process_bam_shard_to_file(
                     i,
                     &mmap,
@@ -647,6 +904,8 @@ impl Scan1 {
                     annotation,
                     &pb,
                     &shard_out,
+                    display_shard_out.as_deref(),
+                    priority_inline,
                     profile_ref,
                 )
             })
@@ -677,8 +936,50 @@ impl Scan1 {
             profile.report();
         }
         let scan1_ids = result?;
+        if let Some(path) = display_path {
+            let _ = self.merge_display_shards(path, num_threads)?;
+        }
         self.bsj1_reads = scan1_ids.len();
         Ok(scan1_ids)
+    }
+
+    /// Extracts the `(read_id, mate_label)` key from one display row.
+    fn parse_display_claim(line: &str) -> Option<(&str, &str)> {
+        let mut parts = line.splitn(3, '\t');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(read_id), Some(mate), Some(_)) => Some((read_id, mate)),
+            _ => None,
+        }
+    }
+
+    /// Merges display shard files in shard order and returns the emitted claims.
+    fn merge_display_shards(
+        &self,
+        output_path: &str,
+        num_threads: usize,
+    ) -> Result<HashSet<String>> {
+        let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(output_path)?);
+        let mut claims = HashSet::new();
+        for i in 0..num_threads {
+            let shard_path = part_path(output_path, i);
+            if let Ok(shard_file) = File::open(&shard_path) {
+                let mut reader = BufReader::new(shard_file);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line)? == 0 {
+                        break;
+                    }
+                    if let Some((rid, mate)) = Self::parse_display_claim(line.trim_end()) {
+                        claims.insert(format!("{rid}\t{mate}"));
+                    }
+                    writer.write_all(line.as_bytes())?;
+                }
+            }
+            let _ = std::fs::remove_file(shard_path);
+        }
+        writer.flush()?;
+        Ok(claims)
     }
 
     /// Processes one BAM shard into a temporary BSJ1 shard file.
@@ -697,12 +998,20 @@ impl Scan1 {
         annotation: &Annotation,
         pb: &ProgressBar,
         out_path: &str,
+        display_out_path: Option<&str>,
+        priority_inline: bool,
         profile: Option<&Scan1Profile>,
     ) -> Result<Scan1ShardStats> {
         use noodles::bam;
         let shard_started = profile.map(|_| Instant::now());
         let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
+        let mut display_writer = if let Some(path) = display_out_path {
+            Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
+        } else {
+            None
+        };
         let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
+        let mut display_validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
         let block_start = if start == 0 {
             0
         } else {
@@ -842,7 +1151,7 @@ impl Scan1 {
                     let id_str = String::from_utf8_lossy(&current_id);
                     let non_empty_groups = group.iter().filter(|g| !g.is_empty()).count();
                     if align_num > 2 || non_empty_groups == 1 {
-                        if let Some((_, res_line)) = self.process_group_view(
+                        let main = self.process_group_view(
                             &id_str,
                             &group,
                             &stand_map,
@@ -850,7 +1159,8 @@ impl Scan1 {
                             annotation,
                             &mut validator,
                             profile,
-                        ) {
+                        );
+                        if let Some((_, _, res_line)) = &main {
                             trace_bam_shard_event(
                                 shard_idx,
                                 &id_str,
@@ -861,12 +1171,37 @@ impl Scan1 {
                                 abs_c_pos,
                             );
                             let write_started = profile.map(|_| Instant::now());
-                            writeln!(writer, "{}", res_line)?;
+                            if !priority_inline {
+                                writeln!(writer, "{}", res_line)?;
+                            }
                             if let (Some(profile), Some(write_started)) = (profile, write_started) {
                                 profile.write_ns.fetch_add(
                                     write_started.elapsed().as_nanos() as u64,
                                     Ordering::Relaxed,
                                 );
+                            }
+                        }
+                        if priority_inline || display_writer.is_some() {
+                            let display_lines = self.process_group_view_display(
+                                &id_str,
+                                &group,
+                                &stand_map,
+                                fasta_map,
+                                annotation,
+                                &mut display_validator,
+                            );
+                            if priority_inline {
+                                let main =
+                                    main.map(|(_, mate_label, res_line)| (mate_label, res_line));
+                                for line in
+                                    Self::prioritize_scan1_display_lines(main, display_lines)
+                                {
+                                    writeln!(writer, "{}", line)?;
+                                }
+                            } else if let Some(display_writer) = display_writer.as_mut() {
+                                for line in display_lines {
+                                    writeln!(display_writer, "{}", line)?;
+                                }
                             }
                         }
                     }
@@ -933,7 +1268,7 @@ impl Scan1 {
         if !current_id.is_empty() {
             mapped_reads += 1;
             let id_str = String::from_utf8_lossy(&current_id);
-            if let Some((_, res_line)) = self.process_group_view(
+            let main = self.process_group_view(
                 &id_str,
                 &group,
                 &stand_map,
@@ -941,7 +1276,8 @@ impl Scan1 {
                 annotation,
                 &mut validator,
                 profile,
-            ) {
+            );
+            if let Some((_, _, res_line)) = &main {
                 trace_bam_shard_event(
                     shard_idx,
                     &id_str,
@@ -952,15 +1288,40 @@ impl Scan1 {
                     pos + last_progress_pos,
                 );
                 let write_started = profile.map(|_| Instant::now());
-                writeln!(writer, "{}", res_line)?;
+                if !priority_inline {
+                    writeln!(writer, "{}", res_line)?;
+                }
                 if let (Some(profile), Some(write_started)) = (profile, write_started) {
                     profile
                         .write_ns
                         .fetch_add(write_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }
             }
+            if priority_inline || display_writer.is_some() {
+                let display_lines = self.process_group_view_display(
+                    &id_str,
+                    &group,
+                    &stand_map,
+                    fasta_map,
+                    annotation,
+                    &mut display_validator,
+                );
+                if priority_inline {
+                    let main = main.map(|(_, mate_label, res_line)| (mate_label, res_line));
+                    for line in Self::prioritize_scan1_display_lines(main, display_lines) {
+                        writeln!(writer, "{}", line)?;
+                    }
+                } else if let Some(display_writer) = display_writer.as_mut() {
+                    for line in display_lines {
+                        writeln!(display_writer, "{}", line)?;
+                    }
+                }
+            }
         }
         writer.flush()?;
+        if let Some(display_writer) = display_writer.as_mut() {
+            display_writer.flush()?;
+        }
         if let (Some(profile), Some(shard_started)) = (profile, shard_started) {
             profile
                 .shard_total_ns
@@ -982,7 +1343,7 @@ impl Scan1 {
         annotation: &Annotation,
         validator: &mut IsBSJHg2,
         profile: Option<&Scan1Profile>,
-    ) -> Option<(String, String)> {
+    ) -> Option<(String, String, String)> {
         let started = profile.map(|_| Instant::now());
         let result = self.process_group_view_impl(
             read_id, group, stand_map, fasta_map, annotation, validator, profile,
@@ -1011,7 +1372,7 @@ impl Scan1 {
         annotation: &Annotation,
         validator: &mut IsBSJHg2,
         profile: Option<&Scan1Profile>,
-    ) -> Option<(String, String)> {
+    ) -> Option<(String, String, String)> {
         // Debug trace is intentionally read-scoped to avoid overwhelming output.
         let trace_read = should_trace_read(read_id);
         let [pair1, pair2] = group;
@@ -1302,8 +1663,10 @@ impl Scan1 {
                             if let Some(res) = res {
                                 let cigar1 = Self::normalize_bsj_cigar(al1.cigar.as_ref());
                                 let cigar2 = Self::normalize_bsj_cigar(al2.cigar.as_ref());
+                                let mate_label = if n == 1 { "R1" } else { "R2" };
                                 return Some((
                                     read_id.to_string(),
+                                    mate_label.to_string(),
                                     format!("{}\t{};{}\t{}", read_id, cigar1, cigar2, res),
                                 ));
                             }
@@ -1313,5 +1676,288 @@ impl Scan1 {
             }
         }
         None
+    }
+
+    /// Enumerates mate-level Scan1 hits for the user-facing post-Summary `.bsj`.
+    ///
+    /// This helper intentionally does not participate in the main parity path.
+    /// It reuses the same BSJ validator, but keeps searching once one mate hits
+    /// so the final display can distinguish `R1`, `R2`, or both.
+    fn process_group_view_display<'a>(
+        &self,
+        read_id: &str,
+        group: &[Vec<AlignmentRecord<'a>>; 2],
+        stand_map: &HashMap<i32, (char, Cow<'a, str>)>,
+        fasta_map: &HashMap<String, String>,
+        annotation: &Annotation,
+        validator: &mut IsBSJHg2,
+    ) -> Vec<String> {
+        let trace_read = should_trace_read(read_id);
+        let [pair1, pair2] = group;
+        let group_count =
+            (if !pair1.is_empty() { 1 } else { 0 }) + (if !pair2.is_empty() { 1 } else { 0 });
+        if group_count == 0 {
+            return Vec::new();
+        }
+        let is_paired = group_count == 2;
+        let mut results = Vec::new();
+
+        'mate: for slot in [1_i32, 0_i32] {
+            let segments = if slot == 0 { pair1 } else { pair2 };
+            let mate_segments = if slot == 0 { pair2 } else { pair1 };
+            let (read_strand, read_seq) = match stand_map.get(&slot) {
+                Some((st, seq)) => (*st, seq.as_ref()),
+                None => continue,
+            };
+            if segments.len() < 2 {
+                continue;
+            }
+            let seq_len = read_seq.len() as i32;
+            let segment_misds: Vec<[i32; 4]> = segments
+                .iter()
+                .map(|aln| misd(&aln.cigar, seq_len))
+                .collect();
+            let mate_misds: Vec<[i32; 4]> = mate_segments
+                .iter()
+                .map(|aln| misd(&aln.cigar, seq_len))
+                .collect();
+            for i in 0..segments.len() {
+                for j in i + 1..segments.len() {
+                    let (mut al1, mut al2) = (&segments[i], &segments[j]);
+                    if al1.chrom != al2.chrom
+                        || al1.chrom.as_ref() == "chrM"
+                        || (al1.flag & 0x10) != (al2.flag & 0x10)
+                        || (al1.mapq < self.min_mapq_uni && al2.mapq < self.min_mapq_uni)
+                        || al1.cigar.as_ref() == "*"
+                        || al2.cigar.as_ref() == "*"
+                    {
+                        continue;
+                    }
+                    let mut c1 = segment_misds[i];
+                    let mut c2 = segment_misds[j];
+                    if c1[0] > c2[0] {
+                        std::mem::swap(&mut c1, &mut c2);
+                        std::mem::swap(&mut al1, &mut al2);
+                    }
+                    let mut identified = false;
+                    let (mut s1_n, mut s2_n, mut adj1, mut adj2): (i32, i32, i32, i32) =
+                        (0, 0, 0, 0);
+                    let (mut str1, mut str2, mut str3, mut str4) =
+                        (String::new(), String::new(), String::new(), String::new());
+                    let (mut q1, mut q2, mut sum_q) = (0, 0, 0);
+                    let al1_strand = if al1.flag & 0x10 != 0 { '1' } else { '0' };
+                    let seq_oriented: Cow<'_, str> = if al1_strand == read_strand {
+                        Cow::Borrowed(read_seq)
+                    } else {
+                        Cow::Owned(crate::utils::reverse_complement(read_seq))
+                    };
+
+                    if c1[0] * c2[0] == -1 {
+                        let scale = c1[0] * al1.pos + c1[2] + c2[0] * al2.pos + c2[2];
+                        if scale > 0
+                            && (c1[1] - c2[1]).abs() <= 6
+                            && scale <= self.max_circle
+                            && scale >= self.min_circle
+                        {
+                            adj1 = (c1[1] * c1[0] + c2[1] * c2[0]) / 2;
+                            adj2 = (c1[1] * c1[0] + c2[1] * c2[0]) - adj1;
+                            if adj1.abs() <= 4 {
+                                identified = true;
+                                s1_n = al1.pos + adj1;
+                                s2_n = al2.pos + c2[3] - 1 - adj2;
+                                str2 = java_substring(seq_oriented.as_ref(), 0, c1[1] + adj1)
+                                    .to_string();
+                                str1 = java_substring(seq_oriented.as_ref(), c1[1] + adj1, seq_len)
+                                    .to_string();
+                                str3 = "*".to_string();
+                                if al1.mapq >= self.min_mapq_uni && al2.mapq >= self.min_mapq_uni {
+                                    q1 = 1;
+                                    q2 = 1;
+                                    sum_q = 1;
+                                } else if al1.mapq >= self.min_mapq_uni {
+                                    q1 = 1;
+                                } else if al2.mapq >= self.min_mapq_uni {
+                                    q2 = 1;
+                                }
+                            }
+                        }
+                    } else if (c1[0] * c2[0]).abs() == 10 {
+                        if c1[0] == -1 {
+                            let scale = al2.pos + c2[3] - 1 - al1.pos;
+                            if scale > 0
+                                && (seq_len - c2[2] - c1[1]).abs() <= 6
+                                && scale <= self.max_circle
+                                && scale >= self.min_circle
+                            {
+                                adj1 = (c2[1] + c2[3] - c1[1]) / 2;
+                                adj2 = (c2[1] + c2[3] - c1[1]) - adj1;
+                                if adj1.abs() <= 4 {
+                                    identified = true;
+                                    s1_n = al1.pos + adj1;
+                                    s2_n = al2.pos + c2[3] - 1 - adj2;
+                                    str1 = java_substring(
+                                        seq_oriented.as_ref(),
+                                        c1[1] + adj1,
+                                        seq_len,
+                                    )
+                                    .to_string();
+                                    str2 =
+                                        java_substring(seq_oriented.as_ref(), c2[1], c1[1] + adj1)
+                                            .to_string();
+                                    str3 =
+                                        java_substring(seq_oriented.as_ref(), 0, c2[1]).to_string();
+                                    if al1.mapq >= self.min_mapq_uni
+                                        && al2.mapq >= self.min_mapq_uni
+                                    {
+                                        q1 = 1;
+                                        q2 = 1;
+                                        sum_q = 1;
+                                    } else if al1.mapq >= self.min_mapq_uni {
+                                        q1 = 1;
+                                    } else if al2.mapq >= self.min_mapq_uni {
+                                        q2 = 1;
+                                    }
+                                }
+                            }
+                        } else {
+                            let scale = al1.pos + c1[3] - 1 - al2.pos;
+                            if scale > 0
+                                && (c1[1] - c2[1]).abs() <= 6
+                                && scale <= self.max_circle
+                                && scale >= self.min_circle
+                            {
+                                adj1 = (c1[1] - c2[1]) / 2;
+                                adj2 = (c1[1] - c2[1]) - adj1;
+                                if adj1.abs() <= 4 {
+                                    identified = true;
+                                    s1_n = al2.pos + adj1;
+                                    s2_n = al1.pos + c1[3] - 1 - adj2;
+                                    str2 = java_substring(seq_oriented.as_ref(), 0, c1[1] - adj2)
+                                        .to_string();
+                                    str1 = java_substring(
+                                        seq_oriented.as_ref(),
+                                        c1[1] - adj2,
+                                        seq_len - c2[2],
+                                    )
+                                    .to_string();
+                                    str3 = java_substring(
+                                        seq_oriented.as_ref(),
+                                        seq_len - c2[2],
+                                        seq_len,
+                                    )
+                                    .to_string();
+                                    if al1.mapq >= self.min_mapq_uni
+                                        && al2.mapq >= self.min_mapq_uni
+                                    {
+                                        q1 = 1;
+                                        q2 = 1;
+                                        sum_q = 1;
+                                    } else if al2.mapq >= self.min_mapq_uni {
+                                        q1 = 1;
+                                    } else if al1.mapq >= self.min_mapq_uni {
+                                        q2 = 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !identified {
+                        continue;
+                    }
+
+                    let mut s4_ok = 0;
+                    if is_paired {
+                        if let Some((mate_stand, mate_seq)) = stand_map.get(&(1 - slot)) {
+                            str4 = if al1_strand != *mate_stand {
+                                mate_seq.to_string()
+                            } else {
+                                crate::utils::reverse_complement(mate_seq)
+                            };
+                        }
+                        for (m_aln, mc) in mate_segments.iter().zip(mate_misds.iter()) {
+                            if m_aln.chrom == al1.chrom && m_aln.mapq >= self.min_mapq_uni {
+                                if m_aln.flag & 0x10 != al1.flag & 0x10
+                                    && m_aln.pos >= s1_n - 6
+                                    && m_aln.pos + mc[3] - 1 <= s2_n + 6
+                                {
+                                    s4_ok = 1;
+                                    break;
+                                } else {
+                                    s4_ok = -1;
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        s4_ok = 1;
+                        str4.clear();
+                    }
+
+                    let mut line_arr = [
+                        if al1.flag & 0x10 != 0 { "1" } else { "0" }.to_string(),
+                        al1.chrom.to_string(),
+                        str1,
+                        str2,
+                        str3,
+                        str4,
+                        q1.to_string(),
+                        q2.to_string(),
+                        s4_ok.to_string(),
+                        s1_n.to_string(),
+                        s2_n.to_string(),
+                        adj1.to_string(),
+                        adj2.to_string(),
+                    ];
+                    if trace_read {
+                        emit_debug_line(&format!(
+                            "[TRACE_SCAN1_DISPLAY] id={} slot={} al1=({}, {}, {}, {}) al2=({}, {}, {}, {}) c1={:?} c2={:?} s1_n={} s2_n={} adj1={} adj2={} q=({},{},{}) s4_ok={}",
+                            read_id,
+                            slot,
+                            al1.chrom,
+                            al1.pos,
+                            al1.mapq,
+                            al1.cigar,
+                            al2.chrom,
+                            al2.pos,
+                            al2.mapq,
+                            al2.cigar,
+                            c1,
+                            c2,
+                            s1_n,
+                            s2_n,
+                            adj1,
+                            adj2,
+                            q1,
+                            q2,
+                            sum_q,
+                            s4_ok,
+                        ));
+                    }
+                    if let Some(chr_seq) = fasta_map.get(al1.chrom.as_ref()) {
+                        let res = validator.is_bsj_hg1(
+                            &mut line_arr,
+                            chr_seq,
+                            sum_q,
+                            "chrM",
+                            false,
+                            &annotation.chr_exon_start_map,
+                            &annotation.chr_exon_end_map,
+                        );
+                        if let Some(res) = res {
+                            let cigar1 = Self::normalize_bsj_cigar(al1.cigar.as_ref());
+                            let cigar2 = Self::normalize_bsj_cigar(al2.cigar.as_ref());
+                            let mate_label = if slot == 1 { "R1" } else { "R2" };
+                            results.push(format!(
+                                "{}\t{}\t{};{}\t{}",
+                                read_id, mate_label, cigar1, cigar2, res
+                            ));
+                            continue 'mate;
+                        }
+                    }
+                }
+            }
+        }
+
+        results
     }
 }

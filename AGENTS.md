@@ -58,7 +58,7 @@
   - 命令行（CLI）默认值应与 CIRI3 默认行为一致，除非有明确证据需要调整。
 
 ## 调试与验证流程（SOP）
-- 使用 `tests/analyze_diff.py` 做三层比较：
+- 使用 `scripts/ciri_result_diff.py` 做三层比较：
   - circRNA 层面
   - 读段 ID（read ID）层面
   - 读段归属（read-assignment）层面
@@ -94,7 +94,7 @@
 - **全量 hg38 口径**：使用 `/data/public/database/gencode/hg38/gencode.v44.annotation.gtf` 与 Java 基线一致地复核 whole-genome parity。
 - **版本目标**：在不改变任何判定结果的前提下，继续推进性能优化（优先 Scan1/Scan2 I/O 路径）。
 - **变更红线**：
-  - 任何优化提交都必须通过 `tests/analyze_diff.py` 三层零差异检查。
+  - 任何优化提交都必须通过 `scripts/ciri_result_diff.py` 三层零差异检查。
   - 若出现差异，先回到行为对齐再谈性能。
   - 不允许以“统计上接近”替代“逐条一致”。
 

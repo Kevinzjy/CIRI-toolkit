@@ -9,19 +9,26 @@ use crate::misd::misd;
 use crate::runtime::{
     emit_debug_line, emit_perf_line, scan2_profile_enabled, should_trace_read, with_trace_hg2_scope,
 };
-use crate::utils::{bam_shard_count, part_path, reverse_complement, AlignmentRecord};
+use crate::utils::{
+    bam_shard_count, bsj_is_summary_priority, bsj_payload_start, part_path, reverse_complement,
+    AlignmentRecord,
+};
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
-use memchr::memchr;
 use memmap2::Mmap;
-use noodles::sam::{self, alignment::Record as _};
+use noodles::sam::{
+    self,
+    alignment::{record::Sequence as _, Record as _},
+};
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -69,19 +76,13 @@ pub struct CandidateBreakpoint {
     pub data: Vec<String>,
 }
 
-/// Fast parser for positive SAM integer fields.
-///
-/// This avoids `str::parse` in the SAM text path, where flag/position/MAPQ are
-/// decoded for every record and profiling showed the generic parser had no value.
-#[inline]
-fn fast_parse_i32(bytes: &[u8]) -> i32 {
-    let mut res = 0;
-    for &b in bytes {
-        if b >= b'0' && b <= b'9' {
-            res = res * 10 + (b - b'0') as i32;
-        }
-    }
-    res
+type OwnedAlignmentRecord = AlignmentRecord<'static>;
+type OwnedStandMap = HashMap<i32, (char, Cow<'static, str>)>;
+
+struct SamOwnedScan2Group {
+    read_id: String,
+    alignments: Vec<OwnedAlignmentRecord>,
+    stand_map: OwnedStandMap,
 }
 
 /// Advises the kernel that a processed `mmap` slice can be evicted from cache.
@@ -314,13 +315,17 @@ impl Scan2 {
         let mut chr_circ_site_insertion: HashMap<String, Vec<String>> = HashMap::new();
         for line_res in reader.lines() {
             let line = line_res?;
-            let p: Vec<String> = line.split('\t').map(|s| s.to_string()).collect();
-            if p.len() < 10 {
+            let p: Vec<&str> = line.split('\t').collect();
+            if p.len() < 10 || !bsj_is_summary_priority(&p) {
                 continue;
             }
-            self.scan1_ids.insert(p[0].clone());
-            let chr = p[3].clone();
-            let site_infor = p[4..].join("\t");
+            let payload_start = bsj_payload_start(&p);
+            if p.len() <= payload_start + 8 {
+                continue;
+            }
+            self.scan1_ids.insert(p[0].to_string());
+            let chr = p[payload_start + 2].to_string();
+            let site_infor = p[payload_start + 3..].join("\t");
             let seen = chr_circ_site_seen
                 .entry(chr.clone())
                 .or_insert_with(HashSet::new);
@@ -394,6 +399,85 @@ impl Scan2 {
             list.sort_by_key(|x| (x.site, x.order));
         }
         Ok(())
+    }
+
+    /// Builds a mate-level display index from the post-Summary Scan1 display rows.
+    ///
+    /// This path is intentionally isolated from the parity index above. It keeps
+    /// the user-facing `.bsj` display self-consistent without feeding any of the
+    /// extra mate-level rows back into `.out`.
+    pub fn build_display_index(&mut self, bsj1_display_file: &str) -> Result<HashSet<String>> {
+        self.index1.clear();
+        self.index2.clear();
+        self.site_array1.clear();
+        self.site_array2.clear();
+        let file = File::open(bsj1_display_file)?;
+        let reader = BufReader::new(file);
+        let mut claims = HashSet::new();
+        let mut chr_circ_site_seen: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut chr_circ_site_insertion: HashMap<String, Vec<String>> = HashMap::new();
+        for line_res in reader.lines() {
+            let line = line_res?;
+            let p: Vec<&str> = line.split('\t').collect();
+            if p.len() < 10 {
+                continue;
+            }
+            let payload_start = bsj_payload_start(&p);
+            let mate_label = if payload_start == 3 { p[1] } else { "NA" };
+            if p.len() <= payload_start + 8 {
+                continue;
+            }
+            claims.insert(format!("{}\t{}", p[0], mate_label));
+            let chr = p[payload_start + 2].to_string();
+            let site_infor = p[payload_start + 3..].join("\t");
+            let seen = chr_circ_site_seen
+                .entry(chr.clone())
+                .or_insert_with(HashSet::new);
+            if seen.insert(site_infor.clone()) {
+                chr_circ_site_insertion
+                    .entry(chr)
+                    .or_insert_with(Vec::new)
+                    .push(site_infor);
+            }
+        }
+
+        let mut order_counter: usize = 0;
+        for (chr, sites) in chr_circ_site_insertion {
+            let mut list1 = Vec::new();
+            let mut list2 = Vec::new();
+            let mut set1 = HashSet::new();
+            let mut set2 = HashSet::new();
+            for site in sites {
+                let data: Vec<String> = site.split('\t').map(|s| s.to_string()).collect();
+                if data.len() != 6 {
+                    continue;
+                }
+                let site1 = data[0].parse::<i32>().unwrap_or(0);
+                let site2 = data[1].parse::<i32>().unwrap_or(0);
+                let num1 = site1 / self.seq_len.max(1);
+                let num2 = site2 / self.seq_len.max(1);
+                set1.insert(num1);
+                set2.insert(num2);
+                list1.push(CandidateBreakpoint {
+                    site: site1,
+                    order: order_counter,
+                    data: data.clone(),
+                });
+                list2.push(CandidateBreakpoint {
+                    site: site2,
+                    order: order_counter,
+                    data,
+                });
+                order_counter += 1;
+            }
+            list1.sort_by_key(|c| (c.site, c.order));
+            list2.sort_by_key(|c| (c.site, c.order));
+            self.index1.insert(chr.clone(), list1);
+            self.index2.insert(chr.clone(), list2);
+            self.site_array1.insert(chr.clone(), set1);
+            self.site_array2.insert(chr, set2);
+        }
+        Ok(claims)
     }
 
     /// Collects FSJ keys overlapped by a linear alignment span.
@@ -481,29 +565,49 @@ impl Scan2 {
     pub fn run(
         &mut self,
         sam_file: &str,
-        input_bsj1: &str,
-        output_bsj: &str,
         output_bsj2: &str,
         output_fsj: &str,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
+        self.run_with_display(sam_file, output_bsj2, output_fsj, None, None, chr_tcga_map)
+    }
+
+    /// Runs Scan2 and optionally emits mate-level `priority=0` rescue rows into
+    /// the same `.bsj2` stream during the scan.
+    pub fn run_with_display(
+        &mut self,
+        sam_file: &str,
+        output_bsj2: &str,
+        output_fsj: &str,
+        scan1_display_path: Option<&str>,
+        display_output_path: Option<&str>,
+        chr_tcga_map: &HashMap<String, String>,
+    ) -> Result<()> {
         use crate::sam_bam::{detect_format, InputFormat};
+        let display_scan2 = if let Some(scan1_path) = scan1_display_path {
+            let mut helper =
+                Scan2::new(self.min_mapq_uni, self.linear_range_size_min, self.seq_len);
+            let claims = helper.build_display_index(scan1_path)?;
+            Some((helper, claims))
+        } else {
+            None
+        };
         let format = detect_format(sam_file)?;
         match format {
-            InputFormat::Sam => self.run_sam(
+            InputFormat::Sam => self.run_sam_with_display(
                 sam_file,
-                input_bsj1,
-                output_bsj,
                 output_bsj2,
                 output_fsj,
+                display_output_path,
+                display_scan2.as_ref(),
                 chr_tcga_map,
             ),
-            InputFormat::Bam => self.run_bam(
+            InputFormat::Bam => self.run_bam_with_display(
                 sam_file,
-                input_bsj1,
-                output_bsj,
                 output_bsj2,
                 output_fsj,
+                display_output_path,
+                display_scan2.as_ref(),
                 chr_tcga_map,
             ),
         }
@@ -511,15 +615,26 @@ impl Scan2 {
 
     /// Runs Scan2 on SAM input.
     ///
-    /// The SAM path is sharded by byte range, but each shard still goes through
-    /// the same `process_group_view` logic as BAM so rescue behavior stays unified.
+    /// The SAM path preserves queryname groups before batch-parallel processing,
+    /// matching the BAM path's read-group semantics while avoiding shard-boundary
+    /// FSJ duplication.
     pub fn run_sam(
         &mut self,
         sam_file: &str,
-        input_bsj1: &str,
-        output_bsj: &str,
         output_bsj2: &str,
         output_fsj: &str,
+        chr_tcga_map: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.run_sam_with_display(sam_file, output_bsj2, output_fsj, None, None, chr_tcga_map)
+    }
+
+    fn run_sam_with_display(
+        &mut self,
+        sam_file: &str,
+        output_bsj2: &str,
+        output_fsj: &str,
+        display_output_path: Option<&str>,
+        display_scan2: Option<&(Scan2, HashSet<String>)>,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
         let run_started = Instant::now();
@@ -529,50 +644,29 @@ impl Scan2 {
             None
         };
         let profile_ref = profile.as_ref();
-        let file = File::open(sam_file)?;
-        let mmap = unsafe { Mmap::map(&file)? };
-        let file_size = mmap.len();
-        let num_threads = rayon::current_num_threads().max(1);
-        let shard_size = file_size / num_threads;
-
-        unsafe {
-            libc::madvise(
-                mmap.as_ptr() as *mut libc::c_void,
-                file_size,
-                libc::MADV_SEQUENTIAL,
-            );
-        }
+        let file_size = std::fs::metadata(sam_file)?.len();
 
         let pb = ProgressBar::new(file_size as u64);
         pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {percent:>3}% ({eta}) {msg}")?.progress_chars("#>-"));
         pb.set_message("");
-
-        (0..num_threads).into_par_iter().try_for_each(|i| {
-            let start = i * shard_size;
-            let end = if i == num_threads - 1 {
-                file_size
-            } else {
-                (i + 1) * shard_size
-            };
-            let shard_out = part_path(output_bsj2, i);
-            let fsj_out = Self::shard_fsj_path(output_fsj, i);
-            self.process_sam_shard_to_file(
-                &mmap,
-                start,
-                end,
-                chr_tcga_map,
-                &pb,
-                &shard_out,
-                &fsj_out,
-                profile_ref,
-            )
-        })?;
+        let shard_out = part_path(output_bsj2, 0);
+        let display_shard_out = display_output_path.map(|path| part_path(path, 0));
+        let fsj_out = Self::shard_fsj_path(output_fsj, 0);
+        self.process_sam_file_to_file(
+            sam_file,
+            chr_tcga_map,
+            &pb,
+            &shard_out,
+            &fsj_out,
+            display_scan2,
+            display_shard_out.as_deref(),
+            profile_ref,
+        )?;
 
         pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")?.progress_chars("#>-"));
         pb.finish_with_message("Completed");
         let merge_started = Instant::now();
-        let result =
-            self.merge_shards_and_fsj(input_bsj1, output_bsj, output_bsj2, output_fsj, num_threads);
+        let result = self.merge_shards_and_fsj(output_bsj2, output_fsj, 1);
         if let Some(profile) = profile_ref {
             profile
                 .merge_ns
@@ -583,39 +677,25 @@ impl Scan2 {
             profile.report();
             report_scan2_hg_profile();
         }
+        if let Some(path) = display_output_path {
+            self.merge_display_shards(path, 1)?;
+        }
         result
     }
 
-    /// Concatenates Scan1 and Scan2 BSJ outputs and merges per-shard FSJ spill files.
-    ///
-    /// The final `<prefix>.bsj` keeps one extra trailing column describing where
-    /// each line came from (`scan1` or `scan2`). Summary ignores the extra field
-    /// because all behaviorally relevant columns stay in their original positions.
+    /// Merges per-shard Scan2 BSJ2 outputs and FSJ spill files.
     ///
     /// `rescued_reads` and `final_bsj_reads` are stage-level accounting only.
     /// The user-facing "final BSJ reads" summary is recomputed later from the
     /// clustered `.out`, because Summary can still merge circ families without
-    /// changing the raw `.bsj` membership.
+    /// changing the raw `.bsj1/.bsj2` membership.
     fn merge_shards_and_fsj(
         &mut self,
-        input_bsj1: &str,
-        output_bsj: &str,
         output_bsj2: &str,
         output_fsj: &str,
         num_threads: usize,
     ) -> Result<()> {
-        let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(output_bsj)?);
-        if let Ok(bsj1_file) = File::open(input_bsj1) {
-            let mut bsj1_reader = BufReader::new(bsj1_file);
-            let mut line = String::new();
-            while bsj1_reader.read_line(&mut line)? != 0 {
-                let trimmed = line.trim_end();
-                if !trimmed.is_empty() {
-                    writeln!(writer, "{}\tscan1", trimmed)?;
-                }
-                line.clear();
-            }
-        }
+        let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(output_bsj2)?);
         let mut rescued_ids = HashSet::new();
         for i in 0..num_threads {
             let shard_path = part_path(output_bsj2, i);
@@ -625,10 +705,11 @@ impl Scan2 {
                 while shard_reader.read_line(&mut line)? != 0 {
                     let trimmed = line.trim_end();
                     if !trimmed.is_empty() {
-                        if let Some(tab_idx) = trimmed.find('\t') {
-                            rescued_ids.insert(trimmed[..tab_idx].to_string());
+                        let parts: Vec<&str> = trimmed.split('\t').collect();
+                        if !parts.is_empty() && bsj_is_summary_priority(&parts) {
+                            rescued_ids.insert(parts[0].to_string());
                         }
-                        writeln!(writer, "{}\tscan2", trimmed)?;
+                        writeln!(writer, "{}", trimmed)?;
                     }
                     line.clear();
                 }
@@ -660,7 +741,6 @@ impl Scan2 {
         writer.flush()?;
         self.rescued_reads = rescued_ids.len();
         self.final_bsj_reads = self.scan1_ids.len() + self.rescued_reads;
-        let _ = std::fs::remove_file(input_bsj1);
         Ok(())
     }
 
@@ -668,10 +748,20 @@ impl Scan2 {
     pub fn run_bam(
         &mut self,
         bam_file: &str,
-        input_bsj1: &str,
-        output_bsj: &str,
         output_bsj2: &str,
         output_fsj: &str,
+        chr_tcga_map: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.run_bam_with_display(bam_file, output_bsj2, output_fsj, None, None, chr_tcga_map)
+    }
+
+    fn run_bam_with_display(
+        &mut self,
+        bam_file: &str,
+        output_bsj2: &str,
+        output_fsj: &str,
+        display_output_path: Option<&str>,
+        display_scan2: Option<&(Scan2, HashSet<String>)>,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
         use noodles::bam;
@@ -716,6 +806,7 @@ impl Scan2 {
                 (i + 1) * shard_size
             };
             let shard_out = part_path(output_bsj2, i);
+            let display_shard_out = display_output_path.map(|path| part_path(path, i));
             let fsj_out = Self::shard_fsj_path(output_fsj, i);
             self.process_bam_shard_to_file(
                 &mmap,
@@ -726,6 +817,8 @@ impl Scan2 {
                 &pb,
                 &shard_out,
                 &fsj_out,
+                display_scan2,
+                display_shard_out.as_deref(),
                 profile_ref,
             )
         })?;
@@ -738,8 +831,7 @@ impl Scan2 {
         );
         pb.finish_with_message("Completed");
         let merge_started = Instant::now();
-        let result =
-            self.merge_shards_and_fsj(input_bsj1, output_bsj, output_bsj2, output_fsj, num_threads);
+        let result = self.merge_shards_and_fsj(output_bsj2, output_fsj, num_threads);
         if let Some(profile) = profile_ref {
             profile
                 .merge_ns
@@ -750,7 +842,345 @@ impl Scan2 {
             profile.report();
             report_scan2_hg_profile();
         }
+        if let Some(path) = display_output_path {
+            self.merge_display_shards(path, num_threads)?;
+        }
         result
+    }
+
+    /// Merges display shard files in shard order into one final temporary file.
+    fn merge_display_shards(&self, output_path: &str, num_threads: usize) -> Result<()> {
+        let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(output_path)?);
+        for i in 0..num_threads {
+            let shard_path = part_path(output_path, i);
+            if let Ok(shard_file) = File::open(&shard_path) {
+                let mut reader = BufReader::new(shard_file);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line)? == 0 {
+                        break;
+                    }
+                    writer.write_all(line.as_bytes())?;
+                }
+            }
+            let _ = std::fs::remove_file(&shard_path);
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Builds a `(read_id, mate_label, legacy_payload)` key from a priority row.
+    ///
+    /// The key lets the expanded Scan2 writer avoid emitting the same mate-level
+    /// rescue twice when the display path rediscovers the Java first-hit row.
+    fn scan2_priority_key(line: &str) -> Option<String> {
+        let mut parts = line.splitn(4, '\t');
+        let read_id = parts.next()?;
+        let mate_label = parts.next()?;
+        let _priority = parts.next()?;
+        let payload = parts.next()?;
+        Some(format!("{read_id}\t{mate_label}\t{payload}"))
+    }
+
+    /// Adds a `priority` field to a display row of the form
+    /// `read_id, mate_label, legacy_payload...`.
+    fn scan2_display_key_and_priority_line(line: &str, priority: &str) -> Option<(String, String)> {
+        let mut parts = line.splitn(3, '\t');
+        let read_id = parts.next()?;
+        let mate_label = parts.next()?;
+        let payload = parts.next()?;
+        Some((
+            format!("{read_id}\t{mate_label}\t{payload}"),
+            format!("{read_id}\t{mate_label}\t{priority}\t{payload}"),
+        ))
+    }
+
+    /// Streams a SAM file into one shard output while batching grouped reads for
+    /// parallel Scan2 rescue evaluation.
+    fn process_sam_file_to_file(
+        &self,
+        sam_file: &str,
+        chr_tcga_map: &HashMap<String, String>,
+        pb: &ProgressBar,
+        out_path: &str,
+        fsj_path: &str,
+        display_scan2: Option<&(Scan2, HashSet<String>)>,
+        display_out_path: Option<&str>,
+        profile: Option<&Scan2Profile>,
+    ) -> Result<()> {
+        let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
+        let mut display_writer = if let Some(path) = display_out_path {
+            Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
+        } else {
+            None
+        };
+        let batch_size = (rayon::current_num_threads().max(1) * 256).max(1024);
+        let (tx, rx) =
+            mpsc::sync_channel::<Vec<SamOwnedScan2Group>>(rayon::current_num_threads().max(2));
+        let pb_clone = pb.clone();
+
+        let local_fsj = thread::scope(|scope| -> Result<HashMap<String, i32>> {
+            let producer = scope.spawn(|| {
+                self.stream_sam_group_batches_for_scan2(
+                    sam_file, &pb_clone, tx, batch_size, profile,
+                )
+            });
+            let mut merged_fsj = HashMap::new();
+            for mut batch in rx {
+                self.process_sam_group_batch_for_scan2(
+                    &mut writer,
+                    display_writer.as_mut(),
+                    &mut batch,
+                    &mut merged_fsj,
+                    chr_tcga_map,
+                    display_scan2,
+                    profile,
+                )?;
+            }
+            producer
+                .join()
+                .map_err(|_| anyhow::anyhow!("SAM Scan2 group producer thread panicked"))??;
+            Ok(merged_fsj)
+        })?;
+
+        writer.flush()?;
+        if let Some(writer) = display_writer.as_mut() {
+            writer.flush()?;
+        }
+        Self::write_fsj_shard(fsj_path, &local_fsj)
+    }
+
+    /// Sequentially parses SAM records into grouped Scan2 inputs.
+    fn stream_sam_group_batches_for_scan2(
+        &self,
+        sam_file: &str,
+        pb: &ProgressBar,
+        tx: mpsc::SyncSender<Vec<SamOwnedScan2Group>>,
+        batch_size: usize,
+        profile: Option<&Scan2Profile>,
+    ) -> Result<()> {
+        let sam_reader = BufReader::with_capacity(1024 * 1024, File::open(sam_file)?);
+        let mut reader = sam::io::Reader::new(sam_reader);
+        let header = reader.read_header()?;
+        let mut record = sam::Record::default();
+        let mut current_id: Vec<u8> = Vec::new();
+        let mut alignments: Vec<OwnedAlignmentRecord> = Vec::with_capacity(16);
+        let mut stand_map: OwnedStandMap = HashMap::with_capacity(4);
+        let mut one_read_key: i32 = -1;
+        let mut batch = Vec::with_capacity(batch_size);
+        let mut records_since_progress = 0usize;
+        let mut last_progress_pos = reader.get_mut().stream_position()?;
+        let mut cigar_buf = String::with_capacity(64);
+        let mut seq_buf = String::with_capacity(256);
+
+        while reader.read_record(&mut record)? != 0 {
+            let read_id = record
+                .name()
+                .ok_or_else(|| anyhow::anyhow!("Missing read name"))?;
+            if let Some(profile) = profile {
+                profile.records.fetch_add(1, Ordering::Relaxed);
+            }
+            if read_id.to_vec() != current_id {
+                if !current_id.is_empty() {
+                    self.push_sam_owned_group_for_scan2(
+                        &mut batch,
+                        &current_id,
+                        &mut alignments,
+                        &mut stand_map,
+                    );
+                    if batch.len() >= batch_size {
+                        tx.send(std::mem::take(&mut batch))
+                            .map_err(|_| anyhow::anyhow!("SAM Scan2 consumer dropped"))?;
+                        batch = Vec::with_capacity(batch_size);
+                    }
+                }
+                current_id = read_id.to_vec();
+                one_read_key = -1;
+            }
+
+            let flag = i32::from(u16::from(record.flags()?));
+            let chrom = match record.reference_sequence(&header) {
+                Some(Ok((name, _))) => String::from_utf8_lossy(name).to_string(),
+                _ => "*".to_string(),
+            };
+            let start_pos = record
+                .alignment_start()
+                .transpose()?
+                .map(|p| p.get() as i32)
+                .unwrap_or(0);
+            let mapq = record
+                .mapping_quality()
+                .transpose()?
+                .map(u8::from)
+                .unwrap_or(0) as i32;
+            cigar_buf.clear();
+            for result in record.cigar().iter() {
+                let op = result?;
+                use noodles::sam::alignment::record::cigar::op::Kind;
+                let op_char = match op.kind() {
+                    Kind::Match => 'M',
+                    Kind::Insertion => 'I',
+                    Kind::Deletion => 'D',
+                    Kind::Skip => 'N',
+                    Kind::SoftClip => 'S',
+                    Kind::HardClip => 'H',
+                    Kind::Pad => 'P',
+                    Kind::SequenceMatch => '=',
+                    Kind::SequenceMismatch => 'X',
+                };
+                let _ = write!(&mut cigar_buf, "{}{}", op.len(), op_char);
+            }
+            seq_buf.clear();
+            for b in record.sequence().iter() {
+                seq_buf.push(char::from(b));
+            }
+            let seq = seq_buf.clone();
+            let s_idx = if flag & 0x40 != 0 { 1 } else { 0 };
+            let st_c = if flag & 0x10 != 0 { '1' } else { '0' };
+            if s_idx != one_read_key {
+                one_read_key = s_idx;
+                alignments.retain(|a| {
+                    let idx = if a.flag & 0x40 != 0 { 1 } else { 0 };
+                    idx != s_idx
+                });
+                if !seq.is_empty() && seq != "*" {
+                    stand_map.insert(s_idx, (st_c, Cow::Owned(seq.clone())));
+                }
+            }
+            alignments.push(AlignmentRecord {
+                flag,
+                chrom: Cow::Owned(chrom),
+                pos: start_pos,
+                mapq,
+                cigar: Cow::Owned(cigar_buf.clone()),
+                seq: Cow::Owned(seq),
+            });
+
+            records_since_progress += 1;
+            if records_since_progress >= 4096 {
+                let pos = reader.get_mut().stream_position()?;
+                if pos > last_progress_pos {
+                    pb.inc(pos - last_progress_pos);
+                    last_progress_pos = pos;
+                }
+                records_since_progress = 0;
+            }
+        }
+
+        if !current_id.is_empty() {
+            self.push_sam_owned_group_for_scan2(
+                &mut batch,
+                &current_id,
+                &mut alignments,
+                &mut stand_map,
+            );
+        }
+        if !batch.is_empty() {
+            tx.send(batch)
+                .map_err(|_| anyhow::anyhow!("SAM Scan2 consumer dropped"))?;
+        }
+
+        let final_pos = reader.get_mut().stream_position()?;
+        if final_pos > last_progress_pos {
+            pb.inc(final_pos - last_progress_pos);
+        }
+        Ok(())
+    }
+
+    /// Moves the currently accumulated SAM Scan2 group into the worker batch.
+    fn push_sam_owned_group_for_scan2(
+        &self,
+        batch: &mut Vec<SamOwnedScan2Group>,
+        current_id: &[u8],
+        alignments: &mut Vec<OwnedAlignmentRecord>,
+        stand_map: &mut OwnedStandMap,
+    ) {
+        batch.push(SamOwnedScan2Group {
+            read_id: String::from_utf8_lossy(current_id).into_owned(),
+            alignments: std::mem::take(alignments),
+            stand_map: std::mem::take(stand_map),
+        });
+        *alignments = Vec::with_capacity(16);
+        *stand_map = HashMap::with_capacity(4);
+    }
+
+    /// Evaluates one batch of grouped SAM reads in parallel and writes Scan2 output.
+    fn process_sam_group_batch_for_scan2(
+        &self,
+        writer: &mut BufWriter<File>,
+        mut display_writer: Option<&mut BufWriter<File>>,
+        batch: &mut Vec<SamOwnedScan2Group>,
+        merged_fsj: &mut HashMap<String, i32>,
+        chr_tcga_map: &HashMap<String, String>,
+        display_scan2: Option<&(Scan2, HashSet<String>)>,
+        profile: Option<&Scan2Profile>,
+    ) -> Result<()> {
+        let groups = std::mem::take(batch);
+        let results: Vec<(Vec<String>, HashMap<String, i32>, Vec<String>)> = groups
+            .into_par_iter()
+            .map(|owned| {
+                let mut local_lines = Vec::new();
+                let mut local_fsj = HashMap::new();
+                let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
+                let _ = self.process_group_view(
+                    &owned.read_id,
+                    &owned.alignments,
+                    &owned.stand_map,
+                    &mut local_lines,
+                    &mut local_fsj,
+                    chr_tcga_map,
+                    &mut validator,
+                    profile,
+                );
+                let display_lines = if let Some((display_helper, scan1_claims)) = display_scan2 {
+                    let mut display_validator =
+                        IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
+                    display_helper
+                        .process_group_view_display(
+                            &owned.read_id,
+                            &owned.alignments,
+                            &owned.stand_map,
+                            scan1_claims,
+                            chr_tcga_map,
+                            &mut display_validator,
+                        )
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                (local_lines, local_fsj, display_lines)
+            })
+            .collect();
+
+        for (lines, fsj_map, display_lines) in results {
+            let main_keys: HashSet<String> = lines
+                .iter()
+                .filter_map(|line| Self::scan2_priority_key(line))
+                .collect();
+            for line in lines {
+                writeln!(writer, "{}", line)?;
+            }
+            if let Some(display_writer) = display_writer.as_deref_mut() {
+                for line in display_lines {
+                    writeln!(display_writer, "{}", line)?;
+                }
+            } else {
+                for line in display_lines {
+                    if let Some((key, priority_line)) =
+                        Self::scan2_display_key_and_priority_line(&line, "0")
+                    {
+                        if !main_keys.contains(&key) {
+                            writeln!(writer, "{}", priority_line)?;
+                        }
+                    }
+                }
+            }
+            for (key, count) in fsj_map {
+                *merged_fsj.entry(key).or_insert(0) += count;
+            }
+        }
+        Ok(())
     }
 
     /// Processes one BAM shard and emits rescued BSJ2 lines plus one local FSJ spill file.
@@ -768,13 +1198,23 @@ impl Scan2 {
         pb: &ProgressBar,
         out_path: &str,
         fsj_path: &str,
+        display_scan2: Option<&(Scan2, HashSet<String>)>,
+        display_out_path: Option<&str>,
         profile: Option<&Scan2Profile>,
     ) -> Result<()> {
         use noodles::bam;
         let shard_started = profile.map(|_| Instant::now());
         let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
+        let mut display_writer = if let Some(path) = display_out_path {
+            Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
+        } else {
+            None
+        };
         let mut local_fsj = HashMap::new();
         let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
+        let mut display_validator = display_scan2
+            .as_ref()
+            .map(|_| IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni));
         let block_start = if start == 0 {
             0
         } else {
@@ -887,8 +1327,39 @@ impl Scan2 {
                         &mut validator,
                         profile,
                     )?;
+                    let main_keys: HashSet<String> = res_batch
+                        .iter()
+                        .filter_map(|line| Self::scan2_priority_key(line))
+                        .collect();
                     for line in &res_batch {
                         writeln!(writer, "{}", line)?;
+                    }
+                    if let (Some((display_helper, scan1_claims)), Some(display_validator)) =
+                        (display_scan2, display_validator.as_mut())
+                    {
+                        let display_lines = display_helper.process_group_view_display(
+                            &id_str,
+                            &alignments,
+                            &stand_map,
+                            scan1_claims,
+                            chr_tcga_map,
+                            display_validator,
+                        )?;
+                        if let Some(display_writer) = display_writer.as_mut() {
+                            for line in &display_lines {
+                                writeln!(display_writer, "{}", line)?;
+                            }
+                        } else {
+                            for line in &display_lines {
+                                if let Some((key, priority_line)) =
+                                    Self::scan2_display_key_and_priority_line(line, "0")
+                                {
+                                    if !main_keys.contains(&key) {
+                                        writeln!(writer, "{}", priority_line)?;
+                                    }
+                                }
+                            }
+                        }
                     }
                     if let (Some(profile), Some(write_started)) = (profile, write_started) {
                         profile.write_ns.fetch_add(
@@ -989,8 +1460,39 @@ impl Scan2 {
                 &mut validator,
                 profile,
             )?;
+            let main_keys: HashSet<String> = res_batch
+                .iter()
+                .filter_map(|line| Self::scan2_priority_key(line))
+                .collect();
             for line in &res_batch {
                 writeln!(writer, "{}", line)?;
+            }
+            if let (Some((display_helper, scan1_claims)), Some(display_validator)) =
+                (display_scan2, display_validator.as_mut())
+            {
+                let display_lines = display_helper.process_group_view_display(
+                    &id_str,
+                    &alignments,
+                    &stand_map,
+                    scan1_claims,
+                    chr_tcga_map,
+                    display_validator,
+                )?;
+                if let Some(display_writer) = display_writer.as_mut() {
+                    for line in &display_lines {
+                        writeln!(display_writer, "{}", line)?;
+                    }
+                } else {
+                    for line in &display_lines {
+                        if let Some((key, priority_line)) =
+                            Self::scan2_display_key_and_priority_line(line, "0")
+                        {
+                            if !main_keys.contains(&key) {
+                                writeln!(writer, "{}", priority_line)?;
+                            }
+                        }
+                    }
+                }
             }
             if let (Some(profile), Some(write_started)) = (profile, write_started) {
                 profile
@@ -1003,148 +1505,9 @@ impl Scan2 {
             advise_dontneed(mmap, last_evicted_pos, last_compressed_pos - evicted_rel);
         }
         writer.flush()?;
-        if let (Some(profile), Some(shard_started)) = (profile, shard_started) {
-            profile
-                .shard_total_ns
-                .fetch_add(shard_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Some(display_writer) = display_writer.as_mut() {
+            display_writer.flush()?;
         }
-        Self::write_fsj_shard(fsj_path, &local_fsj)
-    }
-
-    /// Processes one SAM shard into BSJ2 lines plus one local FSJ spill file.
-    ///
-    /// This path stays text-based for SAM, but reuses the exact same read-group
-    /// rescue logic as BAM after records have been assembled.
-    fn process_sam_shard_to_file<'a>(
-        &self,
-        mmap: &'a Mmap,
-        start: usize,
-        end: usize,
-        chr_tcga_map: &HashMap<String, String>,
-        pb: &ProgressBar,
-        out_path: &str,
-        fsj_path: &str,
-        profile: Option<&Scan2Profile>,
-    ) -> Result<()> {
-        let shard_started = profile.map(|_| Instant::now());
-        let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
-        let mut local_fsj = HashMap::new();
-        let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
-        let mut pos = if start == 0 {
-            0
-        } else {
-            memchr(b'\n', &mmap[start..])
-                .map(|p| start + p + 1)
-                .unwrap_or(mmap.len())
-        };
-        if pos >= mmap.len() {
-            return Self::write_fsj_shard(fsj_path, &local_fsj);
-        }
-
-        let mut current_id: &[u8] = &[];
-        let mut alignments: Vec<AlignmentRecord<'a>> = Vec::with_capacity(16);
-        let mut stand_map: HashMap<i32, (char, Cow<'a, str>)> = HashMap::with_capacity(4);
-        let mut one_read_key: i32 = -1;
-        let mut last_evicted_pos = pos;
-        let eviction_threshold =
-            (self.mem_limit as usize / 8).clamp(8 * 1024 * 1024, 64 * 1024 * 1024);
-        let mut res_batch = Vec::new();
-
-        while pos < mmap.len() {
-            let line_end = memchr(b'\n', &mmap[pos..])
-                .map(|p| pos + p)
-                .unwrap_or(mmap.len());
-            let line = &mmap[pos..line_end];
-            if line.is_empty() {
-                pb.inc(1);
-                pos = line_end + 1;
-                continue;
-            }
-            if pos - last_evicted_pos > eviction_threshold {
-                advise_dontneed(mmap, last_evicted_pos, pos - last_evicted_pos);
-                last_evicted_pos = pos;
-            }
-            if line[0] == b'@' {
-                pb.inc((line_end - pos + 1) as u64);
-                pos = line_end + 1;
-                continue;
-            }
-
-            let mut cols = line.split(|&b| b == b'\t');
-            let read_id = cols.next().unwrap();
-            if let Some(profile) = profile {
-                profile.records.fetch_add(1, Ordering::Relaxed);
-            }
-            if read_id != current_id {
-                if !current_id.is_empty() {
-                    res_batch.clear();
-                    let write_started = profile.map(|_| Instant::now());
-                    self.process_group_view(
-                        unsafe { std::str::from_utf8_unchecked(current_id) },
-                        &alignments,
-                        &stand_map,
-                        &mut res_batch,
-                        &mut local_fsj,
-                        chr_tcga_map,
-                        &mut validator,
-                        profile,
-                    )?;
-                    for l in &res_batch {
-                        writeln!(writer, "{}", l)?;
-                    }
-                    if let (Some(profile), Some(write_started)) = (profile, write_started) {
-                        profile.write_ns.fetch_add(
-                            write_started.elapsed().as_nanos() as u64,
-                            Ordering::Relaxed,
-                        );
-                    }
-                }
-                if pos >= end {
-                    break;
-                }
-                current_id = read_id;
-                alignments.clear();
-                stand_map.clear();
-                one_read_key = -1;
-            }
-            let flag = fast_parse_i32(cols.next().unwrap_or(b"0"));
-            let chrom = unsafe { std::str::from_utf8_unchecked(cols.next().unwrap_or(b"*")) };
-            let start_pos = fast_parse_i32(cols.next().unwrap_or(b"0"));
-            let mapq = fast_parse_i32(cols.next().unwrap_or(b"0"));
-            let cigar = unsafe { std::str::from_utf8_unchecked(cols.next().unwrap_or(b"*")) };
-            cols.next();
-            cols.next();
-            cols.next();
-            let seq = unsafe { std::str::from_utf8_unchecked(cols.next().unwrap_or(b"*")).trim() };
-            let s_idx = if flag & 0x40 != 0 { 1 } else { 0 };
-            let st_c = if flag & 0x10 != 0 { '1' } else { '0' };
-            if s_idx != one_read_key {
-                one_read_key = s_idx;
-                alignments.retain(|a| {
-                    let idx = if a.flag & 0x40 != 0 { 1 } else { 0 };
-                    idx != s_idx
-                });
-                // SAM keeps the same overwrite semantics as BAM so both formats
-                // feed identical Scan2 mate context into `is_bsj_hg2`.
-                if !seq.is_empty() && seq != "*" {
-                    stand_map.insert(s_idx, (st_c, Cow::Borrowed(seq)));
-                }
-            }
-            alignments.push(AlignmentRecord {
-                flag,
-                chrom: Cow::Borrowed(chrom),
-                pos: start_pos,
-                mapq,
-                cigar: Cow::Borrowed(cigar),
-                seq: Cow::Borrowed(seq),
-            });
-            pb.inc((line_end - pos + 1) as u64);
-            pos = line_end + 1;
-        }
-        if pos > last_evicted_pos {
-            advise_dontneed(mmap, last_evicted_pos, pos - last_evicted_pos);
-        }
-        writer.flush()?;
         if let (Some(profile), Some(shard_started)) = (profile, shard_started) {
             profile
                 .shard_total_ns
@@ -1355,9 +1718,11 @@ impl Scan2 {
                                     profile.candidate_hits.fetch_add(1, Ordering::Relaxed);
                                 }
                                 let tag_body = &tag[0..tag.len() - 1];
+                                let mate_label = if seg_idx == 1 { "R1" } else { "R2" };
                                 results.push(format!(
-                                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                                    "{}\t{}\t1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                                     id,
+                                    mate_label,
                                     cigar_ref.as_ref(),
                                     tag_body,
                                     chr,
@@ -1537,9 +1902,11 @@ impl Scan2 {
                                     profile.candidate_hits.fetch_add(1, Ordering::Relaxed);
                                 }
                                 let tag_body = &tag[0..tag.len() - 1];
+                                let mate_label = if seg_idx == 1 { "R1" } else { "R2" };
                                 results.push(format!(
-                                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                                    "{}\t{}\t1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                                     id,
+                                    mate_label,
                                     cigar_ref.as_ref(),
                                     tag_body,
                                     chr,
@@ -1608,5 +1975,375 @@ impl Scan2 {
             profile.groups.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// Enumerates mate-level Scan2 rescue hits for the post-Summary `.bsj`.
+    ///
+    /// This helper keeps the expanded mate view out of the parity path. It uses
+    /// the display-only claim set from Scan1 and returns at most one first-hit
+    /// rescue per mate.
+    fn process_group_view_display<'a>(
+        &self,
+        id: &str,
+        alignments: &[AlignmentRecord<'a>],
+        stand_map: &HashMap<i32, (char, Cow<'a, str>)>,
+        scan1_claims: &HashSet<String>,
+        chr_tcga_map: &HashMap<String, String>,
+        is_bsj_hg2: &mut IsBSJHg2,
+    ) -> Result<Vec<String>> {
+        let trace_read = should_trace_read(id);
+        let trace_all_candidates =
+            trace_read && std::env::var("CIRI_TRACE_ALL_CANDS").ok().as_deref() == Some("1");
+        let mut results = Vec::new();
+        let mut segments: HashMap<i32, Vec<&AlignmentRecord<'a>>> = HashMap::new();
+        for aln in alignments {
+            segments
+                .entry(if aln.flag & 0x40 != 0 { 1 } else { 0 })
+                .or_insert_with(Vec::new)
+                .push(aln);
+        }
+
+        'mate: for seg_idx in [1_i32, 0_i32] {
+            let mate_label = if seg_idx == 1 { "R1" } else { "R2" };
+            if scan1_claims.contains(&format!("{id}\t{mate_label}")) {
+                continue;
+            }
+            let Some(seg_alns) = segments.get(&seg_idx) else {
+                continue;
+            };
+            let (read_strand, seq) = match stand_map.get(&seg_idx) {
+                Some(&(st, ref s)) => (st, s.as_ref()),
+                None => continue,
+            };
+            let slen = seq.len() as i32;
+            let mate_seg_alns = segments.get(&(1 - seg_idx));
+            for aln in seg_alns {
+                let chr = aln.chrom.as_ref();
+                if !self.index1.contains_key(chr) {
+                    continue;
+                }
+                let cigar_ref: Cow<'_, str> = if aln.cigar.contains('H') {
+                    Cow::Owned(aln.cigar.replace('H', "S"))
+                } else {
+                    Cow::Borrowed(aln.cigar.as_ref())
+                };
+                if cigar_ref == "*" {
+                    continue;
+                }
+                let c = misd(cigar_ref.as_ref(), slen);
+                if c[0] == -1 || c[0] == 10 {
+                    if let Some(list) = self.index1.get(chr) {
+                        let curr_strand = if aln.flag & 0x10 != 0 { '1' } else { '0' };
+                        let str_e_owned = if aln.flag & 0x10 != 0 {
+                            if read_strand == '0' {
+                                reverse_complement(seq)
+                            } else {
+                                seq.to_string()
+                            }
+                        } else if read_strand == '0' {
+                            seq.to_string()
+                        } else {
+                            reverse_complement(seq)
+                        };
+                        let p_str_owned =
+                            if let Some(&(p_strand, ref p_seq)) = stand_map.get(&(1 - seg_idx)) {
+                                if p_strand != curr_strand {
+                                    p_seq.to_string()
+                                } else {
+                                    reverse_complement(p_seq)
+                                }
+                            } else {
+                                String::new()
+                            };
+                        let new_num_site = aln.pos;
+                        let bucket_size = self.seq_len.max(1);
+                        let num1 = (new_num_site - 6) / bucket_size;
+                        let num2 = (new_num_site + 6) / bucket_size;
+
+                        let mut eval_candidate = |cand: &CandidateBreakpoint| -> Result<bool> {
+                            let e_idx = c[1] + (cand.site - new_num_site);
+                            if e_idx <= 0 || e_idx > slen {
+                                return Ok(false);
+                            }
+                            let str_f = &str_e_owned[0..e_idx as usize];
+                            let str3 = if c[0] == 10 {
+                                let si = slen - c[2];
+                                if si >= 0 && si <= slen {
+                                    &str_e_owned[si as usize..]
+                                } else {
+                                    ""
+                                }
+                            } else {
+                                "*"
+                            };
+                            let site1 = cand.data[0].parse::<i32>().unwrap_or(0);
+                            let site2 = cand.data[1].parse::<i32>().unwrap_or(0);
+                            let mut s2_ok = if mate_seg_alns.is_some() { 0 } else { 1 };
+                            if let Some(mate_seg_alns) = mate_seg_alns {
+                                for mate_aln in mate_seg_alns {
+                                    if mate_aln.chrom.as_ref() == chr
+                                        && mate_aln.mapq >= self.min_mapq_uni
+                                    {
+                                        let c_ano = misd(&mate_aln.cigar, slen);
+                                        let mate_strand =
+                                            if mate_aln.flag & 0x10 != 0 { '1' } else { '0' };
+                                        if mate_strand != curr_strand
+                                            && mate_aln.pos >= site1 - 6
+                                            && mate_aln.pos + c_ano[3] - 1 <= site2 + 6
+                                        {
+                                            s2_ok = 1;
+                                        } else {
+                                            s2_ok = -1;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            let circ_c = vec![
+                                (if aln.flag & 0x10 != 0 { "1" } else { "0" }).to_string(),
+                                chr.to_string(),
+                                "sm".to_string(),
+                                cand.data[0].clone(),
+                                cand.data[1].clone(),
+                                str_f.to_string(),
+                                p_str_owned.clone(),
+                                str3.to_string(),
+                                s2_ok.to_string(),
+                                cand.data[2].clone(),
+                                cand.data[3].clone(),
+                                cand.data[4].clone(),
+                                aln.mapq.to_string(),
+                            ];
+                            let tag = with_trace_hg2_scope(trace_read, || {
+                                is_bsj_hg2.is_bsj_hg2(&circ_c, chr_tcga_map.get(chr).unwrap())
+                            });
+                            if trace_read {
+                                emit_debug_line(&format!(
+                                    "[TRACE_SCAN2_DISPLAY] id={} type=sm seg={} aln_pos={} chr={} site1={} site2={} cand_site={} cigar={} mapq={} tag={}",
+                                    id,
+                                    seg_idx,
+                                    aln.pos,
+                                    chr,
+                                    cand.data[0],
+                                    cand.data[1],
+                                    cand.site,
+                                    cigar_ref.as_ref(),
+                                    aln.mapq,
+                                    tag
+                                ));
+                            }
+                            if tag != "0" && tag != "2" {
+                                let tag_body = &tag[0..tag.len() - 1];
+                                results.push(format!(
+                                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                                    id,
+                                    mate_label,
+                                    cigar_ref.as_ref(),
+                                    tag_body,
+                                    chr,
+                                    cand.data[0],
+                                    cand.data[1],
+                                    cand.data[2],
+                                    cand.data[3],
+                                    cand.data[4],
+                                    tag.chars().next_back().unwrap()
+                                ));
+                                Ok(true)
+                            } else {
+                                Ok(false)
+                            }
+                        };
+
+                        if num1 > 0 && self.site_array1.get(chr).is_some_and(|s| s.contains(&num1))
+                        {
+                            let (l1, r1) = Self::bucket_range(list, num1, bucket_size);
+                            for idx in (l1..r1).rev() {
+                                let cand = &list[idx];
+                                let bias = cand.site - new_num_site;
+                                if bias >= -6 {
+                                    if bias <= 6 && eval_candidate(cand)? && !trace_all_candidates {
+                                        continue 'mate;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        if num2 != num1
+                            && self.site_array1.get(chr).is_some_and(|s| s.contains(&num2))
+                        {
+                            let (l2, r2) = Self::bucket_range(list, num2, bucket_size);
+                            for idx in l2..r2 {
+                                let cand = &list[idx];
+                                let bias = cand.site - new_num_site;
+                                if bias <= 6 {
+                                    if eval_candidate(cand)? && !trace_all_candidates {
+                                        continue 'mate;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if c[0] == 1 || c[0] == 10 {
+                    let new_site = aln.pos + c[3] - 1;
+                    if let Some(list) = self.index2.get(chr) {
+                        let curr_strand = if aln.flag & 0x10 != 0 { '1' } else { '0' };
+                        let str_e_owned = if aln.flag & 0x10 != 0 {
+                            if read_strand == '0' {
+                                reverse_complement(seq)
+                            } else {
+                                seq.to_string()
+                            }
+                        } else if read_strand == '0' {
+                            seq.to_string()
+                        } else {
+                            reverse_complement(seq)
+                        };
+                        let p_str_owned =
+                            if let Some(&(p_strand, ref p_seq)) = stand_map.get(&(1 - seg_idx)) {
+                                if p_strand != curr_strand {
+                                    p_seq.to_string()
+                                } else {
+                                    reverse_complement(p_seq)
+                                }
+                            } else {
+                                String::new()
+                            };
+                        let bucket_size = self.seq_len.max(1);
+                        let num1 = (new_site - 6) / bucket_size;
+                        let num2 = (new_site + 6) / bucket_size;
+
+                        let mut eval_candidate = |cand: &CandidateBreakpoint| -> Result<bool> {
+                            let s_idx = if c[0] == 10 {
+                                slen - c[2] + (cand.site - new_site)
+                            } else {
+                                c[1] + (cand.site - new_site)
+                            };
+                            if s_idx < 0 || s_idx >= slen {
+                                return Ok(false);
+                            }
+                            let str_f = &str_e_owned[s_idx as usize..];
+                            let str3 = if c[0] == 10 {
+                                &str_e_owned[0..c[1] as usize]
+                            } else {
+                                "*"
+                            };
+                            let site1 = cand.data[0].parse::<i32>().unwrap_or(0);
+                            let site2 = cand.data[1].parse::<i32>().unwrap_or(0);
+                            let mut s2_ok = if mate_seg_alns.is_some() { 0 } else { 1 };
+                            if let Some(mate_seg_alns) = mate_seg_alns {
+                                for mate_aln in mate_seg_alns {
+                                    if mate_aln.chrom.as_ref() == chr
+                                        && mate_aln.mapq >= self.min_mapq_uni
+                                    {
+                                        let c_ano = misd(&mate_aln.cigar, slen);
+                                        let mate_strand =
+                                            if mate_aln.flag & 0x10 != 0 { '1' } else { '0' };
+                                        if mate_strand != curr_strand
+                                            && mate_aln.pos >= site1 - 6
+                                            && mate_aln.pos + c_ano[3] - 1 <= site2 + 6
+                                        {
+                                            s2_ok = 1;
+                                        } else {
+                                            s2_ok = -1;
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                            let circ_c = vec![
+                                (if aln.flag & 0x10 != 0 { "1" } else { "0" }).to_string(),
+                                chr.to_string(),
+                                "ms".to_string(),
+                                cand.data[0].clone(),
+                                cand.data[1].clone(),
+                                str_f.to_string(),
+                                p_str_owned.clone(),
+                                str3.to_string(),
+                                s2_ok.to_string(),
+                                cand.data[2].clone(),
+                                cand.data[3].clone(),
+                                cand.data[4].clone(),
+                                aln.mapq.to_string(),
+                            ];
+                            let tag = with_trace_hg2_scope(trace_read, || {
+                                is_bsj_hg2.is_bsj_hg2(&circ_c, chr_tcga_map.get(chr).unwrap())
+                            });
+                            if trace_read {
+                                emit_debug_line(&format!(
+                                    "[TRACE_SCAN2_DISPLAY] id={} type=ms seg={} aln_pos={} chr={} site1={} site2={} cand_site={} cigar={} mapq={} tag={}",
+                                    id,
+                                    seg_idx,
+                                    aln.pos,
+                                    chr,
+                                    cand.data[0],
+                                    cand.data[1],
+                                    cand.site,
+                                    cigar_ref.as_ref(),
+                                    aln.mapq,
+                                    tag
+                                ));
+                            }
+                            if tag != "0" && tag != "2" {
+                                let tag_body = &tag[0..tag.len() - 1];
+                                results.push(format!(
+                                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                                    id,
+                                    mate_label,
+                                    cigar_ref.as_ref(),
+                                    tag_body,
+                                    chr,
+                                    cand.data[0],
+                                    cand.data[1],
+                                    cand.data[2],
+                                    cand.data[3],
+                                    cand.data[4],
+                                    tag.chars().next_back().unwrap()
+                                ));
+                                Ok(true)
+                            } else {
+                                Ok(false)
+                            }
+                        };
+
+                        if self.site_array2.get(chr).is_some_and(|s| s.contains(&num1)) {
+                            let (l1, r1) = Self::bucket_range(list, num1, bucket_size);
+                            for idx in (l1..r1).rev() {
+                                let cand = &list[idx];
+                                let bias = cand.site - new_site;
+                                if bias >= -6 {
+                                    if bias <= 6 && eval_candidate(cand)? && !trace_all_candidates {
+                                        continue 'mate;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        if num2 != num1
+                            && self.site_array2.get(chr).is_some_and(|s| s.contains(&num2))
+                        {
+                            let (l2, r2) = Self::bucket_range(list, num2, bucket_size);
+                            for idx in l2..r2 {
+                                let cand = &list[idx];
+                                let bias = cand.site - new_site;
+                                if bias <= 6 {
+                                    if eval_candidate(cand)? && !trace_all_candidates {
+                                        continue 'mate;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(results)
     }
 }

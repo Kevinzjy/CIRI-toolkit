@@ -8,7 +8,7 @@ use anyhow::Result;
 use chrono::Local;
 use clap::Parser;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::time::Instant;
 
 use crate::annotation::Annotation;
@@ -90,19 +90,6 @@ struct Args {
     /// Enable profiling and write the report to `<prefix>.perf.log`.
     #[arg(long = "perf", default_value_t = false)]
     perf: bool,
-
-    /// Run CIRI-AS-style internal splice-junction reconstruction as a sidecar.
-    ///
-    /// This consumes the final Summary circRNA table and original SAM/BAM after
-    /// CIRI3 detection completes. It does not alter `.bsj1`, `.bsj`, or `.out`.
-    #[arg(long = "as", default_value_t = false)]
-    as_sidecar: bool,
-
-    /// Output prefix for CIRI-AS sidecar files.
-    ///
-    /// When omitted, CIRI-AS files use `<ciri-output-prefix>.as`.
-    #[arg(long = "as-out")]
-    as_out_prefix: Option<String>,
 }
 
 /// Emits one aligned, timestamped progress line.
@@ -118,12 +105,59 @@ fn log_info(log_writer: &mut BufWriter<File>, label: &str, msg: &str) -> Result<
     Ok(())
 }
 
+/// Sorts the mate-level BSJ rows and writes the final user-facing `.bsj`.
+///
+/// This runs strictly after Summary has consumed only `priority=1` rows, so the
+/// user-facing sort order and `priority=0` evidence cannot perturb `.out`.
+fn write_display_bsj(final_bsj: &str, bsj1_path: &str, bsj2_path: &str) -> Result<()> {
+    let mut rows: Vec<(String, usize, usize, usize, String)> = Vec::new();
+    for (path, stage_rank, stage_name) in
+        [(bsj1_path, 0usize, "scan1"), (bsj2_path, 1usize, "scan2")]
+    {
+        if let Ok(file) = File::open(path) {
+            let reader = BufReader::new(file);
+            for line_res in reader.lines() {
+                let line = line_res?;
+                if line.is_empty() {
+                    continue;
+                }
+                let mut parts = line.splitn(4, '\t');
+                if let (Some(read_id), Some(mate_label), Some(priority), Some(_)) =
+                    (parts.next(), parts.next(), parts.next(), parts.next())
+                {
+                    let mate_rank = if mate_label == "R1" { 0 } else { 1 };
+                    let priority_rank = if priority == "1" { 0 } else { 1 };
+                    rows.push((
+                        read_id.to_string(),
+                        mate_rank,
+                        priority_rank,
+                        stage_rank,
+                        format!("{}\t{}", line, stage_name),
+                    ));
+                }
+            }
+        }
+    }
+    rows.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.3.cmp(&b.3))
+    });
+    let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(final_bsj)?);
+    for (_, _, _, _, line) in rows {
+        writeln!(writer, "{}", line)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 /// Loads inputs, runs Scan1 -> Scan2 -> Summary, and writes outputs.
 ///
 /// The current `ciri` entry keeps the historical direct CIRI3-style arguments
-/// instead of forcing a `detect` subcommand, so existing parity commands remain
-/// usable while CIRI-AS-style internal structure reconstruction is developed as
-/// an explicit post-Summary sidecar.
+/// instead of forcing a `detect` subcommand. After Summary finishes, the CLI now
+/// always performs the read-level circRNA segments pass that feeds future
+/// full-length reconstruction.
 pub fn main() -> Result<()> {
     let run_started = Instant::now();
     let args = Args::parse();
@@ -195,7 +229,7 @@ pub fn main() -> Result<()> {
         args.linear_range_size_min,
     );
     scan1.set_mem_limit(mem_limit);
-    scan1.run(&args.in_sam, &bsj1_output, &fasta.chr_tcga_map, &annotation)?;
+    scan1.run_with_priority(&args.in_sam, &bsj1_output, &fasta.chr_tcga_map, &annotation)?;
     log_info(
         &mut log_writer,
         "Scan 1 summary",
@@ -225,12 +259,12 @@ pub fn main() -> Result<()> {
         "Running scan 2",
         "Curating splicing signals & counting FSJs...",
     )?;
-    scan2.run(
+    scan2.run_with_display(
         &args.in_sam,
-        &bsj1_output,
-        &bsj_output,
         &bsj2_output,
         &fsj_output,
+        Some(&bsj1_output),
+        None,
         &fasta.chr_tcga_map,
     )?;
     log_info(
@@ -247,8 +281,8 @@ pub fn main() -> Result<()> {
         "Clustering sites and filtering results...",
     )?;
     let mut summary = Summary::new(args.stringency);
-    summary.run(
-        &bsj_output,
+    summary.run_from_bsj_files(
+        &[&bsj1_output, &bsj2_output],
         &result_output,
         &scan2.fsj_map,
         &fasta.chr_tcga_map,
@@ -266,35 +300,33 @@ pub fn main() -> Result<()> {
             summary.circ_count, summary.final_bsj_reads
         ),
     )?;
+    scan2.release_working_set();
+
+    log_info(
+        &mut log_writer,
+        "Formatting BSJ",
+        "Sorting mate-level BSJ display...",
+    )?;
+    write_display_bsj(&bsj_output, &bsj1_output, &bsj2_output)?;
 
     log_info(&mut log_writer, "Output file", &result_output)?;
-
-    if args.as_sidecar {
-        let as_prefix = args
-            .as_out_prefix
-            .clone()
-            .unwrap_or_else(|| format!("{}.as", args.out_prefix));
-        log_info(
-            &mut log_writer,
-            "Running CIRI-AS",
-            "Detecting internal splice junctions as a sidecar...",
-        )?;
-        run_ciri_as(AsConfig {
-            input_path: &args.in_sam,
-            circ_path: &result_output,
-            out_prefix: &as_prefix,
-            reference: &fasta.chr_tcga_map,
-            annotation: args.gtf.as_ref().map(|_| &annotation),
-        })?;
-        log_info(
-            &mut log_writer,
-            "CIRI-AS output",
-            &format!(
-                "{}(_splice.list/.list/.isoforms/.isoform_summary/.fa/_AS.list)",
-                as_prefix
-            ),
-        )?;
-    }
+    log_info(
+        &mut log_writer,
+        "Running segments",
+        "Reconstructing circRNA read-level segments...",
+    )?;
+    run_ciri_as(AsConfig {
+        input_path: &args.in_sam,
+        circ_path: &result_output,
+        out_prefix: &args.out_prefix,
+        reference: &fasta.chr_tcga_map,
+        annotation: args.gtf.as_ref().map(|_| &annotation),
+    })?;
+    log_info(
+        &mut log_writer,
+        "Segments output",
+        &format!("{}.segments", args.out_prefix),
+    )?;
 
     log_info(
         &mut log_writer,

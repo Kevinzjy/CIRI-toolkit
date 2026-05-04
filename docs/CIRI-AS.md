@@ -49,26 +49,26 @@ ciri \
   -i <input.sam|input.bam> \
   -o <prefix> \
   -r <ref.fa> \
-  -a <anno.gtf> \
-  --as
+  -a <anno.gtf>
 ```
 
-建议新增参数：
+当前实现不再使用独立的 `--as` / `--as-out` 入口，而是在主流程写完 `<prefix>.out` 后默认继续执行 CIRI-AS-style second sweep。
 
-- `--as`：启用 CIRI-AS 后处理。
-- `--as-out <prefix>`：CIRI-AS 输出前缀，默认 `<out_prefix>.as`。
-- `--as-output-all`：输出 AS 中间文件，默认关闭。
+当前正式输出：
 
-当前输出：
+- `<prefix>.segments`：当前正式输出。记录 `type=bsj/backward/forward` 兼容协议下的 read-level segment chain；`v1` 先只输出 `bsj` 与 `backward`。
 
-- `<as_prefix>.list`：cirexon 预测结果，对应 Perl 的 `<out>.list`；已实现 splice/coverage 主路径。
-- `<as_prefix>.isoforms`：full-length isoform path 输出；每行是一个 anchored exon chain，用于回答同一 BSJ 下有几种 isoform。
-- `<as_prefix>.isoform_summary`：每个 Summary confirmed circRNA 的 cirexon 数与 isoform 数；没有完整 anchored path 的 circRNA 也保留 `isoform_count = 0`。
-- `<as_prefix>.fa`：`<as_prefix>.isoforms` 中每条 isoform 的序列。
-- `<as_prefix>_AS.list`：可变剪接事件历史文件名；当前仅输出 header，不再作为本阶段开发重点。
-- `<as_prefix>_splice.list`：circRNA 内部 splice junction，对应 Perl 的 `<out>_splice.list`；已实现并使用 annotation-aware motif / strand / offset tie-break。
-- `<as_prefix>.log`：CIRI-AS 阶段日志。
-- `<as_prefix>_coverage.list`、`<as_prefix>_jav.list`、`<as_prefix>_library_length.list`：仅在 `--as-output-all` 开启时输出。
+当前保留但暂不作为主输出的内容：
+
+- `_splice.list`
+- `.list`
+- `.isoforms`
+- `.isoform_summary`
+- `.fa`
+- `_AS.list`
+- `_coverage.list` / `_jav.list` / `_library_length.list`
+
+这些旧输出对应的实现和设计说明仍保留在本文档后续章节中，作为 future full-length reconstruction 的参考，而不是当前默认交付物。
 
 ## 3. 重要兼容问题
 
@@ -526,7 +526,7 @@ tmp/ciri_as_gold/
 
 验证：
 
-- CIRI3 主流程仍必须保持 `.out` 三层零差异；
+- CIRI3 主流程仍必须保持 `.out` 的 circ/read/read-assignment/FSJ 四层零差异；
 - AS 阶段先比较候选数、motif validated 数、典型 read 的坐标解释；
 - `_splice.list` 可与 Perl CIRI-AS 作为参考对照，但不要求 100% parity；若差异来自 annotation-aware tie-break 或 Perl hash 顺序，应记录为有意偏离。
 
@@ -586,7 +586,7 @@ tmp/ciri_as_gold/
 新增 CIRI-AS 后应保持两类验证分离：
 
 1. CIRI3 主流程 parity：
-   - `tests/analyze_diff.py` 继续用于 `.out`；
+   - `scripts/ciri_result_diff.py` 继续用于 `.out`；
    - `circ/read/read-assignment/FSJ` 必须保持零差异。
 
 2. CIRI-AS 对照：

@@ -1,23 +1,11 @@
 #!/usr/bin/env python3
-"""Extract read-name subsets from paired Java and Rust CIRI results.
+"""Build read subsets from paired CIRI `.out`/`.result` files.
 
-The script compares two CIRI `.result` files and can materialize a smaller
-SAM/BAM file containing one of two useful subsets:
+Use this when parity debugging needs a compact read subset:
 
-1. `all-bsj` mode (default): every BSJ-supporting read seen by Java or Rust.
-   This is the most useful mode for building a compact parity/performance test
-   fixture, because it keeps the full positive set even when the current diff is
-   tiny.
-2. `diff` mode: only the reads directly implicated in the current Java vs Rust
-   differences, plus optional circRNA context.
-
-`diff` mode includes:
-
-1. Read IDs that appear only on one side.
-2. Read IDs that have different `(circRNA_ID, read_ID)` assignments.
-3. Full supporting-read context for every circRNA touched by a circ-level or
-   assignment-level difference, because Summary/stringency decisions depend on
-   all supporting reads for the affected circRNA.
+1. `all-bsj` mode keeps every BSJ-supporting read reported by either result.
+2. `diff` mode keeps only reads implicated in current circ/read/assignment diffs,
+   with optional full circRNA supporting-read context.
 """
 
 from __future__ import annotations
@@ -32,7 +20,7 @@ from pathlib import Path
 def load_result(
     path: Path,
 ) -> tuple[set[str], set[str], set[tuple[str, str]], dict[str, set[str]], dict[str, set[str]]]:
-    """Load circ/read/assignment sets plus lookup tables from a CIRI result."""
+    """Load circ/read/assignment sets plus lookup tables from one CIRI result."""
     circ_ids: set[str] = set()
     read_ids: set[str] = set()
     assignments: set[tuple[str, str]] = set()
@@ -62,12 +50,8 @@ def load_result(
     return circ_ids, read_ids, assignments, circ_to_reads, read_to_reasons
 
 
-def add_reads(
-    reason_map: dict[str, set[str]],
-    reads: set[str],
-    reason: str,
-) -> None:
-    """Add a batch of reads with a single inclusion reason."""
+def add_reads(reason_map: dict[str, set[str]], reads: set[str], reason: str) -> None:
+    """Add a batch of reads under one inclusion reason."""
     for read_id in reads:
         reason_map[read_id].add(reason)
 
@@ -76,12 +60,7 @@ def collect_all_bsj_reads(
     java_read_ids: set[str],
     rust_read_ids: set[str],
 ) -> dict[str, set[str]]:
-    """Collect every BSJ-supporting read reported by Java or Rust.
-
-    This mode deliberately ignores whether a read is part of the current diff.
-    It is intended for building a compact "positive-only" BAM/SAM fixture that
-    can be rerun across profiling, parity, and regression experiments.
-    """
+    """Collect every BSJ-supporting read reported by Java or Rust."""
     reason_map: dict[str, set[str]] = defaultdict(set)
     add_reads(reason_map, java_read_ids, "bsj_java")
     add_reads(reason_map, rust_read_ids, "bsj_rust")
@@ -107,7 +86,7 @@ def collect_diff_reads(
     set[tuple[str, str]],
     set[tuple[str, str]],
 ]:
-    """Collect only the reads directly involved in Java vs Rust differences."""
+    """Collect only the reads directly involved in current Java/Rust differences."""
     circ_only_java = java_circ_ids - rust_circ_ids
     circ_only_rust = rust_circ_ids - java_circ_ids
     read_only_java = java_read_ids - rust_read_ids
@@ -144,14 +123,14 @@ def collect_diff_reads(
 
 
 def write_read_list(path: Path, reads: list[str]) -> None:
-    """Write one read ID per line for direct use with `samtools view -N`."""
+    """Write one read ID per line for `samtools view -N`."""
     with path.open("w", encoding="utf-8") as handle:
         for read_id in reads:
             handle.write(f"{read_id}\n")
 
 
 def write_manifest(path: Path, reason_map: dict[str, set[str]]) -> None:
-    """Write a TSV manifest so the extracted subset can be traced back later."""
+    """Write a TSV manifest for the selected read subset."""
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
         writer.writerow(["read_id", "reasons"])
@@ -160,11 +139,7 @@ def write_manifest(path: Path, reason_map: dict[str, set[str]]) -> None:
 
 
 def build_subset(input_alignment: Path, read_list: Path, output_alignment: Path) -> None:
-    """Materialize a SAM/BAM subset with only the selected read IDs.
-
-    `samtools view -N` preserves the original record order during the sequential
-    scan, so a queryname-sorted input remains queryname-sorted in the subset.
-    """
+    """Materialize a SAM/BAM subset with only the selected read IDs."""
     output_format = output_alignment.suffix.lower()
     cmd = ["samtools", "view", "-h", "-N", str(read_list), "-@", "16"]
     if output_format == ".bam":
@@ -179,7 +154,7 @@ def build_subset(input_alignment: Path, read_list: Path, output_alignment: Path)
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Extract Java/Rust BSJ-supporting reads or diff-only read subsets."
+        description="Build BSJ-wide or diff-focused read subsets from two CIRI results."
     )
     parser.add_argument("java_result", type=Path, help="Reference result file (Java/CIRI3)")
     parser.add_argument("rust_result", type=Path, help="Current result file (Rust/CIRI-toolkit)")
@@ -194,27 +169,27 @@ def main() -> None:
         "-i",
         "--input-alignment",
         type=Path,
-        help="Optional source SAM/BAM. When set, also emits a smaller subset alignment.",
+        help="Optional source SAM/BAM. When set, also emit a subset alignment.",
     )
     parser.add_argument(
         "--subset-output",
         type=Path,
-        help="Optional subset SAM/BAM output path. Defaults to <prefix>.subset.bam when --input-alignment is set.",
+        help="Optional subset SAM/BAM path. Defaults to <prefix>.subset.bam when --input-alignment is set.",
     )
     parser.add_argument(
         "--mode",
         choices=["all-bsj", "diff"],
         default="all-bsj",
         help=(
-            "Subset selection mode. 'all-bsj' (default) extracts every read that "
-            "supports any circRNA in either result. 'diff' keeps only directly "
-            "differing reads plus optional circ context."
+            "Subset selection mode. 'all-bsj' keeps every BSJ-supporting read "
+            "reported by either result. 'diff' keeps only directly differing "
+            "reads plus optional circ context."
         ),
     )
     parser.add_argument(
         "--no-circ-context",
         action="store_true",
-        help="In diff mode, only include directly differing reads; skip full supporting-read context for touched circRNAs.",
+        help="In diff mode, skip full supporting-read context for touched circRNAs.",
     )
     args = parser.parse_args()
 

@@ -255,6 +255,15 @@ struct MateSegments {
     is_bsj: bool,
 }
 
+/// One contiguous genomic segment produced while traversing simulated source bases.
+#[derive(Clone, Debug)]
+struct SegmentToken {
+    start: usize,
+    end: usize,
+    exon_idx: usize,
+    partition: usize,
+}
+
 /// Small deterministic RNG so the simulator does not add another crate-level dependency.
 #[derive(Clone, Debug)]
 struct Lcg64 {
@@ -607,19 +616,20 @@ fn crosses_boundary(start: usize, len: usize, seq_len: usize) -> bool {
 
 /// Formats mate segments for one simulated read.
 ///
-/// `reverse_order` is used for R2 because the emitted read is the reverse
-/// complement of the template slice. BSJ markers are inserted only when the
-/// circular coordinate order wraps between the last and first base.
+/// The simulator truth now emits segments in genomic order rather than read
+/// order so the contract matches how SAM/BAM alignments are normally inspected.
+/// We still detect BSJ by traversing the simulated template in template order,
+/// but once the genomic segments are known they are written in ascending genomic
+/// coordinate order with the simulated source strand retained in each token.
 fn format_segments(
     source_map: &[SourceBase],
     strand: char,
     start: usize,
     len: usize,
     circular: bool,
-    reverse_order: bool,
 ) -> MateSegments {
     let seq_len = source_map.len();
-    let mut positions: Vec<usize> = (0..len)
+    let positions: Vec<usize> = (0..len)
         .map(|offset| {
             if circular {
                 (start + offset) % seq_len
@@ -628,33 +638,37 @@ fn format_segments(
             }
         })
         .collect();
-    if reverse_order {
-        positions.reverse();
-    }
-
-    let mut tokens = Vec::new();
-    let mut current: Option<(usize, usize, usize)> = None;
+    let mut segments = Vec::new();
+    let mut current: Option<(usize, usize, usize, usize)> = None;
     let mut is_bsj = false;
-    let flush_current = |tokens: &mut Vec<String>, current: &mut Option<(usize, usize, usize)>| {
-        if let Some((min_coord, max_coord, _exon_idx)) = current.take() {
-            tokens.push(format!("{min_coord}-{max_coord}:{strand}"));
-        }
-    };
+    let mut partition = 0usize;
+    let flush_current =
+        |segments: &mut Vec<SegmentToken>, current: &mut Option<(usize, usize, usize, usize)>| {
+            if let Some((min_coord, max_coord, exon_idx, partition)) = current.take() {
+                segments.push(SegmentToken {
+                    start: min_coord,
+                    end: max_coord,
+                    exon_idx,
+                    partition,
+                });
+            }
+        };
 
     for (idx, pos) in positions.iter().copied().enumerate() {
         if idx > 0 && circular {
             let prev = positions[idx - 1];
             if (prev == seq_len - 1 && pos == 0) || (prev == 0 && pos == seq_len - 1) {
-                flush_current(&mut tokens, &mut current);
-                tokens.push("<bsj>".to_string());
+                flush_current(&mut segments, &mut current);
+                partition += 1;
                 is_bsj = true;
             }
         }
 
         let base = &source_map[pos];
         match current {
-            Some((ref mut min_coord, ref mut max_coord, exon_idx))
+            Some((ref mut min_coord, ref mut max_coord, exon_idx, existing_partition))
                 if exon_idx == base.exon_idx
+                    && existing_partition == partition
                     && (base.coord.abs_diff(*min_coord) == 1
                         || base.coord.abs_diff(*max_coord) == 1) =>
             {
@@ -662,18 +676,65 @@ fn format_segments(
                 *max_coord = (*max_coord).max(base.coord);
             }
             Some(_) => {
-                flush_current(&mut tokens, &mut current);
-                current = Some((base.coord, base.coord, base.exon_idx));
+                flush_current(&mut segments, &mut current);
+                current = Some((base.coord, base.coord, base.exon_idx, partition));
             }
-            None => current = Some((base.coord, base.coord, base.exon_idx)),
+            None => current = Some((base.coord, base.coord, base.exon_idx, partition)),
         }
     }
-    flush_current(&mut tokens, &mut current);
+    flush_current(&mut segments, &mut current);
 
-    MateSegments {
-        text: tokens.join("|"),
-        is_bsj,
-    }
+    let text = if is_bsj {
+        let mut by_partition: Vec<Vec<SegmentToken>> = Vec::new();
+        let mut segments_by_partition = segments;
+        segments_by_partition
+            .sort_by_key(|segment| (segment.partition, segment.start, segment.end));
+        for segment in segments_by_partition {
+            while by_partition.len() <= segment.partition {
+                by_partition.push(Vec::new());
+            }
+            by_partition[segment.partition].push(segment);
+        }
+        let mut ordered_groups: Vec<(usize, Vec<String>)> = by_partition
+            .into_iter()
+            .filter(|group| !group.is_empty())
+            .map(|group| {
+                let min_start = group
+                    .iter()
+                    .map(|segment| segment.start)
+                    .min()
+                    .unwrap_or(usize::MAX);
+                let tokens = group
+                    .into_iter()
+                    .map(|segment| format!("{}-{}:{strand}", segment.start, segment.end))
+                    .collect::<Vec<_>>();
+                (min_start, tokens)
+            })
+            .collect();
+        ordered_groups.sort_by_key(|(min_start, _)| *min_start);
+        ordered_groups
+            .into_iter()
+            .enumerate()
+            .flat_map(|(idx, (_, tokens))| {
+                let mut out = Vec::new();
+                if idx > 0 {
+                    out.push("<bsj>".to_string());
+                }
+                out.extend(tokens);
+                out
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    } else {
+        segments.sort_by_key(|segment| (segment.start, segment.end, segment.exon_idx));
+        segments
+            .into_iter()
+            .map(|segment| format!("{}-{}:{strand}", segment.start, segment.end))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+
+    MateSegments { text, is_bsj }
 }
 
 /// Samples a non-negative coverage value from the configured Gaussian model.
@@ -1021,22 +1082,10 @@ fn write_circular_reads(
             let r2_template = circular_slice(&iso.seq, r2_start, args.read_len);
             let r1_seq = mutate_read(&r1_template, args.error_rate, rng);
             let r2_seq = mutate_read(&revcomp(&r2_template), args.error_rate, rng);
-            let r1_segments = format_segments(
-                &source_map,
-                circ.strand,
-                r1_start,
-                args.read_len,
-                true,
-                false,
-            );
-            let r2_segments = format_segments(
-                &source_map,
-                circ.strand,
-                r2_start,
-                args.read_len,
-                true,
-                true,
-            );
+            let r1_segments =
+                format_segments(&source_map, circ.strand, r1_start, args.read_len, true);
+            let r2_segments =
+                format_segments(&source_map, circ.strand, r2_start, args.read_len, true);
             let is_bsj = r1_segments.is_bsj || r2_segments.is_bsj;
             let is_circular = crosses_boundary(r1_start, insert_len, seq_len) || is_bsj;
             let read_id = format!("sim:{}", *next_read_index);
@@ -1132,10 +1181,8 @@ fn write_linear_reads(
         };
         let r1_seq = mutate_read(r1_template, args.error_rate, rng);
         let r2_seq = mutate_read(&revcomp(r2_template), args.error_rate, rng);
-        let r1_segments =
-            format_segments(&source_map, tx.strand, start, args.read_len, false, false);
-        let r2_segments =
-            format_segments(&source_map, tx.strand, r2_start, args.read_len, false, true);
+        let r1_segments = format_segments(&source_map, tx.strand, start, args.read_len, false);
+        let r2_segments = format_segments(&source_map, tx.strand, r2_start, args.read_len, false);
         let read_id = format!("sim:{}", *next_read_index);
         let metadata = format!(
             "read_kind=linear gene_id={} transcript_id={} insert_len={}",

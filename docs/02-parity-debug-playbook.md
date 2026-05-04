@@ -33,16 +33,16 @@ whole-genome / hg38 复核时，还需要先锁定：
 - FASTA：`/data/public/database/gencode/hg38/_BWAindex/hg38.fa`
 - GTF：`/data/public/database/gencode/hg38/gencode.v44.annotation.gtf`
 
-## 3. 三层差异检查
+## 3. 四层差异检查
 
 使用统一脚本一次性看四层指标：
 
 ```bash
-python tests/analyze_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.result \
+python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.result \
   --show-read-ids --show-read-assignments
 ```
 
-三层定义：
+四层定义：
 
 - circRNA-level：circ 位点集合是否一致
 - read-level：read ID 集合是否一致
@@ -53,7 +53,8 @@ python tests/analyze_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.resu
 
 1. 先把 circRNA 层面对齐到 100%
 2. 再把 read ID 层面对齐到 100%
-3. 最后收敛 read-assignment 层面
+3. 再收敛 read-assignment 层面
+4. 涉及 Scan2 / Summary / `.bsj1/.bsj2` 协议时，最后确认 FSJ 层面也为零差异
 
 ## 4. 定向追踪开关
 
@@ -157,34 +158,39 @@ CIRI_PROFILE_SCAN2=1 ./target/release/ciri ...
 ## 5. 推荐排查流程（SOP）
 
 1. 运行正常模式，拿到 Rust `.out`。
-2. 用 `analyze_diff.py` 看三层差异。
+2. 用 `ciri_result_diff.py` 看四层差异。
 3. 从 `ONLY_*` 集合中挑 2~4 条典型 read。
 4. 开 `CIRI_TRACE_READS` 看 Scan1/Scan2 分支与 tag。
 5. 如怀疑候选顺序问题，再开 `CIRI_TRACE_ALL_CANDS=1`。
 6. 如怀疑 `is_bsj_hg2` 内部分支，再开 `CIRI_TRACE_HG2=1`。
 7. 在 Java 源码中对应位置做逐分支比对（变量级）。
-8. 只做一个最小改动，立即复测三层指标。
+8. 只做一个最小改动，立即复测四层指标。
 9. 关闭所有 trace/profile 环境变量，做最终验证。
 
 ## 6. 单条 read 定位建议
 
 针对具体 read，建议按这个顺序缩小范围：
 
-1. 先在 Rust 最终 `.bsj` 里找 read 是否出现，并看尾列来源是 `scan1` 还是 `scan2`。
+1. 先在 Rust 最终 `.bsj` 里找 read 是否出现，并看第二列 `mate_label`、第三列 `priority` 和尾列来源：
+   - `priority=1`：该行参与 Summary 和 `.out`。
+   - `priority=0`：该行只是 mate-level 附加证据，不参与 `.out` 计数。
+   - 尾列 `scan1/scan2` 表示该行来自哪一轮扫描。
 2. 如果不在 `.bsj`，先查 `Scan1`：
    - 看是否有 `TRACE_SCAN1_CAND`
    - 看是否进入 `TRACE_SCAN1_HG1`
-3. 如果在 `.bsj` 里有，但不在最终 `.out`，再查 `Summary`：
+3. 如果在 `.bsj` 里只有 `priority=0`，这不是 parity 差异；先找同一 read id 是否存在 `priority=1` 行。
+4. 如果存在 `priority=1` 行但不在最终 `.out`，再查 `Summary`：
    - 看 `TRACE_SCAN2_CAND`
    - 必要时开 `CIRI_TRACE_ALL_CANDS=1`
    - 必要时看 `TRACE_SCAN2_HG2`
-4. 如果 subset 与 full 结论不一致，优先怀疑“缺了中间竞争上下文”，不要直接判定算法错误。
+5. 如果 subset 与 full 结论不一致，优先怀疑“缺了中间竞争上下文”，不要直接判定算法错误。
 
 ## 7. 常见根因清单（本项目已验证）
 
 - Scan2 索引来源不一致：
   - Java：`BSJ1 -> chrCircSiteMap(HashSet) -> siteArray/siteMap`
-  - 若 Rust 直接用原始 BSJ1 行建索引，可能引入重复候选，影响 early-return 路径。
+  - Rust 当前只用 `.bsj1` 的 `priority=1` 行建主索引。
+  - 若 Rust 直接用所有 `.bsj1` 行建索引，`priority=0` mate-level 附加证据会引入重复候选，影响 early-return 路径。
 - Scan2 payload 字段布局不一致：
   - 应为 `[site1, site2, strand, signal1, signal2, sum_q]`。
 - 配对序列方向计算不一致：
@@ -205,6 +211,7 @@ CIRI_PROFILE_SCAN2=1 ./target/release/ciri ...
 - circ-level：100%
 - read-level：100%
 - read-assignment-level：100%（若当前任务目标覆盖到 assignment）
+- fsj-level：100%（涉及 Scan2、Summary、`.bsj1/.bsj2` 协议或 FSJ 统计时必须检查）
 
 并附上命令与摘要指标，确保可复现。
 

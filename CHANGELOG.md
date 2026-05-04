@@ -5,10 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog, adapted to the current release flow of
 `CIRI-toolkit`.
 
+## [Unreleased]
+
+### Added
+- Added mate-level BSJ evidence columns to `<prefix>.bsj1`, `<prefix>.bsj2`,
+  and the final `<prefix>.bsj`: `mate_label` and `priority`.
+- Added `priority=0` BSJ rows to preserve non-Summary R1/R2 mate evidence for
+  downstream internal splice-site reconstruction.
+
+### Changed
+- Changed Summary input handling to read `<prefix>.bsj1` and `<prefix>.bsj2`
+  directly while consuming only `priority=1` rows, preserving CIRI3-compatible
+  `.out` behavior.
+- Changed final `<prefix>.bsj` generation to sort the combined `.bsj1/.bsj2`
+  mate-level rows by `read_id`, `mate_label`, `priority`, and scan stage.
+- Removed the extra display-only `.scan1.tmp`, `.scan2.tmp`, and `.bsj.raw.tmp`
+  pipeline from the main run path.
+
+### Verified
+- Verified `tests/chr1` BAM and SAM runs against Java CIRI3 with zero
+  circ/read/read-assignment/FSJ differences using
+  `scripts/ciri_result_diff.py`.
+
 ## [0.1.1] - 2026-03-24
 
 ### Added
-- Added `tests/analyze_diff.py` FSJ parity reporting for shared circRNAs.
+- Added `scripts/ciri_result_diff.py` FSJ parity reporting for shared circRNAs.
 - Added `<prefix>.log` as a first-class pipeline output so stage summaries and
   runtime information are preserved outside the terminal session.
 - Added CLI `--debug <read_id_list>` to trace selected reads through the
@@ -48,7 +70,7 @@ The format is based on Keep a Changelog, adapted to the current release flow of
 ### Fixed
 - Fixed Scan2 FSJ counting drift on whole-genome BAM inputs. With the verified
   hg38 FASTA/GTF pairing, shared-circ `#non_junction_reads` now match Java
-  exactly (`fsj_diff=0` in `tests/analyze_diff.py`).
+  exactly (`fsj_diff=0` in `scripts/ciri_result_diff.py`).
 - Fixed Scan2 whole-genome parity regressions caused by BAM mate-switch handling
   within supplementary-heavy read groups.
 - Fixed documentation drift so debugging, parity checking, and release-state

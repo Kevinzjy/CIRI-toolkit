@@ -21,7 +21,7 @@ Scan1 read group -> RO detector -> <prefix>.ro.fq
                                   -> <prefix>.ro.tsv
 ```
 
-不在第一阶段改变主 `.bsj1/.bsj/.out`。
+不在第一阶段改变 `priority=1` 主流程证据和 `.out` 判定结果。
 
 ## 2. 为什么先做 RO
 
@@ -349,7 +349,7 @@ Summary 按 origin read id 去重
 
 6. 主流程回归
    - `--ro-feature` 关闭时，主结果与当前基线保持一致。
-   - `--ro-feature` 开启时，主 `.bsj1/.bsj/.out` 仍保持一致，只额外生成 RO sidecar 文件。
+   - `--ro-feature` 开启时，`priority=1` 主流程证据和 `.out` 仍保持一致，只额外生成 RO sidecar 文件。
 
 ### 阶段 2：RO remap sidecar
 
@@ -382,7 +382,7 @@ Summary 按 origin read id 去重
 - R2 reverse-complement 和 quality reverse。
 - `5p_ro / 3p_ro / bidirectional_ro` 类型选择。
 - 同一 read pair 只写一个 selected `.ro.fq` record。
-- `--ro-feature` 关闭时，主 `.bsj1/.bsj/.out` 字节级不变。
+- `--ro-feature` 关闭时，`priority=1` 主流程证据和 `.out` 判定结果不变。
 
 建议新增测试：
 

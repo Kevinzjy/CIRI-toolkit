@@ -273,7 +273,7 @@ r2_is_bsj
 
 ### 5.1 segment protocol
 
-`r1_segments` / `r2_segments` 使用 read 实际读取顺序输出 genomic segments。每个 genomic segment 的格式为：
+`r1_segments` / `r2_segments` 使用 genomic order 输出 genomic segments。每个 genomic segment 的格式为：
 
 ```text
 start-end:strand
@@ -287,21 +287,21 @@ start-end:strand
 10500-10550:+|10600-10698:+
 ```
 
-对于 BSJ read，segment 顺序仍按真实模拟读取顺序输出，并在跨 BSJ 的断点处插入 `<bsj>` token：
+对于 BSJ read，segments 仍按 genomic order 输出，并在两个 BSJ 分区之间插入 `<bsj>` token：
 
 ```text
-10500-10550:+|10000-10098:+
-10500-10550:+|<bsj>|10000-10098:+
+10000-10098:+|10500-10550:+
+10000-10098:+|<bsj>|10500-10550:+
 ```
 
 BSJ read 必须使用第二种显式格式，即在跨 BSJ 位置加入 `<bsj>`，这样可以直接从 answer 文件中看出该 read 的来源跨过 back-splice junction。
 
 约定：
 
-- segment 顺序必须与 read 在真实模拟序列上的读取顺序一致。
+- segment 顺序必须按 genomic order 输出，而不是按 R1/R2 在测序时的读取顺序输出。
 - 对负链 isoform，`strand=-`，但 `start <= end` 仍使用 genomic coordinate 的自然顺序。
 - 如果 read 横跨多个 exon，需要拆成多个 genomic segments。
-- 如果 read 在 circular boundary 回绕，需要先输出回绕前 genomic segment，再输出 `<bsj>`，再输出回绕后的 genomic segment。
+- 如果 read 在 circular boundary 回绕，仍然按 genomic order 输出各段，并在不同 BSJ 分区之间插入 `<bsj>`。
 - 对不跨 BSJ 的 circular read，如果它来源于一个线性上连续可解释的 exon 片段，则 `is_circular=0`；如果来源结构表现为 backward 或其他非线性顺序，则 `is_circular=1`。
 
 ### 5.2 设计动机
