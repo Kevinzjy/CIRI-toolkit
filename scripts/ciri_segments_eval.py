@@ -9,7 +9,9 @@ extra views that are useful during the current development stage:
 - `circ_id`
 - `is_circular`
 - mate-level genomic segment sets from `r1_segments` / `r2_segments`
-- mate-level `r1_is_bsj` / `r2_is_bsj`
+- mate-level read-chain segment strings from `r1_segments` / `r2_segments`
+- mate-level junction chains derived from retained read-chain segments
+- mate-level `is_r1_bsj` / `is_r2_bsj` in prediction output
 
 Additional summaries:
 
@@ -20,6 +22,9 @@ Additional summaries:
 
 The default output format is a compact human-readable report. Use `--format tsv`
 to emit tidy rows that are easier to redirect into downstream shell tooling.
+By default, segment-set comparison ignores fragments shorter than 10 bp because
+these short clipped pieces are not treated as high-confidence CIRI-AS splice
+templates.
 """
 
 from __future__ import annotations
@@ -34,15 +39,49 @@ PAIR_KEYS_BY_TYPE = {
     "bsj": [
         "circ_id",
         "is_circular",
-        "is_bsj",
     ],
     "backward": [
         "is_circular",
-        "is_bsj",
     ],
 }
 
 MATE_NAMES = ("r1", "r2")
+SEGMENT_ERROR_CLASSES = (
+    "exact",
+    "count_diff",
+    "shift_1bp",
+    "shift_2bp",
+    "shift_gt2",
+    "strand_diff",
+    "other",
+)
+
+
+def pred_mate_bsj_key(mate: str) -> str:
+    """Return the current `<prefix>.segments` mate-level BSJ column name."""
+    return f"is_{mate}_bsj"
+
+
+def truth_mate_bsj_key(mate: str) -> str:
+    """Return the simulator truth mate-level BSJ column name."""
+    return f"{mate}_is_bsj"
+
+
+def parse_segment_token(token: str) -> tuple[int, int, str] | None:
+    """Parse one `start-end:strand` segment token."""
+    try:
+        span, strand = token.rsplit(":", 1)
+        start_text, end_text = span.split("-", 1)
+        start = int(start_text)
+        end = int(end_text)
+    except ValueError:
+        return None
+    return start, end, strand
+
+
+def segment_len(segment: tuple[int, int, str]) -> int:
+    """Return the inclusive genomic length of one parsed segment."""
+    return segment[1] - segment[0] + 1
 
 
 def infer_truth_type(row: dict[str, str]) -> str:
@@ -54,18 +93,137 @@ def infer_truth_type(row: dict[str, str]) -> str:
     return "forward"
 
 
-def normalize_segment_set(text: str) -> tuple[str, ...]:
-    """Normalize one mate's segment tokens into an order-insensitive tuple.
+def parse_segments(text: str, min_seg_len: int) -> tuple[tuple[int, int, str], ...]:
+    """Parse and length-filter one mate's segment tokens."""
+    if text == "NA":
+        return tuple()
+    segments = []
+    for token in text.split("|"):
+        if not token or token == "<bsj>":
+            continue
+        segment = parse_segment_token(token)
+        if segment is None:
+            continue
+        if segment_len(segment) >= min_seg_len:
+            segments.append(segment)
+    return tuple(sorted(segments))
 
-    `<bsj>` is intentionally excluded here because BSJ presence is tracked by the
-    dedicated `r1_is_bsj` / `r2_is_bsj` fields. The current evaluation goal is
-    to ask whether the same genomic segments were recovered, regardless of read
-    order or mapper-specific token order.
+
+def normalize_segment_chain(text: str, min_seg_len: int) -> tuple[str, ...]:
+    """Normalize one mate's segment tokens while preserving read-chain order.
+
+    Short fragments are filtered with the same threshold used by segment-set
+    metrics. `<bsj>` is retained only when it separates two retained segment
+    tokens, so a filtered short fragment next to the BSJ does not leave dangling
+    or duplicate marker tokens.
     """
     if text == "NA":
         return tuple()
-    tokens = [token for token in text.split("|") if token and token != "<bsj>"]
-    return tuple(sorted(tokens))
+    chain: list[str] = []
+    pending_bsj = False
+    for token in text.split("|"):
+        if not token:
+            continue
+        if token == "<bsj>":
+            pending_bsj = bool(chain)
+            continue
+        segment = parse_segment_token(token)
+        if segment is None or segment_len(segment) < min_seg_len:
+            continue
+        if pending_bsj and chain and chain[-1] != "<bsj>":
+            chain.append("<bsj>")
+        start, end, strand = segment
+        chain.append(f"{start}-{end}:{strand}")
+        pending_bsj = False
+    if chain and chain[-1] == "<bsj>":
+        chain.pop()
+    return tuple(chain)
+
+
+def normalize_segment_set(text: str, min_seg_len: int) -> tuple[str, ...]:
+    """Normalize one mate's segment tokens into an order-insensitive tuple.
+
+    `<bsj>` is intentionally excluded here because BSJ presence is tracked by the
+    dedicated `is_r1_bsj` / `is_r2_bsj` fields. The current evaluation goal is
+    to ask whether the same genomic segments were recovered, regardless of read
+    order or mapper-specific token order.
+    """
+    return tuple(
+        f"{start}-{end}:{strand}"
+        for start, end, strand in parse_segments(text, min_seg_len)
+    )
+
+
+def normalize_junction_chain(text: str, min_seg_len: int) -> tuple[str, ...]:
+    """Normalize one mate into a read-chain junction path.
+
+    Full-length reconstruction should eventually use splice/BSJ connections as
+    graph edges, not require every terminal exon boundary to be exact. This
+    metric therefore keeps only connections between retained segments: linear
+    junctions are represented by their donor/acceptor coordinates, while a BSJ
+    marker is represented as `B` without re-checking the adjacent segment ends.
+    """
+    chain = normalize_segment_chain(text, min_seg_len)
+    if not chain:
+        return tuple()
+
+    junctions: list[str] = []
+    previous_segment: tuple[int, int, str] | None = None
+    pending_bsj = False
+    for token in chain:
+        if token == "<bsj>":
+            pending_bsj = previous_segment is not None
+            continue
+
+        segment = parse_segment_token(token)
+        if segment is None:
+            previous_segment = None
+            pending_bsj = False
+            continue
+
+        if previous_segment is not None:
+            if pending_bsj:
+                junctions.append("B")
+            else:
+                _prev_start, prev_end, prev_strand = previous_segment
+                start, _end, strand = segment
+                if prev_strand == strand:
+                    junctions.append(f"N:{prev_end}>{start}:{strand}")
+                else:
+                    junctions.append(f"N:{prev_end}>{start}:{prev_strand}/{strand}")
+        previous_segment = segment
+        pending_bsj = False
+    return tuple(junctions)
+
+
+def classify_segment_error(
+    pred_segments: tuple[tuple[int, int, str], ...],
+    truth_segments: tuple[tuple[int, int, str], ...],
+) -> str:
+    """Classify one segment-set comparison after length filtering."""
+    if pred_segments == truth_segments:
+        return "exact"
+    if len(pred_segments) != len(truth_segments):
+        return "count_diff"
+    if not pred_segments:
+        return "other"
+
+    pred_no_strand = tuple((start, end) for start, end, _strand in pred_segments)
+    truth_no_strand = tuple((start, end) for start, end, _strand in truth_segments)
+    if pred_no_strand == truth_no_strand:
+        return "strand_diff"
+
+    max_shift = max(
+        max(abs(pred_start - truth_start), abs(pred_end - truth_end))
+        for (pred_start, pred_end), (truth_start, truth_end) in zip(
+            pred_no_strand, truth_no_strand
+        )
+    )
+    if max_shift <= 1:
+        return "shift_1bp"
+    if max_shift <= 2:
+        return "shift_2bp"
+    return "shift_gt2"
 
 
 def load_truth(path: Path) -> tuple[dict[str, dict[str, str]], Counter[str]]:
@@ -144,6 +302,12 @@ def main() -> None:
         default="text",
         help="Output format. 'text' prints report-style tables; 'tsv' is tidy and shell-friendly.",
     )
+    parser.add_argument(
+        "--min-seg-len",
+        type=int,
+        default=10,
+        help="Minimum inclusive segment length used in segment-set metrics (default: 10).",
+    )
     args = parser.parse_args()
 
     if args.format == "tsv":
@@ -155,6 +319,7 @@ def main() -> None:
     pred_counts: Counter[str] = Counter()
     confusion: Counter[tuple[str, str]] = Counter()
     exact: Counter[tuple[str, str]] = Counter()
+    segment_errors: Counter[tuple[str, str, str]] = Counter()
     examples: dict[tuple[str, str], list[tuple[str, str, str]]] = defaultdict(list)
     seen_pred: set[str] = set()
 
@@ -181,20 +346,61 @@ def main() -> None:
                     examples[(pred_type, key)].append((read_id, row[key], truth_row[key]))
             for mate in MATE_NAMES:
                 set_key = f"{mate}_segment_set"
-                pred_set = normalize_segment_set(row[f"{mate}_segments"])
-                truth_set = normalize_segment_set(truth_row[f"{mate}_segments"])
+                chain_key = f"{mate}_segment_chain"
+                junction_key = f"{mate}_junction_chain"
+                pred_segments = parse_segments(row[f"{mate}_segments"], args.min_seg_len)
+                truth_segments = parse_segments(
+                    truth_row[f"{mate}_segments"], args.min_seg_len
+                )
+                pred_chain = normalize_segment_chain(
+                    row[f"{mate}_segments"], args.min_seg_len
+                )
+                truth_chain = normalize_segment_chain(
+                    truth_row[f"{mate}_segments"], args.min_seg_len
+                )
+                pred_set = normalize_segment_set(
+                    row[f"{mate}_segments"], args.min_seg_len
+                )
+                truth_set = normalize_segment_set(
+                    truth_row[f"{mate}_segments"], args.min_seg_len
+                )
+                pred_junction_chain = normalize_junction_chain(
+                    row[f"{mate}_segments"], args.min_seg_len
+                )
+                truth_junction_chain = normalize_junction_chain(
+                    truth_row[f"{mate}_segments"], args.min_seg_len
+                )
+                error_class = classify_segment_error(pred_segments, truth_segments)
+                segment_errors[(pred_type, mate, error_class)] += 1
                 if pred_set == truth_set:
                     exact[(pred_type, set_key)] += 1
                 elif len(examples[(pred_type, set_key)]) < args.examples:
                     examples[(pred_type, set_key)].append(
                         (read_id, ",".join(pred_set), ",".join(truth_set))
                     )
-                bsj_key = f"{mate}_is_bsj"
-                if row[bsj_key] == truth_row[bsj_key]:
+                if pred_chain == truth_chain:
+                    exact[(pred_type, chain_key)] += 1
+                elif len(examples[(pred_type, chain_key)]) < args.examples:
+                    examples[(pred_type, chain_key)].append(
+                        (read_id, "|".join(pred_chain), "|".join(truth_chain))
+                    )
+                if pred_junction_chain == truth_junction_chain:
+                    exact[(pred_type, junction_key)] += 1
+                elif len(examples[(pred_type, junction_key)]) < args.examples:
+                    examples[(pred_type, junction_key)].append(
+                        (
+                            read_id,
+                            "|".join(pred_junction_chain),
+                            "|".join(truth_junction_chain),
+                        )
+                    )
+                bsj_key = pred_mate_bsj_key(mate)
+                truth_bsj_key = truth_mate_bsj_key(mate)
+                if row[bsj_key] == truth_row[truth_bsj_key]:
                     exact[(pred_type, bsj_key)] += 1
                 elif len(examples[(pred_type, bsj_key)]) < args.examples:
                     examples[(pred_type, bsj_key)].append(
-                        (read_id, row[bsj_key], truth_row[bsj_key])
+                        (read_id, row[bsj_key], truth_row[truth_bsj_key])
                     )
 
     recall_counts: Counter[str] = Counter()
@@ -238,10 +444,29 @@ def main() -> None:
                 exact[("bsj", f"{mate}_segment_set")],
                 pred_counts["bsj"],
             )
+            for error_class in SEGMENT_ERROR_CLASSES:
+                emit_summary(
+                    "BSJ_SEGMENT_ERRORS",
+                    f"{mate}_{error_class}",
+                    segment_errors[("bsj", mate, error_class)],
+                    pred_counts["bsj"],
+                )
             emit_summary(
                 "BSJ_ONLY",
-                f"bsj_{mate}_is_bsj_exact",
-                exact[("bsj", f"{mate}_is_bsj")],
+                f"bsj_{mate}_segment_chain_exact",
+                exact[("bsj", f"{mate}_segment_chain")],
+                pred_counts["bsj"],
+            )
+            emit_summary(
+                "BSJ_ONLY",
+                f"bsj_{mate}_junction_chain_exact",
+                exact[("bsj", f"{mate}_junction_chain")],
+                pred_counts["bsj"],
+            )
+            emit_summary(
+                "BSJ_ONLY",
+                f"bsj_is_{mate}_bsj_exact",
+                exact[("bsj", pred_mate_bsj_key(mate))],
                 pred_counts["bsj"],
             )
         for key in PAIR_KEYS_BY_TYPE["backward"]:
@@ -258,10 +483,29 @@ def main() -> None:
                 exact[("backward", f"{mate}_segment_set")],
                 pred_counts["backward"],
             )
+            for error_class in SEGMENT_ERROR_CLASSES:
+                emit_summary(
+                    "BACKWARD_SEGMENT_ERRORS",
+                    f"{mate}_{error_class}",
+                    segment_errors[("backward", mate, error_class)],
+                    pred_counts["backward"],
+                )
             emit_summary(
                 "BACKWARD_ONLY",
-                f"backward_{mate}_is_bsj_exact",
-                exact[("backward", f"{mate}_is_bsj")],
+                f"backward_{mate}_segment_chain_exact",
+                exact[("backward", f"{mate}_segment_chain")],
+                pred_counts["backward"],
+            )
+            emit_summary(
+                "BACKWARD_ONLY",
+                f"backward_{mate}_junction_chain_exact",
+                exact[("backward", f"{mate}_junction_chain")],
+                pred_counts["backward"],
+            )
+            emit_summary(
+                "BACKWARD_ONLY",
+                f"backward_is_{mate}_bsj_exact",
+                exact[("backward", pred_mate_bsj_key(mate))],
                 pred_counts["backward"],
             )
         emit_summary("BACKWARD_AS_MISSED_BSJ", "backward_truth_is_bsj", backward_truth_bsj, backward_total)
@@ -287,7 +531,9 @@ def main() -> None:
             for key in (
                 [*PAIR_KEYS_BY_TYPE[pred_type]]
                 + [f"{mate}_segment_set" for mate in MATE_NAMES]
-                + [f"{mate}_is_bsj" for mate in MATE_NAMES]
+                + [f"{mate}_segment_chain" for mate in MATE_NAMES]
+                + [f"{mate}_junction_chain" for mate in MATE_NAMES]
+                + [pred_mate_bsj_key(mate) for mate in MATE_NAMES]
             ):
                 example_rows = examples.get((pred_type, key))
                 if not example_rows:
@@ -331,11 +577,30 @@ def main() -> None:
         [
             ["pair", "circ_id", str(exact[("bsj", "circ_id")]), str(pred_counts["bsj"]), format_rate(exact[("bsj", "circ_id")], pred_counts["bsj"])],
             ["pair", "is_circular", str(exact[("bsj", "is_circular")]), str(pred_counts["bsj"]), format_rate(exact[("bsj", "is_circular")], pred_counts["bsj"])],
-            ["pair", "is_bsj", str(exact[("bsj", "is_bsj")]), str(pred_counts["bsj"]), format_rate(exact[("bsj", "is_bsj")], pred_counts["bsj"])],
+            ["r1", "is_bsj", str(exact[("bsj", "is_r1_bsj")]), str(pred_counts["bsj"]), format_rate(exact[("bsj", "is_r1_bsj")], pred_counts["bsj"])],
+            ["r2", "is_bsj", str(exact[("bsj", "is_r2_bsj")]), str(pred_counts["bsj"]), format_rate(exact[("bsj", "is_r2_bsj")], pred_counts["bsj"])],
             ["r1", "segment_set", str(exact[("bsj", "r1_segment_set")]), str(pred_counts["bsj"]), format_rate(exact[("bsj", "r1_segment_set")], pred_counts["bsj"])],
-            ["r1", "is_bsj", str(exact[("bsj", "r1_is_bsj")]), str(pred_counts["bsj"]), format_rate(exact[("bsj", "r1_is_bsj")], pred_counts["bsj"])],
             ["r2", "segment_set", str(exact[("bsj", "r2_segment_set")]), str(pred_counts["bsj"]), format_rate(exact[("bsj", "r2_segment_set")], pred_counts["bsj"])],
-            ["r2", "is_bsj", str(exact[("bsj", "r2_is_bsj")]), str(pred_counts["bsj"]), format_rate(exact[("bsj", "r2_is_bsj")], pred_counts["bsj"])],
+            ["r1", "segment_chain", str(exact[("bsj", "r1_segment_chain")]), str(pred_counts["bsj"]), format_rate(exact[("bsj", "r1_segment_chain")], pred_counts["bsj"])],
+            ["r2", "segment_chain", str(exact[("bsj", "r2_segment_chain")]), str(pred_counts["bsj"]), format_rate(exact[("bsj", "r2_segment_chain")], pred_counts["bsj"])],
+            ["r1", "junction_chain", str(exact[("bsj", "r1_junction_chain")]), str(pred_counts["bsj"]), format_rate(exact[("bsj", "r1_junction_chain")], pred_counts["bsj"])],
+            ["r2", "junction_chain", str(exact[("bsj", "r2_junction_chain")]), str(pred_counts["bsj"]), format_rate(exact[("bsj", "r2_junction_chain")], pred_counts["bsj"])],
+        ],
+    )
+
+    print_table(
+        f"BSJ_SEGMENT_ERRORS min_seg_len={args.min_seg_len}",
+        ["mate", "error_class", "count", "total", "rate"],
+        [
+            [
+                mate,
+                error_class,
+                str(segment_errors[("bsj", mate, error_class)]),
+                str(pred_counts["bsj"]),
+                format_rate(segment_errors[("bsj", mate, error_class)], pred_counts["bsj"]),
+            ]
+            for mate in MATE_NAMES
+            for error_class in SEGMENT_ERROR_CLASSES
         ],
     )
 
@@ -344,11 +609,33 @@ def main() -> None:
         ["group", "metric", "matched", "total", "rate"],
         [
             ["pair", "is_circular", str(exact[("backward", "is_circular")]), str(pred_counts["backward"]), format_rate(exact[("backward", "is_circular")], pred_counts["backward"])],
-            ["pair", "is_bsj", str(exact[("backward", "is_bsj")]), str(pred_counts["backward"]), format_rate(exact[("backward", "is_bsj")], pred_counts["backward"])],
+            ["r1", "is_bsj", str(exact[("backward", "is_r1_bsj")]), str(pred_counts["backward"]), format_rate(exact[("backward", "is_r1_bsj")], pred_counts["backward"])],
+            ["r2", "is_bsj", str(exact[("backward", "is_r2_bsj")]), str(pred_counts["backward"]), format_rate(exact[("backward", "is_r2_bsj")], pred_counts["backward"])],
             ["r1", "segment_set", str(exact[("backward", "r1_segment_set")]), str(pred_counts["backward"]), format_rate(exact[("backward", "r1_segment_set")], pred_counts["backward"])],
-            ["r1", "is_bsj", str(exact[("backward", "r1_is_bsj")]), str(pred_counts["backward"]), format_rate(exact[("backward", "r1_is_bsj")], pred_counts["backward"])],
             ["r2", "segment_set", str(exact[("backward", "r2_segment_set")]), str(pred_counts["backward"]), format_rate(exact[("backward", "r2_segment_set")], pred_counts["backward"])],
-            ["r2", "is_bsj", str(exact[("backward", "r2_is_bsj")]), str(pred_counts["backward"]), format_rate(exact[("backward", "r2_is_bsj")], pred_counts["backward"])],
+            ["r1", "segment_chain", str(exact[("backward", "r1_segment_chain")]), str(pred_counts["backward"]), format_rate(exact[("backward", "r1_segment_chain")], pred_counts["backward"])],
+            ["r2", "segment_chain", str(exact[("backward", "r2_segment_chain")]), str(pred_counts["backward"]), format_rate(exact[("backward", "r2_segment_chain")], pred_counts["backward"])],
+            ["r1", "junction_chain", str(exact[("backward", "r1_junction_chain")]), str(pred_counts["backward"]), format_rate(exact[("backward", "r1_junction_chain")], pred_counts["backward"])],
+            ["r2", "junction_chain", str(exact[("backward", "r2_junction_chain")]), str(pred_counts["backward"]), format_rate(exact[("backward", "r2_junction_chain")], pred_counts["backward"])],
+        ],
+    )
+
+    print_table(
+        f"BACKWARD_SEGMENT_ERRORS min_seg_len={args.min_seg_len}",
+        ["mate", "error_class", "count", "total", "rate"],
+        [
+            [
+                mate,
+                error_class,
+                str(segment_errors[("backward", mate, error_class)]),
+                str(pred_counts["backward"]),
+                format_rate(
+                    segment_errors[("backward", mate, error_class)],
+                    pred_counts["backward"],
+                ),
+            ]
+            for mate in MATE_NAMES
+            for error_class in SEGMENT_ERROR_CLASSES
         ],
     )
 
@@ -372,7 +659,9 @@ def main() -> None:
         for key in (
             [*PAIR_KEYS_BY_TYPE[pred_type]]
             + [f"{mate}_segment_set" for mate in MATE_NAMES]
-            + [f"{mate}_is_bsj" for mate in MATE_NAMES]
+            + [f"{mate}_segment_chain" for mate in MATE_NAMES]
+            + [f"{mate}_junction_chain" for mate in MATE_NAMES]
+            + [pred_mate_bsj_key(mate) for mate in MATE_NAMES]
         ):
             example_rows = examples.get((pred_type, key))
             if not example_rows:

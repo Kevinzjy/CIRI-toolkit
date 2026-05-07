@@ -6,7 +6,7 @@
 //! It is used to validate BSJ candidates against known transcript boundaries.
 
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 
@@ -32,8 +32,26 @@ pub struct Annotation {
     pub chr_exon_start_map: HashMap<String, String>,
     /// Maps from genomic coordinate string ("Chr\tEnd") to its exon metadata ("GeneID\tStrand").
     pub chr_exon_end_map: HashMap<String, String>,
+    /// Numeric exon-start lookup for post-Summary CIRI-AS boundary correction.
+    ///
+    /// Scan1/Scan2 keep using the Java-shaped string maps above for parity.
+    /// Segments reconstruction tests thousands of nearby splice-site candidates,
+    /// so it uses this side index to avoid formatting `"chr\tpos"` strings in
+    /// the hot loop.
+    pub chr_exon_start_index: HashMap<String, HashMap<i32, (String, char)>>,
+    /// Numeric exon-end lookup for post-Summary CIRI-AS boundary correction.
+    pub chr_exon_end_index: HashMap<String, HashMap<i32, (String, char)>>,
     /// Maps from Gene ID to a vector of its exons (as start and end pairs).
     pub gene_exon_map: HashMap<String, Vec<(i32, i32)>>,
+    /// Transcript-consistent introns keyed as `chr\tleft_exon_end\tright_exon_start\tstrand`.
+    ///
+    /// This is intentionally a side lookup rather than a replacement for the
+    /// Java-shaped exon-boundary maps above: CIRI3 parity paths still need the
+    /// boundary-only behavior, while CIRI-AS read-level segments can use adjacent
+    /// exon pairs from the same transcript to resolve ambiguous splice offsets.
+    pub transcript_splice_map: HashSet<String>,
+    /// Numeric transcript-consistent splice-pair index for CIRI-AS hot loops.
+    pub transcript_splice_index: HashMap<String, HashMap<char, HashSet<(i32, i32)>>>,
     /// Groups genes by chromosome with their outer exon span for Summary's
     /// exon/intron/intergenic fallback labeling.
     pub chr_gene_map: HashMap<String, Vec<GeneSpan>>,
@@ -45,7 +63,11 @@ impl Annotation {
         Self {
             chr_exon_start_map: HashMap::new(),
             chr_exon_end_map: HashMap::new(),
+            chr_exon_start_index: HashMap::new(),
+            chr_exon_end_index: HashMap::new(),
             gene_exon_map: HashMap::new(),
+            transcript_splice_map: HashSet::new(),
+            transcript_splice_index: HashMap::new(),
             chr_gene_map: HashMap::new(),
         }
     }
@@ -61,6 +83,8 @@ impl Annotation {
         let file = File::open(annotation_file)?;
         let reader = BufReader::new(file);
         let mut gene_bounds: HashMap<(String, String), (i32, i32)> = HashMap::new();
+        let mut transcript_exons: HashMap<(String, String), Vec<(i32, i32, String)>> =
+            HashMap::new();
         for line_res in reader.lines() {
             let line = line_res?;
             if line.starts_with('#') {
@@ -87,6 +111,11 @@ impl Annotation {
                 .and_then(|s| s.split('"').nth(1))
                 .unwrap_or("NA")
                 .to_string();
+            let transcript_id = attributes
+                .split(';')
+                .find(|s| s.trim().starts_with("transcript_id"))
+                .and_then(|s| s.split('"').nth(1))
+                .map(str::to_string);
 
             let gene_id_key = gene_id.clone();
             let start_key = format!("{}\t{}", chr, start);
@@ -95,10 +124,25 @@ impl Annotation {
 
             self.chr_exon_start_map.insert(start_key, value.clone());
             self.chr_exon_end_map.insert(end_key, value);
+            let strand_char = strand.chars().next().unwrap_or('?');
+            self.chr_exon_start_index
+                .entry(chr.to_string())
+                .or_default()
+                .insert(start, (gene_id_key.clone(), strand_char));
+            self.chr_exon_end_index
+                .entry(chr.to_string())
+                .or_default()
+                .insert(end, (gene_id_key.clone(), strand_char));
             self.gene_exon_map
                 .entry(gene_id)
                 .or_insert_with(Vec::new)
                 .push((start, end));
+            if let Some(transcript_id) = transcript_id {
+                transcript_exons
+                    .entry((chr.to_string(), transcript_id))
+                    .or_default()
+                    .push((start, end, strand.to_string()));
+            }
             let gene_key = (chr.to_string(), gene_id_key);
             gene_bounds
                 .entry(gene_key)
@@ -107,6 +151,27 @@ impl Annotation {
                     bounds.1 = bounds.1.max(end);
                 })
                 .or_insert((start, end));
+        }
+        self.transcript_splice_map.clear();
+        self.transcript_splice_index.clear();
+        for ((chr, _transcript_id), mut exons) in transcript_exons {
+            exons.sort_by_key(|(start, end, _strand)| (*start, *end));
+            for pair in exons.windows(2) {
+                let left = &pair[0];
+                let right = &pair[1];
+                if left.2 != right.2 {
+                    continue;
+                }
+                self.transcript_splice_map
+                    .insert(format!("{}\t{}\t{}\t{}", chr, left.1, right.0, left.2));
+                let strand = left.2.chars().next().unwrap_or('?');
+                self.transcript_splice_index
+                    .entry(chr.clone())
+                    .or_default()
+                    .entry(strand)
+                    .or_default()
+                    .insert((left.1, right.0));
+            }
         }
         self.chr_gene_map.clear();
         for ((chr, gene_id), (start, end)) in gene_bounds {

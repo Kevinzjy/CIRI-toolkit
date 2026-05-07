@@ -572,7 +572,21 @@ Score
 
 如果一开始就对着最终 `.out` 逐行肉眼 diff，效率很低，也容易把 Summary 问题误判成 Scan1/Scan2 问题。
 
-### 12.7 release 才是有效性能与真实流程口径
+### 12.7 CIRI3 不解析 XA/SA 字符串是明确边界
+
+Java CIRI3 的 Scan1 / Scan2 只消费已经 materialize 成 SAM/BAM record 的 alignment，不解析 `XA:Z` alternative，也不解析 `SA:Z` 字符串本身。因此在 parity 模式下，Rust 主流程必须保留这个边界：不能因为 `XA` 中存在更合理的本地替代，就改变 `.bsj1 / .bsj2 / Summary / .out` 的 BSJ 判定。
+
+这个边界同时也是一个已知算法缺陷。BWA-MEM 不做 splice-aware/circ-aware chain selection，可能把短 supplementary block 放到远端重复位点，而把更合理的本地替代只写在 `XA` 中。`sim:3966179` 是典型例子：R2 的远端 `chr1:90982 23M127H` 与 `XA:Z:chr1,-203745224,22M128S,0` 覆盖几乎同一 read slice；从 paired-end spanning 和 circRNA read-chain 角度，后者更合理，但 CIRI3 主流程不会使用它。
+
+当前项目的处理策略是分层：
+
+- CIRI3 parity 主流程继续不读取 aux tag；
+- `<prefix>.segments` post-Summary sidecar 可以使用 exact、read-slice-compatible 的 `XA` 替代来重排 read-level chain；
+- sidecar 会在 selected chain 的 `MAPQ=0` 原始 alignment record 上统一评估 linear / circular `XA` 替代，primary 和 supplementary 都可参与，多个 read blocks 可以联合替换；按 same strand、same read slice、query coverage 和更合理的 spanning size 选择 best chain；
+- best chain 若仍 circular/backward 则修正输出，若变成 linear-compatible 则拒绝 `type=backward`，例如 `sim:432652` / `sim:432594`；`XA` 的 `NM` 不作为 hard filter，也不参与排序，因为 RNA editing / mutation 可能让一个真实位置带有 mismatch；
+- 如果未来要把这类 XA-aware 逻辑推进到 Scan1 / Scan2，应作为非 parity 增强模式单独验证，不能混入 CIRI3-compatible 默认路径。
+
+### 12.8 release 才是有效性能与真实流程口径
 
 - 真实 SAM/BAM fixture、whole-genome parity 和性能观察都应使用 `--release`。
 - debug build 适合做局部单元调试，不适合拿来判断主流程耗时、候选密度或整体资源行为。

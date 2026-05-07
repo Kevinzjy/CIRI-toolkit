@@ -10,8 +10,8 @@ use crate::runtime::{
     emit_debug_line, emit_perf_line, scan2_profile_enabled, should_trace_read, with_trace_hg2_scope,
 };
 use crate::utils::{
-    bam_shard_count, bsj_is_summary_priority, bsj_payload_start, part_path, reverse_complement,
-    AlignmentRecord,
+    bam_shard_count, bsj_is_summary_priority, bsj_payload_start, clip_sequence_payload,
+    local_clip_evidence_lines, part_path, reverse_complement, AlignmentRecord,
 };
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -583,6 +583,33 @@ impl Scan2 {
         display_output_path: Option<&str>,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
+        self.run_with_display_and_segments(
+            sam_file,
+            output_bsj2,
+            output_fsj,
+            scan1_display_path,
+            display_output_path,
+            None,
+            chr_tcga_map,
+        )
+    }
+
+    /// Runs Scan2 while also writing a segments-evidence sidecar for rescued BSJ reads.
+    ///
+    /// The extra sidecar is independent from `.bsj2` and FSJ counting. It records
+    /// mapper alignment blocks for read groups with Scan2 BSJ evidence so the
+    /// post-Summary segments stage can reconstruct confirmed BSJ rows without
+    /// scanning the input alignment file again.
+    pub fn run_with_display_and_segments(
+        &mut self,
+        sam_file: &str,
+        output_bsj2: &str,
+        output_fsj: &str,
+        scan1_display_path: Option<&str>,
+        display_output_path: Option<&str>,
+        segments_output_path: Option<&str>,
+        chr_tcga_map: &HashMap<String, String>,
+    ) -> Result<()> {
         use crate::sam_bam::{detect_format, InputFormat};
         let display_scan2 = if let Some(scan1_path) = scan1_display_path {
             let mut helper =
@@ -599,6 +626,7 @@ impl Scan2 {
                 output_bsj2,
                 output_fsj,
                 display_output_path,
+                segments_output_path,
                 display_scan2.as_ref(),
                 chr_tcga_map,
             ),
@@ -607,6 +635,7 @@ impl Scan2 {
                 output_bsj2,
                 output_fsj,
                 display_output_path,
+                segments_output_path,
                 display_scan2.as_ref(),
                 chr_tcga_map,
             ),
@@ -625,7 +654,15 @@ impl Scan2 {
         output_fsj: &str,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
-        self.run_sam_with_display(sam_file, output_bsj2, output_fsj, None, None, chr_tcga_map)
+        self.run_sam_with_display(
+            sam_file,
+            output_bsj2,
+            output_fsj,
+            None,
+            None,
+            None,
+            chr_tcga_map,
+        )
     }
 
     fn run_sam_with_display(
@@ -634,6 +671,7 @@ impl Scan2 {
         output_bsj2: &str,
         output_fsj: &str,
         display_output_path: Option<&str>,
+        segments_output_path: Option<&str>,
         display_scan2: Option<&(Scan2, HashSet<String>)>,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
@@ -651,6 +689,7 @@ impl Scan2 {
         pb.set_message("");
         let shard_out = part_path(output_bsj2, 0);
         let display_shard_out = display_output_path.map(|path| part_path(path, 0));
+        let segments_shard_out = segments_output_path.map(|path| part_path(path, 0));
         let fsj_out = Self::shard_fsj_path(output_fsj, 0);
         self.process_sam_file_to_file(
             sam_file,
@@ -660,6 +699,7 @@ impl Scan2 {
             &fsj_out,
             display_scan2,
             display_shard_out.as_deref(),
+            segments_shard_out.as_deref(),
             profile_ref,
         )?;
 
@@ -679,6 +719,9 @@ impl Scan2 {
         }
         if let Some(path) = display_output_path {
             self.merge_display_shards(path, 1)?;
+        }
+        if let Some(path) = segments_output_path {
+            self.merge_segment_shards(path, 1)?;
         }
         result
     }
@@ -752,7 +795,15 @@ impl Scan2 {
         output_fsj: &str,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
-        self.run_bam_with_display(bam_file, output_bsj2, output_fsj, None, None, chr_tcga_map)
+        self.run_bam_with_display(
+            bam_file,
+            output_bsj2,
+            output_fsj,
+            None,
+            None,
+            None,
+            chr_tcga_map,
+        )
     }
 
     fn run_bam_with_display(
@@ -761,6 +812,7 @@ impl Scan2 {
         output_bsj2: &str,
         output_fsj: &str,
         display_output_path: Option<&str>,
+        segments_output_path: Option<&str>,
         display_scan2: Option<&(Scan2, HashSet<String>)>,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
@@ -807,6 +859,7 @@ impl Scan2 {
             };
             let shard_out = part_path(output_bsj2, i);
             let display_shard_out = display_output_path.map(|path| part_path(path, i));
+            let segments_shard_out = segments_output_path.map(|path| part_path(path, i));
             let fsj_out = Self::shard_fsj_path(output_fsj, i);
             self.process_bam_shard_to_file(
                 &mmap,
@@ -819,6 +872,7 @@ impl Scan2 {
                 &fsj_out,
                 display_scan2,
                 display_shard_out.as_deref(),
+                segments_shard_out.as_deref(),
                 profile_ref,
             )
         })?;
@@ -845,6 +899,9 @@ impl Scan2 {
         if let Some(path) = display_output_path {
             self.merge_display_shards(path, num_threads)?;
         }
+        if let Some(path) = segments_output_path {
+            self.merge_segment_shards(path, num_threads)?;
+        }
         result
     }
 
@@ -868,6 +925,86 @@ impl Scan2 {
         }
         writer.flush()?;
         Ok(())
+    }
+
+    /// Merges shard-local Scan2 segment-evidence sidecars in stable shard order.
+    ///
+    /// The merged file is not consumed by Summary. It is only a post-Summary
+    /// reconstruction input, so keeping it separate from `.bsj2` preserves the
+    /// CIRI3-compatible rescue/counting contract.
+    fn merge_segment_shards(&self, output_path: &str, num_threads: usize) -> Result<()> {
+        let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(output_path)?);
+        for i in 0..num_threads {
+            let shard_path = part_path(output_path, i);
+            if let Ok(shard_file) = File::open(&shard_path) {
+                let mut reader = BufReader::new(shard_file);
+                let mut line = String::new();
+                while reader.read_line(&mut line)? != 0 {
+                    writer.write_all(line.as_bytes())?;
+                    line.clear();
+                }
+            }
+            let _ = std::fs::remove_file(&shard_path);
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Formats read-group alignments for the Scan2 `<prefix>.segments2` sidecar.
+    ///
+    /// These rows intentionally mirror Scan1's sidecar protocol: raw mapper
+    /// blocks are captured only for read groups with Scan2 BSJ evidence, and the
+    /// post-Summary segments stage later applies circ confirmation, mate labels,
+    /// and chain-level CIGAR reconstruction.
+    fn segment_evidence_lines<'a>(
+        read_id: &str,
+        stage: &str,
+        alignments: &[AlignmentRecord<'a>],
+    ) -> Vec<String> {
+        let mut rows = Vec::new();
+        for aln in alignments {
+            if aln.chrom.as_ref() == "*" || aln.cigar.as_ref() == "*" {
+                continue;
+            }
+            let mate = if aln.flag & 0x40 != 0 { "R1" } else { "R2" };
+            let clips = clip_sequence_payload(aln.cigar.as_ref(), aln.seq.as_ref());
+            rows.push(format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                read_id,
+                stage,
+                mate,
+                aln.flag,
+                aln.chrom,
+                aln.pos,
+                aln.mapq,
+                aln.cigar,
+                aln.seq.len(),
+                clips
+            ));
+        }
+        rows
+    }
+
+    /// Formats mapper rows plus validator-accepted local clip pseudo rows.
+    fn segment_evidence_lines_with_local<'a>(
+        read_id: &str,
+        stage: &str,
+        local_stage: &str,
+        alignments: &[AlignmentRecord<'a>],
+        bsj_lines: &[String],
+        reference: &HashMap<String, String>,
+    ) -> Vec<String> {
+        let mut rows = Self::segment_evidence_lines(read_id, stage, alignments);
+        let refs: Vec<&AlignmentRecord<'_>> = alignments.iter().collect();
+        rows.extend(local_clip_evidence_lines(
+            read_id,
+            local_stage,
+            &refs,
+            bsj_lines,
+            reference,
+            10,
+        ));
+        rows
     }
 
     /// Builds a `(read_id, mate_label, legacy_payload)` key from a priority row.
@@ -907,10 +1044,16 @@ impl Scan2 {
         fsj_path: &str,
         display_scan2: Option<&(Scan2, HashSet<String>)>,
         display_out_path: Option<&str>,
+        segments_out_path: Option<&str>,
         profile: Option<&Scan2Profile>,
     ) -> Result<()> {
         let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
         let mut display_writer = if let Some(path) = display_out_path {
+            Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
+        } else {
+            None
+        };
+        let mut segments_writer = if let Some(path) = segments_out_path {
             Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
         } else {
             None
@@ -931,6 +1074,7 @@ impl Scan2 {
                 self.process_sam_group_batch_for_scan2(
                     &mut writer,
                     display_writer.as_mut(),
+                    segments_writer.as_mut(),
                     &mut batch,
                     &mut merged_fsj,
                     chr_tcga_map,
@@ -946,6 +1090,9 @@ impl Scan2 {
 
         writer.flush()?;
         if let Some(writer) = display_writer.as_mut() {
+            writer.flush()?;
+        }
+        if let Some(writer) = segments_writer.as_mut() {
             writer.flush()?;
         }
         Self::write_fsj_shard(fsj_path, &local_fsj)
@@ -1110,6 +1257,7 @@ impl Scan2 {
         &self,
         writer: &mut BufWriter<File>,
         mut display_writer: Option<&mut BufWriter<File>>,
+        mut segments_writer: Option<&mut BufWriter<File>>,
         batch: &mut Vec<SamOwnedScan2Group>,
         merged_fsj: &mut HashMap<String, i32>,
         chr_tcga_map: &HashMap<String, String>,
@@ -1117,7 +1265,7 @@ impl Scan2 {
         profile: Option<&Scan2Profile>,
     ) -> Result<()> {
         let groups = std::mem::take(batch);
-        let results: Vec<(Vec<String>, HashMap<String, i32>, Vec<String>)> = groups
+        let results: Vec<(Vec<String>, HashMap<String, i32>, Vec<String>, Vec<String>)> = groups
             .into_par_iter()
             .map(|owned| {
                 let mut local_lines = Vec::new();
@@ -1149,11 +1297,26 @@ impl Scan2 {
                 } else {
                     Vec::new()
                 };
-                (local_lines, local_fsj, display_lines)
+                let has_bsj = !local_lines.is_empty() || !display_lines.is_empty();
+                let evidence = if has_bsj {
+                    let mut bsj_lines = local_lines.clone();
+                    bsj_lines.extend(display_lines.iter().cloned());
+                    Self::segment_evidence_lines_with_local(
+                        &owned.read_id,
+                        "scan2",
+                        "scan2_local",
+                        &owned.alignments,
+                        &bsj_lines,
+                        chr_tcga_map,
+                    )
+                } else {
+                    Vec::new()
+                };
+                (local_lines, local_fsj, display_lines, evidence)
             })
             .collect();
 
-        for (lines, fsj_map, display_lines) in results {
+        for (lines, fsj_map, display_lines, evidence) in results {
             let main_keys: HashSet<String> = lines
                 .iter()
                 .filter_map(|line| Self::scan2_priority_key(line))
@@ -1179,6 +1342,11 @@ impl Scan2 {
             for (key, count) in fsj_map {
                 *merged_fsj.entry(key).or_insert(0) += count;
             }
+            if let Some(segments_writer) = segments_writer.as_deref_mut() {
+                for line in evidence {
+                    writeln!(segments_writer, "{}", line)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1200,12 +1368,18 @@ impl Scan2 {
         fsj_path: &str,
         display_scan2: Option<&(Scan2, HashSet<String>)>,
         display_out_path: Option<&str>,
+        segments_out_path: Option<&str>,
         profile: Option<&Scan2Profile>,
     ) -> Result<()> {
         use noodles::bam;
         let shard_started = profile.map(|_| Instant::now());
         let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
         let mut display_writer = if let Some(path) = display_out_path {
+            Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
+        } else {
+            None
+        };
+        let mut segments_writer = if let Some(path) = segments_out_path {
             Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
         } else {
             None
@@ -1334,17 +1508,22 @@ impl Scan2 {
                     for line in &res_batch {
                         writeln!(writer, "{}", line)?;
                     }
-                    if let (Some((display_helper, scan1_claims)), Some(display_validator)) =
-                        (display_scan2, display_validator.as_mut())
-                    {
-                        let display_lines = display_helper.process_group_view_display(
-                            &id_str,
-                            &alignments,
-                            &stand_map,
-                            scan1_claims,
-                            chr_tcga_map,
-                            display_validator,
-                        )?;
+                    let display_lines =
+                        if let (Some((display_helper, scan1_claims)), Some(display_validator)) =
+                            (display_scan2, display_validator.as_mut())
+                        {
+                            display_helper.process_group_view_display(
+                                &id_str,
+                                &alignments,
+                                &stand_map,
+                                scan1_claims,
+                                chr_tcga_map,
+                                display_validator,
+                            )?
+                        } else {
+                            Vec::new()
+                        };
+                    if !display_lines.is_empty() {
                         if let Some(display_writer) = display_writer.as_mut() {
                             for line in &display_lines {
                                 writeln!(display_writer, "{}", line)?;
@@ -1358,6 +1537,23 @@ impl Scan2 {
                                         writeln!(writer, "{}", priority_line)?;
                                     }
                                 }
+                            }
+                        }
+                    }
+                    if let Some(segments_writer) = segments_writer.as_mut() {
+                        let has_bsj = !res_batch.is_empty() || !display_lines.is_empty();
+                        if has_bsj {
+                            let mut bsj_lines = res_batch.clone();
+                            bsj_lines.extend(display_lines.iter().cloned());
+                            for line in Self::segment_evidence_lines_with_local(
+                                &id_str,
+                                "scan2",
+                                "scan2_local",
+                                &alignments,
+                                &bsj_lines,
+                                chr_tcga_map,
+                            ) {
+                                writeln!(segments_writer, "{}", line)?;
                             }
                         }
                     }
@@ -1467,17 +1663,22 @@ impl Scan2 {
             for line in &res_batch {
                 writeln!(writer, "{}", line)?;
             }
-            if let (Some((display_helper, scan1_claims)), Some(display_validator)) =
-                (display_scan2, display_validator.as_mut())
-            {
-                let display_lines = display_helper.process_group_view_display(
-                    &id_str,
-                    &alignments,
-                    &stand_map,
-                    scan1_claims,
-                    chr_tcga_map,
-                    display_validator,
-                )?;
+            let display_lines =
+                if let (Some((display_helper, scan1_claims)), Some(display_validator)) =
+                    (display_scan2, display_validator.as_mut())
+                {
+                    display_helper.process_group_view_display(
+                        &id_str,
+                        &alignments,
+                        &stand_map,
+                        scan1_claims,
+                        chr_tcga_map,
+                        display_validator,
+                    )?
+                } else {
+                    Vec::new()
+                };
+            if !display_lines.is_empty() {
                 if let Some(display_writer) = display_writer.as_mut() {
                     for line in &display_lines {
                         writeln!(display_writer, "{}", line)?;
@@ -1494,6 +1695,23 @@ impl Scan2 {
                     }
                 }
             }
+            if let Some(segments_writer) = segments_writer.as_mut() {
+                let has_bsj = !res_batch.is_empty() || !display_lines.is_empty();
+                if has_bsj {
+                    let mut bsj_lines = res_batch.clone();
+                    bsj_lines.extend(display_lines.iter().cloned());
+                    for line in Self::segment_evidence_lines_with_local(
+                        &id_str,
+                        "scan2",
+                        "scan2_local",
+                        &alignments,
+                        &bsj_lines,
+                        chr_tcga_map,
+                    ) {
+                        writeln!(segments_writer, "{}", line)?;
+                    }
+                }
+            }
             if let (Some(profile), Some(write_started)) = (profile, write_started) {
                 profile
                     .write_ns
@@ -1507,6 +1725,9 @@ impl Scan2 {
         writer.flush()?;
         if let Some(display_writer) = display_writer.as_mut() {
             display_writer.flush()?;
+        }
+        if let Some(segments_writer) = segments_writer.as_mut() {
+            segments_writer.flush()?;
         }
         if let (Some(profile), Some(shard_started)) = (profile, shard_started) {
             profile

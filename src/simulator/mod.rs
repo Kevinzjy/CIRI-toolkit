@@ -616,11 +616,13 @@ fn crosses_boundary(start: usize, len: usize, seq_len: usize) -> bool {
 
 /// Formats mate segments for one simulated read.
 ///
-/// The simulator truth now emits segments in genomic order rather than read
-/// order so the contract matches how SAM/BAM alignments are normally inspected.
-/// We still detect BSJ by traversing the simulated template in template order,
-/// but once the genomic segments are known they are written in ascending genomic
-/// coordinate order with the simulated source strand retained in each token.
+/// The simulator truth emits segments in read-chain order.
+///
+/// This preserves circRNA topology. A plus-strand BSJ read is represented as
+/// the circ-end-side source blocks followed by `<bsj>` and then the
+/// circ-start-side blocks; negative-strand isoforms use the transcript-oriented
+/// source map, so walking forward through `source_map` gives the comparable
+/// read-chain order after reverse-complement normalization.
 fn format_segments(
     source_map: &[SourceBase],
     strand: char,
@@ -684,55 +686,16 @@ fn format_segments(
     }
     flush_current(&mut segments, &mut current);
 
-    let text = if is_bsj {
-        let mut by_partition: Vec<Vec<SegmentToken>> = Vec::new();
-        let mut segments_by_partition = segments;
-        segments_by_partition
-            .sort_by_key(|segment| (segment.partition, segment.start, segment.end));
-        for segment in segments_by_partition {
-            while by_partition.len() <= segment.partition {
-                by_partition.push(Vec::new());
-            }
-            by_partition[segment.partition].push(segment);
+    let mut out = Vec::with_capacity(segments.len() + usize::from(is_bsj));
+    let mut previous_partition = None;
+    for segment in segments {
+        if previous_partition.is_some_and(|partition| partition != segment.partition) {
+            out.push("<bsj>".to_string());
         }
-        let mut ordered_groups: Vec<(usize, Vec<String>)> = by_partition
-            .into_iter()
-            .filter(|group| !group.is_empty())
-            .map(|group| {
-                let min_start = group
-                    .iter()
-                    .map(|segment| segment.start)
-                    .min()
-                    .unwrap_or(usize::MAX);
-                let tokens = group
-                    .into_iter()
-                    .map(|segment| format!("{}-{}:{strand}", segment.start, segment.end))
-                    .collect::<Vec<_>>();
-                (min_start, tokens)
-            })
-            .collect();
-        ordered_groups.sort_by_key(|(min_start, _)| *min_start);
-        ordered_groups
-            .into_iter()
-            .enumerate()
-            .flat_map(|(idx, (_, tokens))| {
-                let mut out = Vec::new();
-                if idx > 0 {
-                    out.push("<bsj>".to_string());
-                }
-                out.extend(tokens);
-                out
-            })
-            .collect::<Vec<_>>()
-            .join("|")
-    } else {
-        segments.sort_by_key(|segment| (segment.start, segment.end, segment.exon_idx));
-        segments
-            .into_iter()
-            .map(|segment| format!("{}-{}:{strand}", segment.start, segment.end))
-            .collect::<Vec<_>>()
-            .join("|")
-    };
+        out.push(format!("{}-{}:{strand}", segment.start, segment.end));
+        previous_partition = Some(segment.partition);
+    }
+    let text = out.join("|");
 
     MateSegments { text, is_bsj }
 }

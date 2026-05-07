@@ -3,33 +3,50 @@
 //! This module remains intentionally separate from `Scan1 -> Scan2 -> Summary`.
 //! The CIRI3 Rust path is parity-sensitive, so all circRNA internal-structure
 //! work stays in a post-Summary phase that consumes the final circRNA table and
-//! the original SAM/BAM alignments without feeding evidence back into BSJ
-//! detection. The current deliverable is `<prefix>.segments`: a read-level,
-//! splice-aware representation of BSJ and backward reads that can be compared
-//! directly against simulator truth before full-length path reconstruction is
-//! re-enabled on top of it.
+//! sidecar alignment evidence without feeding evidence back into BSJ detection.
+//! The current deliverable is `<prefix>.segments`: a read-level, splice-aware
+//! representation of confirmed BSJ reads that can be compared directly against
+//! simulator truth before full-length path reconstruction is re-enabled on top
+//! of it.
 
 use anyhow::{anyhow, bail, Context, Result};
 use noodles::bam;
+use noodles::sam::alignment::record::data::field::{Tag, Value};
+use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::time::Instant;
 
 use crate::annotation::Annotation;
 use crate::sam_bam::{detect_format, InputFormat};
-use crate::utils::reverse_complement;
+use crate::utils::{bsj_payload_start, is_bsj_mate_label, reverse_complement};
 
 const MIN_INTRON: i32 = 70;
 const MIN_EXON_LENGTH: i32 = 20;
 const MAX_EXON_LENGTH: i32 = 2000;
 const MAX_ISOFORM_PATHS_PER_CIRC: usize = 1024;
 const Z_ALPHA: f64 = 1.6449;
+const MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH: i32 = 10;
+const INTERNAL_SPLICE_CORRECTION_WINDOW: i32 = 4;
+const PARTIAL_LOCAL_SPLICE_CORRECTION_WINDOW: i32 = 16;
 const MAPQ_THRES: i32 = 5;
 const MAPQ_UNI: i32 = 0;
 const MAPQ_BOTH: i32 = 0;
 const STRINGENCY: usize = 1;
+/// Minimum selected XA anchor length accepted by the backward negative filter.
+const XA_REJECT_MIN_ANCHOR_LEN: i32 = MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH;
+/// Minimum span reduction required before XA can reject a backward sidecar row.
+const XA_REJECT_MIN_SPAN_REDUCTION: i32 = 1000;
+/// Read-coordinate tolerance for treating an XA hit as the same aligned slice.
+const XA_SEAMLESS_QUERY_TOLERANCE: i32 = 2;
+/// Maximum exact XA alternatives evaluated per selected alignment record.
+const XA_MAX_ALTERNATIVES_PER_RECORD: usize = 4;
+/// CIRI3 default `-Max/--max_span`; sidecar backward rows should not exceed the
+/// same circRNA spanning range when they are candidates for later graph work.
+const BACKWARD_MAX_SPAN: i32 = 200000;
 
 /// Runtime options for the post-Summary circRNA segments phase.
 ///
@@ -41,6 +58,20 @@ pub struct AsConfig<'a> {
     pub input_path: &'a str,
     /// Final CIRI3-style circRNA result table used as CIRI-AS `-C` input.
     pub circ_path: &'a str,
+    /// Final mate-level BSJ table written after Summary.
+    ///
+    /// This file contains both `priority=1` CIRI3-compatible evidence and
+    /// `priority=0` mate-level evidence. The segments phase uses it only as
+    /// post-Summary read/mate annotation; it never feeds these rows back into
+    /// Summary counts or circRNA discovery.
+    pub bsj_path: Option<&'a str>,
+    /// Scan1/Scan2 segment-evidence sidecars produced before Summary.
+    ///
+    /// When present, the segments phase reads these compact alignment dumps and
+    /// filters them by the final `.out` junction-read assignments. This avoids a
+    /// second BAM/SAM scan for confirmed BSJ reads while keeping the sidecar out
+    /// of Summary's parity-sensitive inputs.
+    pub segment_evidence_paths: Vec<&'a str>,
     /// Output prefix; the current phase writes `<prefix>.segments`.
     pub out_prefix: &'a str,
     /// In-memory reference sequence map loaded by the main CLI.
@@ -56,9 +87,10 @@ pub struct AsConfig<'a> {
 
 /// Compact alignment representation for CIRI-AS read-group matching.
 ///
-/// CIRI-AS only needs a subset of SAM fields. We keep sequence here because the
-/// original Perl stores it while normalizing read orientation, even though the
-/// current splice-junction stage does not consume the sequence after that point.
+/// CIRI-AS only needs a subset of SAM fields. `seq` stores the full read
+/// sequence in the legacy SAM/BAM sweep and the compact sidecar clip payload for
+/// auditability; the default sidecar path materializes validator-accepted local
+/// clips as pseudo-alignment rows before the post-Summary chain builder runs.
 #[derive(Debug, Clone)]
 struct AsAlignment {
     flag: i32,
@@ -67,14 +99,31 @@ struct AsAlignment {
     mapq: i32,
     cigar: String,
     seq: String,
+    from_local_clip: bool,
+    xa_alternatives: Vec<XaAlternative>,
+}
+
+/// One BWA `XA:Z` alternative alignment parsed for sidecar chain rejection.
+///
+/// CIRI3 parity code ignores optional tags. The segments sidecar uses XA only as
+/// a conservative negative signal: if a short ambiguous supplementary block can
+/// be placed by XA into a non-circular chain, the read should not be promoted to
+/// `type=backward` solely because BWA materialized a different equivalent hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct XaAlternative {
+    chr: String,
+    strand: char,
+    pos: i32,
+    cigar: String,
+    edit_distance: i32,
 }
 
 /// Read-level output row written to `<prefix>.segments`.
 ///
-/// This is the formal handoff format between the CIRI-AS-style second sweep and
-/// future full-length reconstruction. The current phase only emits `bsj` and
-/// `backward` rows, but the `type` column intentionally reserves `forward` for a
-/// later linear-compatible read phase.
+/// This is the formal handoff format between the CIRI-AS-style evidence capture
+/// and future full-length reconstruction. The current default CLI path emits
+/// confirmed `bsj` rows only; `backward` and `forward` remain supported by the
+/// internal builders for later extra-scan phases.
 struct SegmentRecord {
     read_id: String,
     type_name: &'static str,
@@ -84,11 +133,29 @@ struct SegmentRecord {
     end: String,
     strand: String,
     is_circular: usize,
-    is_bsj: usize,
+    is_r1_bsj: usize,
+    is_r2_bsj: usize,
+    r1_cigar: String,
     r1_segments: String,
-    r1_is_bsj: usize,
+    r2_cigar: String,
     r2_segments: String,
-    r2_is_bsj: usize,
+}
+
+/// One mate-level BSJ row parsed from the final `<prefix>.bsj` display file.
+///
+/// The final `.bsj` protocol can report both mates for one read. Keeping this
+/// sidecar evidence separate from `junction_read_to_circ` lets segments mark
+/// the R1/R2 mate that CIRI identified as a BSJ while preserving the Summary
+/// rule that only `priority=1` rows define `.out` junction read counts.
+#[derive(Debug, Clone)]
+struct MateBsjEvidence {
+    mate_bucket: usize,
+    chr: String,
+    start: i32,
+    end: i32,
+    strand: String,
+    priority: u8,
+    source_stage: String,
 }
 
 /// One genomic segment block in read order.
@@ -102,6 +169,7 @@ struct SegmentBlock {
     read_end: i32,
     ref_start: i32,
     ref_end: i32,
+    from_local_clip: bool,
 }
 
 /// One alignment record with CIGAR-derived blocks in read order.
@@ -129,6 +197,7 @@ struct MateChain {
     blocks: Vec<SegmentBlock>,
     token_spans: Vec<(i32, i32)>,
     tokens: Vec<String>,
+    cigar: String,
     is_bsj: bool,
     is_circular: bool,
     used_secondary: usize,
@@ -333,14 +402,16 @@ struct AsStats {
 
 /// Runs the post-Summary read-level circRNA segments phase.
 ///
-/// The recognition logic still follows the existing CIRI-AS-style second sweep:
-/// queryname-grouped reads are scanned, circ-local splice candidates are
-/// validated against motif/annotation support, and the resulting read classes are
-/// rendered into simulator-compatible segment chains. Full-length cirexon/path
-/// reconstruction remains in this module for future reuse but is not executed in
-/// the current phase.
+/// The default CLI path consumes Scan1/Scan2 sidecar evidence and filters it by
+/// Summary-confirmed junction reads, which avoids re-scanning BAM/SAM while
+/// preserving CIRI3 `.out` parity. If no sidecar paths are supplied, the older
+/// CIRI-AS-style second sweep remains available for focused development and
+/// tests; full-length cirexon/path reconstruction stays dormant in this module.
 pub fn run_ciri_as(config: AsConfig<'_>) -> Result<()> {
+    let profile = segments_profile_enabled();
+    let phase_started = profile.then(Instant::now);
     let (circ_records, junction_read_to_circ) = load_circ_records(config.circ_path)?;
+    log_segments_profile(profile, "load_circ_records", phase_started);
     if circ_records.is_empty() {
         bail!("No circRNAs were loaded from {}", config.circ_path);
     }
@@ -351,40 +422,103 @@ pub fn run_ciri_as(config: AsConfig<'_>) -> Result<()> {
         );
     }
 
-    let read_len = infer_read_length(config.input_path)?;
-    if read_len < 40 {
-        bail!(
-            "CIRI-AS requires paired reads with inferred read length >= 40, got {}",
-            read_len
-        );
-    }
-
+    let phase_started = profile.then(Instant::now);
+    let mate_bsj_evidence = if let Some(path) = config.bsj_path {
+        load_mate_bsj_evidence(path)?
+    } else {
+        HashMap::new()
+    };
+    log_segments_profile(profile, "load_mate_bsj_evidence", phase_started);
+    let phase_started = profile.then(Instant::now);
     let clusters = build_circ_clusters(&circ_records);
+    log_segments_profile(profile, "build_circ_clusters", phase_started);
+    let phase_started = profile.then(Instant::now);
+    let (segment_groups, read_len) = if config.segment_evidence_paths.is_empty() {
+        let read_len = infer_read_length(config.input_path)?;
+        if read_len < 40 {
+            bail!(
+                "CIRI-AS requires paired reads with inferred read length >= 40, got {}",
+                read_len
+            );
+        }
+        (HashMap::new(), read_len)
+    } else {
+        let (groups, read_len) =
+            load_segment_evidence(&config.segment_evidence_paths, &junction_read_to_circ)?;
+        if read_len < 40 {
+            bail!(
+                "segments sidecar read length must be >= 40 for CIRI-AS chain assembly, got {}",
+                read_len
+            );
+        }
+        (groups, read_len)
+    };
+    log_segments_profile(profile, "load_segment_evidence", phase_started);
+    let phase_started = profile.then(Instant::now);
     let mut state = ScanState {
         circ_by_id: circ_records
             .iter()
             .map(|r| (r.id.clone(), r.clone()))
             .collect(),
         junction_read_to_circ,
+        mate_bsj_evidence,
+        reference: config.reference,
+        annotation: config.annotation,
         clusters_by_chr: clusters_by_chr(clusters),
         read_len,
         candidates: Vec::new(),
         coverage: HashMap::new(),
         read_mappings: HashMap::new(),
         seen_junction_reads: HashSet::new(),
-        segment_groups: HashMap::new(),
+        segment_groups,
         stats: AsStats::default(),
     };
     state.stats.junction_reads_loaded = state.junction_read_to_circ.len();
+    log_segments_profile(profile, "build_scan_state", phase_started);
 
-    scan_alignment_groups(config.input_path, &mut state)?;
-    validate_splice_motifs(&mut state.candidates, config.reference, config.annotation)?;
-    state.stats.motif_validated = state.candidates.len();
-    state.stats.junction_reads_seen = state.seen_junction_reads.len();
-    let segments = build_segment_records(&state)?;
+    let phase_started = profile.then(Instant::now);
+    let segments = if config.segment_evidence_paths.is_empty() {
+        scan_alignment_groups(config.input_path, &mut state)?;
+        validate_splice_motifs(&mut state.candidates, config.reference, config.annotation)?;
+        state.stats.motif_validated = state.candidates.len();
+        state.stats.junction_reads_seen = state.seen_junction_reads.len();
+        build_segment_records(&state)?
+    } else {
+        let phase_started = profile.then(Instant::now);
+        scan_backward_alignment_groups(config.input_path, &mut state)?;
+        log_segments_profile(profile, "scan_backward_alignment_groups", phase_started);
+        let phase_started = profile.then(Instant::now);
+        validate_splice_motifs(&mut state.candidates, config.reference, config.annotation)?;
+        log_segments_profile(profile, "validate_backward_splice_motifs", phase_started);
+        state.stats.motif_validated = state.candidates.len();
+        state.stats.junction_reads_seen = state.segment_groups.len();
+        build_sidecar_segment_records(&state)?
+    };
+    log_segments_profile(profile, "build_segments", phase_started);
     state.stats.final_segments = segments.len();
+    let phase_started = profile.then(Instant::now);
     write_segments(&format!("{}.segments", config.out_prefix), &segments)?;
+    log_segments_profile(profile, "write_segments", phase_started);
     Ok(())
+}
+
+/// Returns whether segments-phase profiling is enabled.
+///
+/// This mirrors the existing `CIRI_PROFILE_SCAN1/2` convention: profiling is
+/// opt-in, has no effect on normal output, and is scoped to post-Summary
+/// sidecar reconstruction so CIRI3 parity logs remain stable by default.
+fn segments_profile_enabled() -> bool {
+    matches!(std::env::var("CIRI_PROFILE_SEGMENTS"), Ok(v) if !v.is_empty() && v != "0")
+}
+
+/// Prints one segments profiling phase when the opt-in switch is enabled.
+fn log_segments_profile(enabled: bool, label: &str, started: Option<Instant>) {
+    if let (true, Some(started)) = (enabled, started) {
+        eprintln!(
+            "[CIRI_PROFILE_SEGMENTS] {label}: {:.3}s",
+            started.elapsed().as_secs_f64()
+        );
+    }
 }
 
 /// Mutable state accumulated while scanning the original alignment file.
@@ -392,9 +526,12 @@ pub fn run_ciri_as(config: AsConfig<'_>) -> Result<()> {
 /// Perl stores these as package globals. Rust keeps them in one struct so later
 /// BAM parallelization can shard the scan and merge candidate/state fragments
 /// without changing the CIRI-AS decision routines themselves.
-struct ScanState {
+struct ScanState<'a> {
     circ_by_id: HashMap<String, CircRecord>,
     junction_read_to_circ: HashMap<String, String>,
+    mate_bsj_evidence: HashMap<String, Vec<MateBsjEvidence>>,
+    reference: &'a HashMap<String, String>,
+    annotation: Option<&'a Annotation>,
     clusters_by_chr: HashMap<String, Vec<CircCluster>>,
     read_len: i32,
     candidates: Vec<PositiveCandidate>,
@@ -404,6 +541,21 @@ struct ScanState {
     segment_groups: HashMap<String, Vec<AsAlignment>>,
     stats: AsStats,
 }
+
+/// Reference and annotation inputs used only when formatting read-level chains.
+///
+/// Keeping this context out of Scan1/Scan2 preserves CIRI3 parity: boundary
+/// correction changes only the final `<prefix>.segments` representation after a
+/// read has already been assigned to a confirmed circRNA.
+struct SegmentCorrectionContext<'a> {
+    reference: &'a HashMap<String, String>,
+    annotation: Option<&'a Annotation>,
+    junction_support: Option<&'a JunctionSupportMap>,
+}
+
+type JunctionSupportKey = (i32, i32, char);
+type JunctionSupportMap = HashMap<String, HashMap<JunctionSupportKey, usize>>;
+type JunctionSupportIndex = HashMap<String, HashMap<char, HashMap<i32, Vec<i32>>>>;
 
 /// Loads the CIRI3 Summary table and maps junction reads back to circRNAs.
 ///
@@ -478,6 +630,150 @@ fn load_circ_records(path: &str) -> Result<(Vec<CircRecord>, HashMap<String, Str
         });
     }
     Ok((records, read_to_circ))
+}
+
+/// Loads post-Summary mate-level BSJ evidence from the final `.bsj` display file.
+///
+/// New `.bsj` rows start with `read_id, mate_label, priority` before the legacy
+/// CIRI payload and end with `source_stage`. Historical rows without an explicit
+/// mate label are ignored here because `<prefix>.segments` needs R1/R2-specific
+/// evidence; Summary compatibility remains handled by the core pipeline.
+fn load_mate_bsj_evidence(path: &str) -> Result<HashMap<String, Vec<MateBsjEvidence>>> {
+    let file = File::open(path).with_context(|| format!("open BSJ evidence {}", path))?;
+    let reader = BufReader::new(file);
+    let mut out: HashMap<String, Vec<MateBsjEvidence>> = HashMap::new();
+    for line_res in reader.lines() {
+        let line = line_res?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        let payload_start = bsj_payload_start(&parts);
+        if payload_start != 3 || parts.len() < payload_start + 9 {
+            continue;
+        }
+        let Some(read_id) = parts.first().copied() else {
+            continue;
+        };
+        let mate_label = parts[1];
+        if !is_bsj_mate_label(mate_label) {
+            continue;
+        }
+        let priority = parts[2].parse::<u8>().unwrap_or(1);
+        let start = parts[payload_start + 3]
+            .parse::<i32>()
+            .with_context(|| format!("parse BSJ start from {}", line))?;
+        let end = parts[payload_start + 4]
+            .parse::<i32>()
+            .with_context(|| format!("parse BSJ end from {}", line))?;
+        out.entry(read_id.to_string())
+            .or_default()
+            .push(MateBsjEvidence {
+                mate_bucket: if mate_label == "R1" { 0 } else { 1 },
+                chr: parts[payload_start + 2].to_string(),
+                start,
+                end,
+                strand: parts[payload_start + 5].to_string(),
+                priority,
+                source_stage: parts.last().copied().unwrap_or("unknown").to_string(),
+            });
+    }
+    for rows in out.values_mut() {
+        rows.sort_by(|a, b| {
+            a.mate_bucket
+                .cmp(&b.mate_bucket)
+                .then_with(|| a.priority.cmp(&b.priority))
+                .then_with(|| a.source_stage.cmp(&b.source_stage))
+                .then_with(|| a.chr.cmp(&b.chr))
+                .then_with(|| a.start.cmp(&b.start))
+                .then_with(|| a.end.cmp(&b.end))
+        });
+    }
+    Ok(out)
+}
+
+/// Loads Scan1/Scan2 mapper-block evidence for Summary-confirmed BSJ reads.
+///
+/// The sidecar rows are deliberately compact:
+/// `read_id, stage, mate, flag, chrom, pos, mapq, cigar, read_len, clips`. Only
+/// `read_id` and the mapper fields are mandatory; `clips` stores compact
+/// `L:<seq>,R:<seq>` soft-clip subsequences for traceability, while accepted
+/// local clip placements arrive as normal-looking `scan*_local` pseudo rows.
+/// Duplicate mapper rows can appear when Scan1 and Scan2 both capture the same
+/// read group, so rows are de-duplicated before chain selection.
+fn load_segment_evidence(
+    paths: &[&str],
+    confirmed_reads: &HashMap<String, String>,
+) -> Result<(HashMap<String, Vec<AsAlignment>>, i32)> {
+    let mut groups: HashMap<String, Vec<AsAlignment>> = HashMap::new();
+    let mut seen = HashSet::new();
+    let mut read_len = 0_i32;
+    for path in paths {
+        let file = File::open(path).with_context(|| format!("open segment evidence {}", path))?;
+        let reader = BufReader::new(file);
+        for line_res in reader.lines() {
+            let line = line_res?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 9 {
+                continue;
+            }
+            let read_id = parts[0];
+            if !confirmed_reads.contains_key(read_id) {
+                continue;
+            }
+            let flag = parts[3]
+                .parse::<i32>()
+                .with_context(|| format!("parse segment evidence flag from {}", line))?;
+            let chrom = parts[4];
+            let pos = parts[5]
+                .parse::<i32>()
+                .with_context(|| format!("parse segment evidence position from {}", line))?;
+            let mapq = parts[6]
+                .parse::<i32>()
+                .with_context(|| format!("parse segment evidence MAPQ from {}", line))?;
+            let cigar = parts[7];
+            let row_read_len = parts[8]
+                .parse::<i32>()
+                .with_context(|| format!("parse segment evidence read length from {}", line))?;
+            read_len = read_len.max(row_read_len);
+            let seq = parts.get(9).copied().unwrap_or("*");
+            let key = format!("{read_id}\t{flag}\t{chrom}\t{pos}\t{mapq}\t{cigar}\t{seq}");
+            if !seen.insert(key) {
+                continue;
+            }
+            groups
+                .entry(read_id.to_string())
+                .or_default()
+                .push(AsAlignment {
+                    flag,
+                    chr: chrom.to_string(),
+                    pos,
+                    mapq,
+                    cigar: cigar.to_string(),
+                    seq: if seq == "*" {
+                        String::new()
+                    } else {
+                        seq.to_string()
+                    },
+                    from_local_clip: parts[1].contains("_local"),
+                    xa_alternatives: Vec::new(),
+                });
+        }
+    }
+    for records in groups.values_mut() {
+        records.sort_by(|a, b| {
+            mate_bucket(a.flag)
+                .cmp(&mate_bucket(b.flag))
+                .then_with(|| as_alignment_order_key(a).cmp(&as_alignment_order_key(b)))
+                .then_with(|| a.chr.cmp(&b.chr))
+                .then_with(|| a.pos.cmp(&b.pos))
+                .then_with(|| a.cigar.cmp(&b.cigar))
+        });
+    }
+    Ok((groups, read_len))
 }
 
 /// Builds CIRI-AS circRNA locus clusters.
@@ -582,6 +878,19 @@ fn scan_alignment_groups(path: &str, state: &mut ScanState) -> Result<()> {
     })
 }
 
+/// Scans only non-BSJ read groups for backward/circular candidates.
+///
+/// The default segments path already receives Summary-confirmed BSJ mapper
+/// blocks from Scan1/Scan2 sidecars. This pass deliberately skips those read IDs
+/// so it can supplement `<prefix>.segments` with `type=backward` rows without
+/// overwriting the richer BSJ sidecar evidence or changing Summary parity.
+fn scan_backward_alignment_groups(path: &str, state: &mut ScanState) -> Result<()> {
+    for_group_records(path, |read_id, records| {
+        process_backward_group(read_id, records, state)?;
+        Ok(false)
+    })
+}
+
 /// Iterates queryname-sorted alignment groups from either SAM or BAM.
 ///
 /// Both formats feed the same lightweight `AsAlignment` records so the CIRI-AS
@@ -630,6 +939,8 @@ where
         cols.next();
         cols.next();
         let seq = cols.next().unwrap_or("*").to_string();
+        cols.next();
+        let xa_alternatives = parse_xa_from_sam_fields(cols);
         group.push(AsAlignment {
             flag,
             chr,
@@ -637,6 +948,8 @@ where
             mapq,
             cigar,
             seq,
+            from_local_clip: false,
+            xa_alternatives,
         });
     }
     if !group.is_empty() {
@@ -705,6 +1018,7 @@ where
         for b in record.sequence().iter() {
             seq_buf.push(char::from(b));
         }
+        let xa_alternatives = parse_xa_from_bam_record(&record)?;
         group.push(AsAlignment {
             flag,
             chr,
@@ -712,6 +1026,8 @@ where
             mapq,
             cigar: cigar_buf.clone(),
             seq: seq_buf.clone(),
+            from_local_clip: false,
+            xa_alternatives,
         });
     }
     if !group.is_empty() {
@@ -719,6 +1035,65 @@ where
         on_group(&id, &group)?;
     }
     Ok(())
+}
+
+/// Parses `XA:Z` alternatives from raw SAM optional columns.
+///
+/// The parser intentionally accepts only BWA's four-field entries
+/// `chr,[+-]pos,cigar,NM;`. Malformed entries are ignored because XA is a
+/// sidecar-only negative signal and must never make alignment parsing fail.
+fn parse_xa_from_sam_fields<'a>(fields: impl Iterator<Item = &'a str>) -> Vec<XaAlternative> {
+    for field in fields {
+        if let Some(raw) = field.strip_prefix("XA:Z:") {
+            return parse_xa_tag(raw);
+        }
+    }
+    Vec::new()
+}
+
+/// Parses `XA:Z` alternatives from one BAM record.
+fn parse_xa_from_bam_record(record: &bam::Record) -> Result<Vec<XaAlternative>> {
+    let tag = Tag::new(b'X', b'A');
+    let data = record.data();
+    let Some(value) = data.get(&tag).transpose()? else {
+        return Ok(Vec::new());
+    };
+    let Value::String(raw) = value else {
+        return Ok(Vec::new());
+    };
+    let Ok(raw) = std::str::from_utf8(raw.as_ref()) else {
+        return Ok(Vec::new());
+    };
+    Ok(parse_xa_tag(raw))
+}
+
+/// Parses one BWA `XA:Z` payload into alternative alignment records.
+fn parse_xa_tag(raw: &str) -> Vec<XaAlternative> {
+    raw.split(';')
+        .filter_map(|entry| {
+            if entry.is_empty() {
+                return None;
+            }
+            let mut parts = entry.split(',');
+            let chr = parts.next()?.to_string();
+            let signed_pos = parts.next()?;
+            let mut chars = signed_pos.chars();
+            let strand = chars.next()?;
+            if !matches!(strand, '+' | '-') {
+                return None;
+            }
+            let pos = chars.as_str().parse::<i32>().ok()?.abs();
+            let cigar = parts.next()?.to_string();
+            let edit_distance = parts.next()?.parse::<i32>().ok()?;
+            Some(XaAlternative {
+                chr,
+                strand,
+                pos,
+                cigar,
+                edit_distance,
+            })
+        })
+        .collect()
 }
 
 /// Processes one queryname group through CIRI-AS known/non-known read paths.
@@ -738,6 +1113,31 @@ fn process_group(read_id: &str, records: &[AsAlignment], state: &mut ScanState) 
         state
             .segment_groups
             .insert(read_id.to_string(), records.to_vec());
+        mapping_check1(read_id, records, false, state)?;
+    }
+    Ok(())
+}
+
+/// Processes one non-BSJ read group for backward candidate discovery.
+///
+/// This is the sidecar-mode counterpart of the non-BSJ branch in
+/// `process_group`. Confirmed BSJ reads are skipped because their final chains
+/// must come from `.segments1/2`; non-BSJ groups are only retained when they
+/// overlap a confirmed circRNA cluster and produce CIRI-AS-style circular
+/// topology candidates.
+fn process_backward_group(
+    read_id: &str,
+    records: &[AsAlignment],
+    state: &mut ScanState,
+) -> Result<()> {
+    if records.is_empty() || state.junction_read_to_circ.contains_key(read_id) {
+        return Ok(());
+    }
+    if records.len() > 2 && overlaps_any_circ_cluster(records, state) {
+        state
+            .segment_groups
+            .entry(read_id.to_string())
+            .or_insert_with(|| records.to_vec());
         mapping_check1(read_id, records, false, state)?;
     }
     Ok(())
@@ -2719,6 +3119,11 @@ fn build_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
         .collect();
     let read_strand_hints = build_read_strand_hints(state);
     let read_junction_hints = build_read_junction_hints(state);
+    let correction = SegmentCorrectionContext {
+        reference: state.reference,
+        annotation: state.annotation,
+        junction_support: None,
+    };
     let mut read_ids: Vec<&str> = state.segment_groups.keys().map(String::as_str).collect();
     read_ids.sort_unstable();
 
@@ -2736,10 +3141,16 @@ fn build_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
                 read_id,
                 records,
                 circ,
+                state
+                    .mate_bsj_evidence
+                    .get(read_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
                 read_junction_hints
                     .get(read_id)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
+                Some(&correction),
                 state.read_len,
             ) {
                 out.push(record);
@@ -2753,13 +3164,373 @@ fn build_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
                     .get(read_id)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
+                Some(&correction),
                 state.read_len,
             ) {
                 out.push(record);
             }
         }
     }
+    sort_segment_records(&mut out);
     Ok(out)
+}
+
+/// Builds the default sidecar-mode `<prefix>.segments` rows.
+///
+/// Confirmed BSJ reads are materialized from Scan1/Scan2 sidecar alignments so
+/// the output keeps local clip pseudo rows captured during validation. Backward
+/// rows are appended from the supplemental non-BSJ scan and intentionally carry
+/// no circRNA assignment because the current stage has not run circRNA-level
+/// interval arbitration for them.
+fn build_sidecar_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
+    let mut out = build_confirmed_bsj_segment_records(state)?;
+    out.extend(build_backward_segment_records(state)?);
+    sort_segment_records(&mut out);
+    Ok(out)
+}
+
+/// Converts sidecar evidence into confirmed `type=bsj` segment rows only.
+///
+/// This is the default post-Summary path: Scan1/Scan2 have already captured
+/// mapper blocks for BSJ-supporting read groups, and `.out` supplies the final
+/// circRNA assignment. Backward/internal reads are deliberately excluded here
+/// because they require a later extra scan and must not be inferred from the
+/// CIRI3 Summary-only evidence set.
+fn build_confirmed_bsj_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
+    let profile = segments_profile_enabled();
+    let first_pass_correction = SegmentCorrectionContext {
+        reference: state.reference,
+        annotation: state.annotation,
+        junction_support: None,
+    };
+    let phase_started = profile.then(Instant::now);
+    let mut out =
+        build_confirmed_bsj_segment_records_with_correction(state, &first_pass_correction)?;
+    log_segments_profile(profile, "confirmed_bsj_first_pass", phase_started);
+    let phase_started = profile.then(Instant::now);
+    let junction_support = collect_junction_support(&out);
+    log_segments_profile(profile, "collect_junction_support", phase_started);
+    let phase_started = profile.then(Instant::now);
+    let junction_support_index = build_junction_support_index(&junction_support);
+    log_segments_profile(profile, "build_junction_support_index", phase_started);
+    let correction = SegmentCorrectionContext {
+        reference: state.reference,
+        annotation: state.annotation,
+        junction_support: Some(&junction_support),
+    };
+
+    let phase_started = profile.then(Instant::now);
+    let replacements: Vec<(usize, SegmentRecord)> = out
+        .par_iter()
+        .enumerate()
+        .filter_map(|(idx, record)| {
+            if !segment_record_has_supported_alternative(record, &junction_support_index) {
+                return None;
+            }
+            let read_id = record.read_id.as_str();
+            let records = state.segment_groups.get(read_id)?;
+            let circ_id = state.junction_read_to_circ.get(read_id)?;
+            let circ = state.circ_by_id.get(circ_id)?;
+            build_bsj_segment_record(
+                read_id,
+                records,
+                circ,
+                state
+                    .mate_bsj_evidence
+                    .get(read_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                &[],
+                Some(&correction),
+                state.read_len,
+            )
+            .map(|record| (idx, record))
+        })
+        .collect();
+    let ambiguous_records = replacements.len();
+    for (idx, record) in replacements {
+        out[idx] = record;
+    }
+    log_segments_profile(profile, "selective_second_pass", phase_started);
+    if profile {
+        eprintln!(
+            "[CIRI_PROFILE_SEGMENTS] selective_second_pass_records: {ambiguous_records}/{}",
+            out.len()
+        );
+    }
+    Ok(out)
+}
+
+/// Builds confirmed BSJ segment rows using one boundary-correction context.
+fn build_confirmed_bsj_segment_records_with_correction(
+    state: &ScanState,
+    correction: &SegmentCorrectionContext<'_>,
+) -> Result<Vec<SegmentRecord>> {
+    let mut read_ids: Vec<&str> = state
+        .junction_read_to_circ
+        .keys()
+        .map(String::as_str)
+        .collect();
+    read_ids.sort_unstable();
+    let records = read_ids
+        .par_iter()
+        .map(|read_id| -> Result<Option<SegmentRecord>> {
+            let Some(records) = state.segment_groups.get(*read_id) else {
+                return Ok(None);
+            };
+            let Some(circ_id) = state.junction_read_to_circ.get(*read_id) else {
+                return Ok(None);
+            };
+            let circ = state
+                .circ_by_id
+                .get(circ_id)
+                .ok_or_else(|| anyhow!("missing circ record {}", circ_id))?;
+            Ok(build_bsj_segment_record(
+                read_id,
+                records,
+                circ,
+                state
+                    .mate_bsj_evidence
+                    .get(*read_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                &[],
+                Some(correction),
+                state.read_len,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(records.into_iter().flatten().collect::<Vec<_>>())
+}
+
+/// Converts supplemental non-BSJ candidates into `type=backward` segment rows.
+///
+/// These reads do not have a reliable circRNA ID at this stage. The row-level
+/// topology and mate chains are still useful for downstream circRNA-level
+/// assembly, but assignment to a specific circRNA remains deferred.
+fn build_backward_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
+    let backward_ids: HashSet<&str> = state
+        .candidates
+        .iter()
+        .map(|candidate| candidate.read_id.as_str())
+        .filter(|read_id| !state.junction_read_to_circ.contains_key(*read_id))
+        .collect();
+    let read_strand_hints = build_read_strand_hints(state);
+    let read_junction_hints = build_read_junction_hints(state);
+    let correction = SegmentCorrectionContext {
+        reference: state.reference,
+        annotation: state.annotation,
+        junction_support: None,
+    };
+    let mut read_ids: Vec<&str> = backward_ids.into_iter().collect();
+    read_ids.sort_unstable();
+    let records = read_ids
+        .par_iter()
+        .filter_map(|read_id| {
+            let records = state.segment_groups.get(*read_id)?;
+            build_backward_segment_record(
+                *read_id,
+                records,
+                read_strand_hints.get(*read_id).copied().flatten(),
+                read_junction_hints
+                    .get(*read_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                Some(&correction),
+                state.read_len,
+            )
+        })
+        .collect();
+    Ok(records)
+}
+
+/// Counts preliminary non-BSJ junctions for support-aware boundary ranking.
+///
+/// The support map is built only from post-Summary `<prefix>.segments` rows, so
+/// it cannot change which reads are counted as BSJ evidence. It is used as a
+/// second-pass tie breaker when multiple nearby splice boundaries have comparable
+/// annotation or motif support.
+fn collect_junction_support(records: &[SegmentRecord]) -> JunctionSupportMap {
+    let mut support = HashMap::new();
+    for record in records {
+        collect_junction_support_from_segments(&record.chrom, &record.r1_segments, &mut support);
+        collect_junction_support_from_segments(&record.chrom, &record.r2_segments, &mut support);
+    }
+    support
+}
+
+/// Adds retained read-chain `N` junctions from one mate's segment string.
+fn collect_junction_support_from_segments(
+    chrom: &str,
+    segments: &str,
+    support: &mut JunctionSupportMap,
+) {
+    let mut previous: Option<(i32, i32, char)> = None;
+    let mut pending_bsj = false;
+    for token in segments.split('|') {
+        if token == "<bsj>" {
+            pending_bsj = previous.is_some();
+            continue;
+        }
+        let Some((start, end, strand)) = parse_segment_token(token) else {
+            pending_bsj = false;
+            continue;
+        };
+        if end - start + 1 < MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH {
+            continue;
+        }
+        if let Some((prev_start, prev_end, prev_strand)) = previous {
+            if !pending_bsj && prev_strand == strand {
+                let (site2, site1) = if prev_start <= start {
+                    (prev_end, start)
+                } else {
+                    (end, prev_start)
+                };
+                *support
+                    .entry(chrom.to_string())
+                    .or_default()
+                    .entry((site2, site1, strand))
+                    .or_insert(0) += 1;
+            }
+        }
+        previous = Some((start, end, strand));
+        pending_bsj = false;
+    }
+}
+
+/// Builds a sparse lookup for finding nearby supported junction alternatives.
+///
+/// The ranking path still needs exact `(end, start, strand)` counts, so the
+/// support map above remains authoritative. This auxiliary index avoids scanning
+/// every coordinate inside a correction window for every confirmed BSJ read.
+fn build_junction_support_index(support: &JunctionSupportMap) -> JunctionSupportIndex {
+    let mut index = HashMap::new();
+    for (chrom, chrom_support) in support {
+        let chrom_index = index.entry(chrom.clone()).or_insert_with(HashMap::new);
+        for (&(end, start, strand), &count) in chrom_support {
+            if count == 0 {
+                continue;
+            }
+            chrom_index
+                .entry(strand)
+                .or_insert_with(HashMap::new)
+                .entry(end)
+                .or_insert_with(Vec::new)
+                .push(start);
+        }
+    }
+    index
+}
+
+/// Tests whether preliminary segments have a nearby supported splice alternative.
+///
+/// The first pass already applies annotation and motif correction. A support
+/// aware rebuild is only useful when another preliminary BSJ read supports a
+/// different internal `N` boundary near the current one. This keeps the second
+/// pass focused on ambiguous internal splice sites instead of materializing all
+/// confirmed BSJ reads twice.
+fn segment_record_has_supported_alternative(
+    record: &SegmentRecord,
+    support: &JunctionSupportIndex,
+) -> bool {
+    let Some(chrom_support) = support.get(&record.chrom) else {
+        return false;
+    };
+    segments_have_supported_alternative(&record.r1_segments, chrom_support)
+        || segments_have_supported_alternative(&record.r2_segments, chrom_support)
+}
+
+/// Scans one mate's read-chain segments for nearby non-BSJ supported alternatives.
+fn segments_have_supported_alternative(
+    segments: &str,
+    chrom_support: &HashMap<char, HashMap<i32, Vec<i32>>>,
+) -> bool {
+    let mut previous: Option<(i32, i32, char)> = None;
+    let mut pending_bsj = false;
+    for token in segments.split('|') {
+        if token == "<bsj>" {
+            pending_bsj = previous.is_some();
+            continue;
+        }
+        let Some((start, end, strand)) = parse_segment_token(token) else {
+            previous = None;
+            pending_bsj = false;
+            continue;
+        };
+        if let Some((prev_start, prev_end, prev_strand)) = previous {
+            if !pending_bsj && prev_strand == strand {
+                let (left_start, left_end, right_start, right_end) = if prev_start <= start {
+                    (prev_start, prev_end, start, end)
+                } else {
+                    (start, end, prev_start, prev_end)
+                };
+                let left_len = left_end - left_start + 1;
+                let right_len = right_end - right_start + 1;
+                if supported_alternative_near_junction(
+                    left_end,
+                    right_start,
+                    left_len,
+                    right_len,
+                    strand,
+                    chrom_support,
+                ) {
+                    return true;
+                }
+            }
+        }
+        previous = Some((start, end, strand));
+        pending_bsj = false;
+    }
+    false
+}
+
+/// Looks for a different supported junction in the correction search window.
+fn supported_alternative_near_junction(
+    current_end: i32,
+    current_start: i32,
+    left_len: i32,
+    right_len: i32,
+    strand: char,
+    chrom_support: &HashMap<char, HashMap<i32, Vec<i32>>>,
+) -> bool {
+    let Some(strand_support) = chrom_support.get(&strand) else {
+        return false;
+    };
+    let base_window = if left_len <= MIN_EXON_LENGTH || right_len <= MIN_EXON_LENGTH {
+        PARTIAL_LOCAL_SPLICE_CORRECTION_WINDOW
+    } else {
+        INTERNAL_SPLICE_CORRECTION_WINDOW
+    };
+    // The preliminary pass may already have moved one side by `base_window`.
+    // Doubling the lookup window keeps the selective second pass accurate while
+    // materialization itself now runs in parallel, so this broader prefilter is
+    // no longer the dominant cost.
+    let search_window = base_window * 2;
+    for end in current_end - search_window..=current_end + search_window {
+        let Some(starts) = strand_support.get(&end) else {
+            continue;
+        };
+        for &start in starts {
+            if end == current_end && start == current_start {
+                continue;
+            }
+            if start < current_start - search_window || start > current_start + search_window {
+                continue;
+            }
+            if end < start {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Parses one `start-end:strand` segment token.
+fn parse_segment_token(token: &str) -> Option<(i32, i32, char)> {
+    let (range, strand_text) = token.rsplit_once(':')?;
+    let (start, end) = range.split_once('-')?;
+    let strand = strand_text.chars().next()?;
+    Some((start.parse().ok()?, end.parse().ok()?, strand))
 }
 
 /// Builds one `type=bsj` output row.
@@ -2767,7 +3538,9 @@ fn build_bsj_segment_record(
     read_id: &str,
     records: &[AsAlignment],
     circ: &CircRecord,
+    mate_bsj_evidence: &[MateBsjEvidence],
     junction_hints: &[(i32, i32)],
+    correction: Option<&SegmentCorrectionContext<'_>>,
     read_len: i32,
 ) -> Option<SegmentRecord> {
     let token_strand = circ
@@ -2776,19 +3549,21 @@ fn build_bsj_segment_record(
         .next()
         .filter(|strand| matches!(strand, '+' | '-'))
         .unwrap_or('?');
-    let chains = build_pair_chains(
+    let mut chains = build_pair_chains(
         records,
         read_len,
         Some(circ),
         "bsj",
         token_strand,
         junction_hints,
+        correction,
     );
+    apply_mate_bsj_evidence(&mut chains, mate_bsj_evidence, circ);
     if chains[0].is_none() && chains[1].is_none() {
         return None;
     }
-    let (r1_segments, r1_is_bsj) = chain_text(chains[0].as_ref());
-    let (r2_segments, r2_is_bsj) = chain_text(chains[1].as_ref());
+    let (r1_segments, r1_cigar, is_r1_bsj) = chain_text(chains[0].as_ref());
+    let (r2_segments, r2_cigar, is_r2_bsj) = chain_text(chains[1].as_ref());
     Some(SegmentRecord {
         read_id: read_id.to_string(),
         type_name: "bsj",
@@ -2798,11 +3573,12 @@ fn build_bsj_segment_record(
         end: circ.end.to_string(),
         strand: circ.strand.clone(),
         is_circular: 1,
-        is_bsj: 1,
+        is_r1_bsj,
+        is_r2_bsj,
+        r1_cigar,
         r1_segments,
-        r1_is_bsj,
+        r2_cigar,
         r2_segments,
-        r2_is_bsj,
     })
 }
 
@@ -2812,17 +3588,40 @@ fn build_backward_segment_record(
     records: &[AsAlignment],
     inferred_strand: Option<char>,
     junction_hints: &[(i32, i32)],
+    correction: Option<&SegmentCorrectionContext<'_>>,
     read_len: i32,
 ) -> Option<SegmentRecord> {
     let token_strand = inferred_strand.unwrap_or('?');
-    let chains = build_pair_chains(
+    let mut chains = build_pair_chains(
         records,
         read_len,
         None,
         "backward",
         token_strand,
         junction_hints,
+        correction,
     );
+    let is_initial_circular = usize::from(
+        chains
+            .iter()
+            .flatten()
+            .any(|chain| chain.is_circular && !chain.is_bsj),
+    );
+    if is_initial_circular == 0 {
+        return None;
+    }
+    match resolve_backward_records_by_xa(
+        records,
+        &chains,
+        read_len,
+        token_strand,
+        junction_hints,
+        correction,
+    ) {
+        XaBackwardResolution::Keep => {}
+        XaBackwardResolution::Reject => return None,
+        XaBackwardResolution::Repair(repaired_chains) => chains = repaired_chains,
+    }
     let is_circular = usize::from(
         chains
             .iter()
@@ -2832,24 +3631,463 @@ fn build_backward_segment_record(
     if is_circular == 0 {
         return None;
     }
-    let (chrom, start, end, strand) = summarize_non_bsj_context(&chains);
-    let (r1_segments, r1_is_bsj) = chain_text(chains[0].as_ref());
-    let (r2_segments, r2_is_bsj) = chain_text(chains[1].as_ref());
+    let chrom = selected_chain_chrom(&chains)?;
+    let (span_start, span_end) = selected_chain_span(&chains)?;
+    if span_end - span_start + 1 > BACKWARD_MAX_SPAN {
+        return None;
+    }
+    let (r1_segments, r1_cigar, _) = chain_text(chains[0].as_ref());
+    let (r2_segments, r2_cigar, _) = chain_text(chains[1].as_ref());
     Some(SegmentRecord {
         read_id: read_id.to_string(),
         type_name: "backward",
         circ_id: "NA".to_string(),
         chrom,
-        start,
-        end,
-        strand,
+        start: span_start.to_string(),
+        end: span_end.to_string(),
+        strand: "NA".to_string(),
         is_circular,
-        is_bsj: 0,
+        is_r1_bsj: 0,
+        is_r2_bsj: 0,
+        r1_cigar,
         r1_segments,
-        r1_is_bsj,
+        r2_cigar,
         r2_segments,
-        r2_is_bsj,
     })
+}
+
+/// Result of topology-neutral XA selection for a candidate backward read.
+enum XaBackwardResolution {
+    Keep,
+    Repair([Option<MateChain>; 2]),
+    Reject,
+}
+
+/// Resolves weak backward chains by ranking seamless XA alternatives first.
+///
+/// BWA-MEM emits `XA` alternatives without splice-aware context. For segments
+/// sidecar output we can safely compare read-slice-compatible XA hits before
+/// applying the max-span guard. The ranking is topology-neutral and does not use
+/// XA edit distance: linear and circular replacements compete by strand/query
+/// compatibility and genomic spanning size first, then the selected best chain
+/// decides whether the read is still a `type=backward` row. This keeps CIRI3
+/// Scan1/Scan2 parity untouched while handling both `sim:3966179`-style
+/// circular repair and `sim:432652`-style linear rejection.
+fn resolve_backward_records_by_xa(
+    records: &[AsAlignment],
+    chains: &[Option<MateChain>; 2],
+    read_len: i32,
+    token_strand: char,
+    junction_hints: &[(i32, i32)],
+    correction: Option<&SegmentCorrectionContext<'_>>,
+) -> XaBackwardResolution {
+    let Some(current_rank) = xa_alignment_rank(chains) else {
+        return XaBackwardResolution::Keep;
+    };
+    let Some((current_start, current_end)) = selected_chain_span(chains) else {
+        return XaBackwardResolution::Keep;
+    };
+    let current_span = current_end - current_start + 1;
+    let current_coverage = selected_chain_query_coverage(chains);
+    let candidate_sets = xa_candidate_sets(records, chains, read_len);
+    if candidate_sets.is_empty() {
+        return XaBackwardResolution::Keep;
+    }
+
+    let mut best: Option<((i32, i32, i32, i32, i32), [Option<MateChain>; 2])> = None;
+    let mut candidate_records = records.to_vec();
+    enumerate_xa_candidate_sets(
+        records,
+        &candidate_sets,
+        0,
+        &mut candidate_records,
+        read_len,
+        token_strand,
+        junction_hints,
+        correction,
+        current_span,
+        current_coverage,
+        current_rank,
+        &mut best,
+    );
+
+    if let Some((_, best_chains)) = best {
+        if chain_has_backward_topology(&best_chains) {
+            XaBackwardResolution::Repair(best_chains)
+        } else {
+            XaBackwardResolution::Reject
+        }
+    } else {
+        XaBackwardResolution::Keep
+    }
+}
+
+/// One selected alignment plus its seamless XA replacements.
+struct XaCandidateSet {
+    record_index: usize,
+    alternatives: Vec<AsAlignment>,
+}
+
+/// Builds XA choices from all selected MAPQ=0 records, not only supplementary ones.
+///
+/// Some BWA-MEM records keep the more local splice-aware placement as `XA` on a
+/// primary MAPQ=0 record. Restricting the sidecar to supplementary records leaves
+/// false backward rows such as `sim:4599148`; therefore every selected low-MAPQ
+/// record used by the current chain can contribute exact same-slice alternatives.
+fn xa_candidate_sets(
+    records: &[AsAlignment],
+    chains: &[Option<MateChain>; 2],
+    read_len: i32,
+) -> Vec<XaCandidateSet> {
+    records
+        .iter()
+        .enumerate()
+        .filter_map(|(record_index, record)| {
+            if !ambiguous_alignment_with_xa(record, read_len)
+                || !chains_use_record_as_backward(chains, record, read_len)
+            {
+                return None;
+            }
+            let alternatives: Vec<AsAlignment> = record
+                .xa_alternatives
+                .iter()
+                .filter(|alternative| xa_replacement_is_seamless(record, alternative, read_len))
+                .take(XA_MAX_ALTERNATIVES_PER_RECORD)
+                .map(|alternative| alignment_from_xa(record, alternative))
+                .collect();
+            (!alternatives.is_empty()).then_some(XaCandidateSet {
+                record_index,
+                alternatives,
+            })
+        })
+        .collect()
+}
+
+/// Enumerates joint XA replacements across selected records.
+///
+/// Greedy single-record replacement misses cases where R1 and R2 each carry one
+/// remote equivalent hit: replacing either record alone does not reduce the
+/// pair-level span, but replacing both reveals a linear local interpretation.
+fn enumerate_xa_candidate_sets(
+    original_records: &[AsAlignment],
+    candidate_sets: &[XaCandidateSet],
+    set_idx: usize,
+    candidate_records: &mut Vec<AsAlignment>,
+    read_len: i32,
+    token_strand: char,
+    junction_hints: &[(i32, i32)],
+    correction: Option<&SegmentCorrectionContext<'_>>,
+    current_span: i32,
+    current_coverage: i32,
+    current_rank: (i32, i32, i32, i32, i32),
+    best: &mut Option<((i32, i32, i32, i32, i32), [Option<MateChain>; 2])>,
+) {
+    if set_idx == candidate_sets.len() {
+        if candidate_records
+            .iter()
+            .zip(original_records.iter())
+            .all(|(candidate, original)| {
+                candidate.pos == original.pos
+                    && candidate.flag == original.flag
+                    && candidate.cigar == original.cigar
+                    && candidate.chr == original.chr
+            })
+        {
+            return;
+        }
+        let candidate_chains = build_pair_chains(
+            candidate_records,
+            read_len,
+            None,
+            "backward",
+            token_strand,
+            junction_hints,
+            correction,
+        );
+        if selected_chain_query_coverage(&candidate_chains)
+            < current_coverage - XA_SEAMLESS_QUERY_TOLERANCE
+        {
+            return;
+        }
+        let Some((candidate_start, candidate_end)) = selected_chain_span(&candidate_chains) else {
+            return;
+        };
+        let candidate_span = candidate_end - candidate_start + 1;
+        if current_span - candidate_span < XA_REJECT_MIN_SPAN_REDUCTION {
+            return;
+        }
+        let Some(rank) = xa_alignment_rank(&candidate_chains) else {
+            return;
+        };
+        if rank <= current_rank {
+            return;
+        }
+        if best.as_ref().is_none_or(|(best_rank, _)| rank > *best_rank) {
+            *best = Some((rank, candidate_chains));
+        }
+        return;
+    }
+
+    let candidate_set = &candidate_sets[set_idx];
+    enumerate_xa_candidate_sets(
+        original_records,
+        candidate_sets,
+        set_idx + 1,
+        candidate_records,
+        read_len,
+        token_strand,
+        junction_hints,
+        correction,
+        current_span,
+        current_coverage,
+        current_rank,
+        best,
+    );
+    let original = candidate_records[candidate_set.record_index].clone();
+    for alternative in &candidate_set.alternatives {
+        candidate_records[candidate_set.record_index] = alternative.clone();
+        enumerate_xa_candidate_sets(
+            original_records,
+            candidate_sets,
+            set_idx + 1,
+            candidate_records,
+            read_len,
+            token_strand,
+            junction_hints,
+            correction,
+            current_span,
+            current_coverage,
+            current_rank,
+            best,
+        );
+    }
+    candidate_records[candidate_set.record_index] = original;
+}
+
+/// Ranks one XA-derived alignment interpretation without using topology.
+///
+/// Exact same-slice XA hits are alternative mapper placements, so the sidecar
+/// first asks which placement is the most compatible with the read pair's
+/// genomic span. Topology is intentionally excluded here; the caller handles a
+/// linear best chain by dropping the `type=backward` row.
+fn xa_alignment_rank(chains: &[Option<MateChain>; 2]) -> Option<(i32, i32, i32, i32, i32)> {
+    selected_chain_chrom(chains)?;
+    let (start, end) = selected_chain_span(chains)?;
+    let span = end - start + 1;
+    let used_supplementary: usize = chains
+        .iter()
+        .flatten()
+        .map(|chain| chain.used_supplementary)
+        .sum();
+    let used_secondary: usize = chains
+        .iter()
+        .flatten()
+        .map(|chain| chain.used_secondary)
+        .sum();
+    Some((
+        i32::from(span <= BACKWARD_MAX_SPAN),
+        -span,
+        selected_chain_query_coverage(chains),
+        -(used_supplementary as i32),
+        -(used_secondary as i32),
+    ))
+}
+
+/// Returns whether any selected mate chain still supports backward topology.
+fn chain_has_backward_topology(chains: &[Option<MateChain>; 2]) -> bool {
+    chains
+        .iter()
+        .flatten()
+        .any(|chain| chain.is_circular && !chain.is_bsj)
+}
+
+/// Returns whether the selected backward chain currently uses this alignment.
+fn chains_use_record_as_backward(
+    chains: &[Option<MateChain>; 2],
+    record: &AsAlignment,
+    read_len: i32,
+) -> bool {
+    if !chains
+        .iter()
+        .flatten()
+        .any(|chain| chain.is_circular && !chain.is_bsj)
+    {
+        return false;
+    }
+    chains
+        .iter()
+        .flatten()
+        .any(|chain| chain_uses_record(chain, record, read_len))
+}
+
+/// Identifies ambiguous alignments that should not define backward alone.
+///
+/// The CIRI3 parity path does not inspect XA tags, but this sidecar resolver
+/// uses them to choose a better read-level chain. We require a minimum mapped
+/// anchor so tiny clips do not drive the decision, and deliberately avoid a
+/// maximum anchor length because exact XA alternatives can also explain longer
+/// repetitive supplementary blocks.
+fn ambiguous_alignment_with_xa(record: &AsAlignment, read_len: i32) -> bool {
+    if record.xa_alternatives.is_empty() || record.from_local_clip || record.mapq != 0 {
+        return false;
+    }
+    alignment_mapped_len(record, read_len).is_some_and(|len| len >= XA_REJECT_MIN_ANCHOR_LEN)
+}
+
+/// Tests whether an XA hit can replace the same read slice as one SAM record.
+///
+/// The replacement is intentionally strict: it must stay on the same alignment
+/// strand, parse into the same number of blocks, and cover nearly the same
+/// query coordinates. BWA already marked these as alternatives, but this
+/// read-slice check keeps the sidecar from swapping unrelated clipped pieces.
+fn xa_replacement_is_seamless(
+    record: &AsAlignment,
+    alternative: &XaAlternative,
+    read_len: i32,
+) -> bool {
+    if alternative.strand != strand_char(record.flag) {
+        return false;
+    }
+    let alt_record = alignment_from_xa(record, alternative);
+    let Some(source_blocks) = parse_alignment_blocks(record, read_len) else {
+        return false;
+    };
+    let Some(alt_blocks) = parse_alignment_blocks(&alt_record, read_len) else {
+        return false;
+    };
+    if source_blocks.len() != alt_blocks.len() {
+        return false;
+    }
+    source_blocks
+        .iter()
+        .zip(alt_blocks.iter())
+        .all(|(source, alt)| {
+            (source.read_start - alt.read_start).abs() <= XA_SEAMLESS_QUERY_TOLERANCE
+                && (source.read_end - alt.read_end).abs() <= XA_SEAMLESS_QUERY_TOLERANCE
+                && (source.read_end - source.read_start + 1) >= XA_REJECT_MIN_ANCHOR_LEN
+                && (alt.read_end - alt.read_start + 1) >= XA_REJECT_MIN_ANCHOR_LEN
+        })
+}
+
+/// Returns whether a selected chain contains one block from the source record.
+fn chain_uses_record(chain: &MateChain, record: &AsAlignment, read_len: i32) -> bool {
+    let Some(blocks) = parse_alignment_blocks(record, read_len) else {
+        return false;
+    };
+    blocks.iter().any(|source| {
+        chain.blocks.iter().any(|selected| {
+            source.read_start == selected.read_start
+                && source.read_end == selected.read_end
+                && source.ref_start <= selected.ref_end
+                && selected.ref_start <= source.ref_end
+        })
+    })
+}
+
+/// Returns total selected query coverage across both mates.
+fn selected_chain_query_coverage(chains: &[Option<MateChain>; 2]) -> i32 {
+    chains
+        .iter()
+        .flatten()
+        .map(|chain| chain.query_coverage)
+        .sum()
+}
+
+/// Returns the aligned query length represented by one record.
+fn alignment_mapped_len(record: &AsAlignment, read_len: i32) -> Option<i32> {
+    parse_alignment_blocks(record, read_len).map(|blocks| {
+        blocks
+            .iter()
+            .map(|block| block.read_end - block.read_start + 1)
+            .sum()
+    })
+}
+
+/// Converts a BWA XA hit into an alternative alignment for sidecar ranking.
+fn alignment_from_xa(record: &AsAlignment, alternative: &XaAlternative) -> AsAlignment {
+    let mut flag = record.flag;
+    if alternative.strand == '-' {
+        flag |= 0x10;
+    } else {
+        flag &= !0x10;
+    }
+    AsAlignment {
+        flag,
+        chr: alternative.chr.clone(),
+        pos: alternative.pos,
+        mapq: 0,
+        cigar: alternative.cigar.clone(),
+        seq: record.seq.clone(),
+        from_local_clip: false,
+        xa_alternatives: Vec::new(),
+    }
+}
+
+/// Sorts final read-level segment rows by their graph-construction coordinates.
+///
+/// Each row already contains both mates, so row-level genomic sorting does not
+/// break read-pair phasing. The ordering makes later circRNA-level graph
+/// construction stream mostly contiguous BSJ/backward evidence instead of
+/// holding every read in a read-ID keyed map.
+fn sort_segment_records(records: &mut [SegmentRecord]) {
+    records.sort_by(|a, b| {
+        a.chrom
+            .cmp(&b.chrom)
+            .then_with(|| sort_position(&a.start).cmp(&sort_position(&b.start)))
+            .then_with(|| sort_position(&a.end).cmp(&sort_position(&b.end)))
+            .then_with(|| type_sort_rank(a.type_name).cmp(&type_sort_rank(b.type_name)))
+            .then_with(|| a.circ_id.cmp(&b.circ_id))
+            .then_with(|| a.read_id.cmp(&b.read_id))
+    });
+}
+
+/// Parses a segment row coordinate for stable output ordering.
+fn sort_position(value: &str) -> i32 {
+    value.parse::<i32>().unwrap_or(i32::MAX)
+}
+
+/// Keeps confirmed BSJ rows ahead of supplemental rows at identical loci.
+fn type_sort_rank(type_name: &str) -> u8 {
+    match type_name {
+        "bsj" => 0,
+        "backward" => 1,
+        "forward" => 2,
+        _ => 3,
+    }
+}
+
+/// Returns the single chromosome shared by selected mate chains.
+///
+/// Backward rows have no circRNA assignment yet, but downstream candidate
+/// clustering still needs chromosome context. The row-level schema has one
+/// `chrom` column, so mixed-chromosome mate chains are filtered out instead of
+/// being reported as circular segments with ambiguous reference context.
+fn selected_chain_chrom(chains: &[Option<MateChain>; 2]) -> Option<String> {
+    let mut chrom: Option<&str> = None;
+    for chain in chains.iter().flatten() {
+        match chrom {
+            Some(existing) if existing != chain.chrom => return None,
+            Some(_) => {}
+            None => chrom = Some(chain.chrom.as_str()),
+        }
+    }
+    chrom.map(str::to_string)
+}
+
+/// Returns the genomic span covered by all selected mate-chain blocks.
+///
+/// Backward rows are not assigned to a candidate BSJ at read-level output time:
+/// one backward read can be compatible with multiple later BSJ/circRNA groups.
+/// The sortable coordinates therefore describe the retained alignment span
+/// across the selected R1/R2 chains, not a putative circRNA boundary.
+fn selected_chain_span(chains: &[Option<MateChain>; 2]) -> Option<(i32, i32)> {
+    let mut start = i32::MAX;
+    let mut end = i32::MIN;
+    for block in chains.iter().flatten().flat_map(|chain| &chain.blocks) {
+        start = start.min(block.ref_start);
+        end = end.max(block.ref_end);
+    }
+    (start <= end).then_some((start, end))
 }
 
 /// Selects one best chain for each mate of a read pair.
@@ -2860,6 +4098,7 @@ fn build_pair_chains(
     type_name: &str,
     token_strand: char,
     junction_hints: &[(i32, i32)],
+    correction: Option<&SegmentCorrectionContext<'_>>,
 ) -> [Option<MateChain>; 2] {
     let mut buckets: [Vec<&AsAlignment>; 2] = [Vec::new(), Vec::new()];
     for record in records {
@@ -2873,6 +4112,8 @@ fn build_pair_chains(
             type_name,
             token_strand,
             junction_hints,
+            correction,
+            false,
         ),
         select_best_chain_for_mate(
             &buckets[1],
@@ -2881,6 +4122,8 @@ fn build_pair_chains(
             type_name,
             token_strand,
             junction_hints,
+            correction,
+            true,
         ),
     ]
 }
@@ -2897,6 +4140,8 @@ fn select_best_chain_for_mate(
     type_name: &str,
     token_strand: char,
     junction_hints: &[(i32, i32)],
+    correction: Option<&SegmentCorrectionContext<'_>>,
+    reverse_chain_order: bool,
 ) -> Option<MateChain> {
     if records.is_empty() {
         return None;
@@ -2906,10 +4151,24 @@ fn select_best_chain_for_mate(
         .copied()
         .filter(|record| !is_secondary(record.flag))
         .collect();
-    let primary_chain =
-        build_chain_from_pool(&non_secondary, read_len, circ, token_strand, junction_hints);
-    let fallback_chain =
-        build_chain_from_pool(records, read_len, circ, token_strand, junction_hints);
+    let primary_chain = build_chain_from_pool(
+        &non_secondary,
+        read_len,
+        circ,
+        token_strand,
+        junction_hints,
+        correction,
+        reverse_chain_order,
+    );
+    let fallback_chain = build_chain_from_pool(
+        records,
+        read_len,
+        circ,
+        token_strand,
+        junction_hints,
+        correction,
+        reverse_chain_order,
+    );
     better_chain(primary_chain, fallback_chain, type_name, circ)
 }
 
@@ -2941,8 +4200,10 @@ fn build_chain_from_pool(
     circ: Option<&CircRecord>,
     token_strand: char,
     junction_hints: &[(i32, i32)],
+    correction: Option<&SegmentCorrectionContext<'_>>,
+    reverse_chain_order: bool,
 ) -> Option<MateChain> {
-    let mut by_key: HashMap<(String, char), Vec<ParsedAlignment>> = HashMap::new();
+    let mut by_key: BTreeMap<(String, char), Vec<ParsedAlignment>> = BTreeMap::new();
     for record in records {
         let Some(blocks) = parse_alignment_blocks(record, read_len) else {
             continue;
@@ -2991,7 +4252,15 @@ fn build_chain_from_pool(
             selected.push(record);
         }
 
-        let chain = materialize_chain(&selected, circ, token_strand, junction_hints)?;
+        let chain = materialize_chain(
+            &selected,
+            read_len,
+            circ,
+            token_strand,
+            junction_hints,
+            correction,
+            reverse_chain_order,
+        )?;
         if best.as_ref().is_none_or(|current| {
             chain_generic_rank(&chain, circ) > chain_generic_rank(current, circ)
         }) {
@@ -3006,12 +4275,26 @@ fn parse_alignment_blocks(record: &AsAlignment, read_len: i32) -> Option<Vec<Seg
     if record.cigar == "*" || record.cigar.is_empty() || record.chr == "*" {
         return None;
     }
-    let ops = parse_cigar_ops(&record.cigar)?;
     let mut ref_pos = record.pos;
     let mut read_pos = 1;
     let mut blocks = Vec::new();
     let mut current: Option<SegmentBlock> = None;
-    for (count, op) in ops {
+    let mut count = 0i32;
+    let mut has_count = false;
+    for mut op in record.cigar.chars() {
+        if op.is_ascii_digit() {
+            count = count
+                .checked_mul(10)?
+                .checked_add(op.to_digit(10)? as i32)?;
+            has_count = true;
+            continue;
+        }
+        if !has_count {
+            return None;
+        }
+        if op == 'H' {
+            op = 'S';
+        }
         match op {
             'M' | '=' | 'X' => {
                 let block = current.get_or_insert(SegmentBlock {
@@ -3019,6 +4302,7 @@ fn parse_alignment_blocks(record: &AsAlignment, read_len: i32) -> Option<Vec<Seg
                     read_end: read_pos + count - 1,
                     ref_start: ref_pos,
                     ref_end: ref_pos + count - 1,
+                    from_local_clip: record.from_local_clip,
                 });
                 block.read_end = read_pos + count - 1;
                 block.ref_end = ref_pos + count - 1;
@@ -3052,6 +4336,11 @@ fn parse_alignment_blocks(record: &AsAlignment, read_len: i32) -> Option<Vec<Seg
             'P' => {}
             _ => return None,
         }
+        count = 0;
+        has_count = false;
+    }
+    if has_count {
+        return None;
     }
     if let Some(block) = current.take() {
         blocks.push(block);
@@ -3071,38 +4360,28 @@ fn parse_alignment_blocks(record: &AsAlignment, read_len: i32) -> Option<Vec<Seg
     Some(blocks)
 }
 
-/// Parses a normalized CIGAR string into `(length, op)` pairs.
-fn parse_cigar_ops(cigar: &str) -> Option<Vec<(i32, char)>> {
-    let mut ops = Vec::new();
-    let mut number = String::new();
-    for ch in cigar.chars() {
-        if ch.is_ascii_digit() {
-            number.push(ch);
-            continue;
-        }
-        let len = number.parse::<i32>().ok()?;
-        number.clear();
-        ops.push((len, if ch == 'H' { 'S' } else { ch }));
-    }
-    if number.is_empty() {
-        Some(ops)
-    } else {
-        None
-    }
-}
-
-/// Builds the final output chain and segment tokens from selected alignments.
+/// Builds the final output chain and segment CIGAR from selected alignments.
+///
+/// The final `<prefix>.segments` fields are emitted in read-chain order, not
+/// genomic order. For BSJ reads this is the only representation that preserves
+/// circular topology: a plus-strand junction is `circ-end-side -> B ->
+/// circ-start-side`, while a minus-strand junction is the reverse genomic
+/// direction after the reverse-strand alignment has been normalized into read
+/// order.
 fn materialize_chain(
     records: &[ParsedAlignment],
+    read_len: i32,
     circ: Option<&CircRecord>,
     token_strand: char,
     junction_hints: &[(i32, i32)],
+    correction: Option<&SegmentCorrectionContext<'_>>,
+    reverse_chain_order: bool,
 ) -> Option<MateChain> {
     if records.is_empty() {
         return None;
     }
     let chrom = records.first()?.chrom.clone();
-    let order_strand = records.first()?.strand;
+    let mut order_strand = records.first()?.strand;
     let mut blocks = Vec::new();
     let mut used_secondary = 0usize;
     let mut used_supplementary = 0usize;
@@ -3116,45 +4395,59 @@ fn materialize_chain(
         }
     }
     blocks.sort_by_key(|block| (block.read_start, block.read_end, block.ref_start));
-    apply_segment_boundary_corrections(&mut blocks, circ, junction_hints);
-    let mut token_spans = Vec::new();
-    let mut tokens = Vec::new();
+    if reverse_chain_order {
+        blocks.reverse();
+        order_strand = opposite_strand(order_strand);
+    }
+    apply_circ_boundary_corrections(&mut blocks, circ);
     let mut is_bsj = false;
     let mut is_circular = false;
-    for block in blocks.iter().cloned() {
-        if let Some(&(prev_start, prev_end)) = token_spans.last() {
-            let prev_block = SegmentBlock {
-                read_start: 0,
-                read_end: 0,
-                ref_start: prev_start,
-                ref_end: prev_end,
-            };
-            let wrapped = wraps_in_read_order(&prev_block, &block, order_strand);
-            if let Some(circ) = circ {
-                if is_bsj_transition(&prev_block, &block, circ) {
-                    tokens.push("<bsj>".to_string());
-                    is_bsj = true;
-                    is_circular = true;
-                } else if wrapped {
-                    is_circular = true;
-                }
+    for pair in blocks.windows(2) {
+        let prev_block = &pair[0];
+        let next_block = &pair[1];
+        let wrapped = wraps_in_read_order(prev_block, next_block, order_strand);
+        if let Some(circ) = circ {
+            if is_bsj_transition(prev_block, next_block, circ, order_strand) {
+                is_bsj = true;
+                is_circular = true;
             } else if wrapped {
                 is_circular = true;
             }
+        } else if wrapped {
+            is_circular = true;
         }
-        token_spans.push((block.ref_start, block.ref_end));
-        tokens.push(format!(
-            "{}-{}:{}",
-            block.ref_start, block.ref_end, token_strand
-        ));
     }
+
+    let mut output_blocks = blocks.clone();
+    let bsj_gap_idx = if is_bsj {
+        circ.and_then(|circ| read_order_bsj_gap_index(&output_blocks, circ, order_strand))
+    } else {
+        None
+    };
+    apply_segment_boundary_corrections(
+        &mut output_blocks,
+        &chrom,
+        bsj_gap_idx,
+        junction_hints,
+        correction,
+        token_strand,
+    );
+    let (tokens, token_spans, cigar) = materialize_read_chain_output(
+        &output_blocks,
+        token_strand,
+        bsj_gap_idx,
+        read_len,
+        reverse_chain_order,
+    );
+
     Some(MateChain {
         chrom,
         order_strand,
         token_strand,
-        blocks,
+        blocks: output_blocks,
         token_spans,
         tokens,
+        cigar,
         is_bsj,
         is_circular,
         used_secondary,
@@ -3163,18 +4456,92 @@ fn materialize_chain(
     })
 }
 
-/// Applies motif/annotation-corrected junctions and circ outer boundaries to blocks.
+/// Builds read-chain segment tokens and the matching CIRI-specific CIGAR.
 ///
-/// The second-sweep candidates may already have had their splice boundaries
-/// shifted by `validate_splice_motifs`, but raw segment reconstruction still
-/// starts from `POS + CIGAR` block boundaries. Snapping nearby block edges onto
-/// the corrected sites keeps the final `<prefix>.segments` output aligned with
-/// the same biological boundary decisions used during candidate validation.
-fn apply_segment_boundary_corrections(
-    blocks: &mut [SegmentBlock],
-    circ: Option<&CircRecord>,
-    junction_hints: &[(i32, i32)],
-) {
+/// `N` and `B` both encode the genomic interval skipped between adjacent
+/// read-chain blocks. `B` is deliberately tied to the read-order circular wrap;
+/// re-sorting these blocks by coordinate would turn `C|B|A` circRNA evidence
+/// into a linear-looking `A|B|C` chain.
+fn materialize_read_chain_output(
+    blocks: &[SegmentBlock],
+    token_strand: char,
+    bsj_gap_idx: Option<usize>,
+    read_len: i32,
+    reverse_chain_order: bool,
+) -> (Vec<String>, Vec<(i32, i32)>, String) {
+    let mut token_spans = Vec::with_capacity(blocks.len());
+    let mut tokens = Vec::with_capacity(blocks.len() + usize::from(bsj_gap_idx.is_some()));
+    let mut cigar = String::new();
+    if let Some(first) = blocks.first() {
+        let leading_clip = if reverse_chain_order {
+            read_len - first.read_end
+        } else {
+            first.read_start - 1
+        };
+        if leading_clip > 0 {
+            let _ = write!(&mut cigar, "{}S", leading_clip);
+        }
+    }
+    for (idx, block) in blocks.iter().enumerate() {
+        if idx > 0 {
+            let prev = &blocks[idx - 1];
+            let gap = interval_gap(prev, block);
+            let op = if bsj_gap_idx == Some(idx) { 'B' } else { 'N' };
+            let _ = write!(&mut cigar, "{}{}", gap, op);
+            if op == 'B' {
+                tokens.push("<bsj>".to_string());
+            }
+        }
+        let len = block.ref_end - block.ref_start + 1;
+        let _ = write!(&mut cigar, "{}M", len.max(0));
+        tokens.push(format!(
+            "{}-{}:{}",
+            block.ref_start, block.ref_end, token_strand
+        ));
+        token_spans.push((block.ref_start, block.ref_end));
+    }
+    if let Some(last) = blocks.last() {
+        let trailing_clip = if reverse_chain_order {
+            last.read_start - 1
+        } else {
+            read_len - last.read_end
+        };
+        if trailing_clip > 0 {
+            let _ = write!(&mut cigar, "{}S", trailing_clip);
+        }
+    }
+    (tokens, token_spans, cigar)
+}
+
+/// Returns the read-chain gap index where the selected blocks cross BSJ.
+fn read_order_bsj_gap_index(
+    read_blocks: &[SegmentBlock],
+    circ: &CircRecord,
+    order_strand: char,
+) -> Option<usize> {
+    read_blocks.windows(2).enumerate().find_map(|(idx, pair)| {
+        is_bsj_transition(&pair[0], &pair[1], circ, order_strand).then_some(idx + 1)
+    })
+}
+
+/// Returns the skipped genomic distance between two read-chain blocks.
+fn interval_gap(left: &SegmentBlock, right: &SegmentBlock) -> i32 {
+    if left.ref_end < right.ref_start {
+        right.ref_start - left.ref_end - 1
+    } else if right.ref_end < left.ref_start {
+        left.ref_start - right.ref_end - 1
+    } else {
+        0
+    }
+}
+
+/// Snaps read-order blocks onto confirmed circ outer boundaries.
+///
+/// This runs before topology detection because BSJ transitions are judged in
+/// read order. Internal splice correction is intentionally deferred until the
+/// final read-chain blocks are selected, then each adjacent non-BSJ pair is
+/// interpreted in genomic low/high order only for choosing splice boundaries.
+fn apply_circ_boundary_corrections(blocks: &mut [SegmentBlock], circ: Option<&CircRecord>) {
     if let Some(circ) = circ {
         for block in blocks.iter_mut() {
             if (block.ref_start - circ.start).abs() <= 2 {
@@ -3185,19 +4552,407 @@ fn apply_segment_boundary_corrections(
             }
         }
     }
-    if blocks.len() < 2 || junction_hints.is_empty() {
+}
+
+/// Applies corrected internal splice boundaries to read-chain output blocks.
+///
+/// The correction order mirrors the current CIRI-AS design: annotation-supported
+/// exon end/start pairs win first, read-specific validated junction hints are
+/// used next, and de novo splice motifs are a final fallback. Only the
+/// `<prefix>.segments` representation is changed; CIRI3 Summary evidence has
+/// already been finalized before this function runs.
+fn apply_segment_boundary_corrections(
+    blocks: &mut [SegmentBlock],
+    chrom: &str,
+    bsj_gap_idx: Option<usize>,
+    junction_hints: &[(i32, i32)],
+    correction: Option<&SegmentCorrectionContext<'_>>,
+    token_strand: char,
+) {
+    if blocks.len() < 2 {
         return;
     }
     for idx in 0..blocks.len() - 1 {
-        let prev_end = blocks[idx].ref_end;
-        let next_start = blocks[idx + 1].ref_start;
-        if let Some(&(site2, site1)) = junction_hints.iter().find(|&&(site2, site1)| {
-            (prev_end - site2).abs() <= 3 && (next_start - site1).abs() <= 3
-        }) {
-            blocks[idx].ref_end = site2;
-            blocks[idx + 1].ref_start = site1;
+        if bsj_gap_idx == Some(idx + 1) {
+            continue;
+        }
+        let (left_idx, right_idx) = if blocks[idx].ref_start <= blocks[idx + 1].ref_start {
+            (idx, idx + 1)
+        } else {
+            (idx + 1, idx)
+        };
+        let prev_end = blocks[left_idx].ref_end;
+        let next_start = blocks[right_idx].ref_start;
+        if prev_end >= next_start {
+            continue;
+        }
+        let annotation_window = correction_window_for_pair(&blocks[left_idx], &blocks[right_idx]);
+        let chosen = if let Some(ctx) = correction {
+            choose_supported_splice_boundary(
+                ctx,
+                chrom,
+                prev_end,
+                next_start,
+                &blocks[left_idx],
+                &blocks[right_idx],
+                junction_hints,
+                token_strand,
+                annotation_window,
+            )
+        } else {
+            choose_hinted_splice_boundary(
+                prev_end,
+                next_start,
+                &blocks[left_idx],
+                &blocks[right_idx],
+                junction_hints,
+                annotation_window,
+            )
+        };
+        if let Some((site2, site1)) = chosen {
+            blocks[left_idx].ref_end = site2;
+            blocks[right_idx].ref_start = site1;
         }
     }
+}
+
+/// Chooses the best nearby internal splice boundary using all available signals.
+///
+/// The ranking is deliberately sidecar-local: read-specific CIRI-AS validation
+/// hints win first, then transcript-consistent annotation, then preliminary
+/// read-level junction support, then boundary-level annotation and splice motif.
+/// BSJ gaps have already been skipped by the caller, so this function cannot
+/// rewrite circRNA outer-boundary topology.
+fn choose_supported_splice_boundary(
+    ctx: &SegmentCorrectionContext<'_>,
+    chrom: &str,
+    prev_end: i32,
+    next_start: i32,
+    left: &SegmentBlock,
+    right: &SegmentBlock,
+    junction_hints: &[(i32, i32)],
+    token_strand: char,
+    window: i32,
+) -> Option<(i32, i32)> {
+    let chr_seq = ctx.reference.get(chrom);
+    let mut best: Option<((i32, i32, i32, i32, i32, i32, i32, i32), i32, i32)> = None;
+    for end in left.ref_end - window..=left.ref_end + window {
+        if end < left.ref_start || end >= right.ref_start {
+            continue;
+        }
+        for start in right.ref_start - window..=right.ref_start + window {
+            if start > right.ref_end || end >= start {
+                continue;
+            }
+            let hint_score = junction_hints
+                .iter()
+                .filter(|&&(site2, site1)| site2 == end && site1 == start)
+                .count() as i32;
+            let (transcript_score, annotation_score) =
+                annotation_splice_pair_score(ctx.annotation, chrom, end, start, token_strand)
+                    .unwrap_or((0, 0));
+            let support_score = ctx
+                .junction_support
+                .and_then(|support| support.get(chrom))
+                .and_then(|support| support.get(&(end, start, token_strand)).copied())
+                .unwrap_or(0)
+                .min(i32::MAX as usize) as i32;
+            let motif_score = if (end - left.ref_end).abs() <= INTERNAL_SPLICE_CORRECTION_WINDOW
+                && (start - right.ref_start).abs() <= INTERNAL_SPLICE_CORRECTION_WINDOW
+            {
+                chr_seq
+                    .and_then(|seq| splice_motif_score(seq, end, start, token_strand))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if hint_score == 0
+                && transcript_score == 0
+                && annotation_score == 0
+                && support_score == 0
+                && motif_score == 0
+            {
+                continue;
+            }
+            let movement = (end - prev_end).abs() + (start - next_start).abs();
+            let key = (
+                hint_score,
+                transcript_score,
+                support_score,
+                annotation_score,
+                motif_score,
+                -movement,
+                -(end.abs_diff(prev_end) as i32),
+                -(start.abs_diff(next_start) as i32),
+            );
+            if best.as_ref().is_none_or(|(current, _, _)| key > *current) {
+                best = Some((key, end, start));
+            }
+        }
+    }
+    best.map(|(_, end, start)| (end, start))
+}
+
+/// Chooses a nearby annotated exon end/start pair for one internal junction.
+#[allow(dead_code)]
+fn choose_annotation_splice_boundary(
+    annotation: Option<&Annotation>,
+    chrom: &str,
+    left: &SegmentBlock,
+    right: &SegmentBlock,
+    token_strand: char,
+    window: i32,
+) -> Option<(i32, i32)> {
+    let mut best: Option<(i32, i32, i32, i32)> = None;
+    for end in left.ref_end - window..=left.ref_end + window {
+        if end < left.ref_start || end >= right.ref_start {
+            continue;
+        }
+        for start in right.ref_start - window..=right.ref_start + window {
+            if start > right.ref_end || end >= start {
+                continue;
+            }
+            let Some((transcript_score, annotation_score)) =
+                annotation_splice_pair_score(annotation, chrom, end, start, token_strand)
+            else {
+                continue;
+            };
+            let movement = (end - left.ref_end).abs() + (start - right.ref_start).abs();
+            let score = transcript_score * 1000 + annotation_score;
+            let key = (
+                score,
+                -movement,
+                -(end.abs_diff(left.ref_end) as i32),
+                -(start.abs_diff(right.ref_start) as i32),
+            );
+            if best.is_none_or(|current| key > current) {
+                best = Some((key.0, key.1, end, start));
+            }
+        }
+    }
+    best.map(|(_, _, end, start)| (end, start))
+}
+
+/// Scores one annotation-supported internal splice boundary candidate.
+fn annotation_splice_pair_score(
+    annotation: Option<&Annotation>,
+    chrom: &str,
+    end: i32,
+    start: i32,
+    token_strand: char,
+) -> Option<(i32, i32)> {
+    let annotation = annotation?;
+    let transcript_score =
+        transcript_splice_pair_score(annotation, chrom, end, start, token_strand);
+    let boundary_score = boundary_splice_pair_score(annotation, chrom, end, start, token_strand);
+    match (transcript_score, boundary_score) {
+        (0, None) => None,
+        (score, Some(boundary)) => Some((score, boundary)),
+        (score, None) => Some((score, 0)),
+    }
+}
+
+/// Scores whether one intron is supported by adjacent exons from the same transcript.
+fn transcript_splice_pair_score(
+    annotation: &Annotation,
+    chrom: &str,
+    end: i32,
+    start: i32,
+    token_strand: char,
+) -> i32 {
+    let has_pair = |strand: char| {
+        transcript_splice_pair_score_for_strand(annotation, chrom, end, start, strand)
+    };
+    match token_strand {
+        '+' | '-' => i32::from(has_pair(token_strand)),
+        '?' => i32::from(has_pair('+') || has_pair('-')),
+        _ => 0,
+    }
+}
+
+/// Scores one transcript splice-pair strand without allocating keys when possible.
+fn transcript_splice_pair_score_for_strand(
+    annotation: &Annotation,
+    chrom: &str,
+    end: i32,
+    start: i32,
+    strand: char,
+) -> bool {
+    if let Some(by_strand) = annotation.transcript_splice_index.get(chrom) {
+        return by_strand
+            .get(&strand)
+            .is_some_and(|sites| sites.contains(&(end, start)));
+    }
+    annotation
+        .transcript_splice_map
+        .contains(&format!("{}\t{}\t{}\t{}", chrom, end, start, strand))
+}
+
+/// Scores boundary-level exon end/start support without requiring transcript identity.
+fn boundary_splice_pair_score(
+    annotation: &Annotation,
+    chrom: &str,
+    end: i32,
+    start: i32,
+    token_strand: char,
+) -> Option<i32> {
+    if annotation.chr_exon_end_index.contains_key(chrom)
+        || annotation.chr_exon_start_index.contains_key(chrom)
+    {
+        return typed_boundary_splice_pair_score(annotation, chrom, end, start, token_strand);
+    }
+    let end_key = format!("{}\t{}", chrom, end);
+    let start_key = format!("{}\t{}", chrom, start);
+    let end_hit = annotation.chr_exon_end_map.get(&end_key)?;
+    let start_hit = annotation.chr_exon_start_map.get(&start_key)?;
+    let (end_gene, end_strand) = split_gene_strand(end_hit);
+    let (start_gene, start_strand) = split_gene_strand(start_hit);
+    let same_gene = end_gene == start_gene;
+    if token_strand != '?' && (end_strand != token_strand || start_strand != token_strand) {
+        return None;
+    }
+    Some(if same_gene { 100 } else { 80 })
+}
+
+/// Scores exon end/start support from numeric annotation indexes.
+fn typed_boundary_splice_pair_score(
+    annotation: &Annotation,
+    chrom: &str,
+    end: i32,
+    start: i32,
+    token_strand: char,
+) -> Option<i32> {
+    let end_hit = annotation.chr_exon_end_index.get(chrom)?.get(&end)?;
+    let start_hit = annotation.chr_exon_start_index.get(chrom)?.get(&start)?;
+    if token_strand != '?' && (end_hit.1 != token_strand || start_hit.1 != token_strand) {
+        return None;
+    }
+    Some(if end_hit.0 == start_hit.0 { 100 } else { 80 })
+}
+
+/// Splits the legacy `"gene\tstrand"` annotation payload without allocating.
+fn split_gene_strand(value: &str) -> (&str, char) {
+    let (gene, strand) = value.split_once('\t').unwrap_or((value, ""));
+    (gene, strand.chars().next().unwrap_or('?'))
+}
+
+/// Returns the annotation/hint correction window for one internal splice pair.
+///
+/// Normal mapper blocks keep the conservative CIRI-AS-sized window. Partial
+/// local clip blocks and very short retained blocks can sit farther from the
+/// true annotated splice boundary, so annotation and validated read-specific
+/// hints may use a wider window. De novo motif correction intentionally remains
+/// conservative to avoid overfitting microhomology around BSJ-adjacent gaps.
+fn correction_window_for_pair(left: &SegmentBlock, right: &SegmentBlock) -> i32 {
+    let has_partial_clip_like_block = [left, right].iter().any(|block| {
+        block.from_local_clip || block.ref_end - block.ref_start + 1 <= MIN_EXON_LENGTH
+    });
+    if has_partial_clip_like_block {
+        PARTIAL_LOCAL_SPLICE_CORRECTION_WINDOW
+    } else {
+        INTERNAL_SPLICE_CORRECTION_WINDOW
+    }
+}
+
+/// Reuses read-specific splice hints produced by CIRI-AS candidate validation.
+fn choose_hinted_splice_boundary(
+    prev_end: i32,
+    next_start: i32,
+    left: &SegmentBlock,
+    right: &SegmentBlock,
+    junction_hints: &[(i32, i32)],
+    window: i32,
+) -> Option<(i32, i32)> {
+    junction_hints
+        .iter()
+        .copied()
+        .filter(|&(site2, site1)| {
+            site2 >= left.ref_start
+                && site2 < site1
+                && site1 <= right.ref_end
+                && (prev_end - site2).abs() <= window
+                && (next_start - site1).abs() <= window
+        })
+        .min_by_key(|&(site2, site1)| (prev_end - site2).abs() + (next_start - site1).abs())
+}
+
+/// Chooses a nearby canonical splice signal when annotation gives no answer.
+fn choose_motif_splice_boundary(
+    reference: &HashMap<String, String>,
+    chrom: &str,
+    left: &SegmentBlock,
+    right: &SegmentBlock,
+    token_strand: char,
+) -> Option<(i32, i32)> {
+    let chr_seq = reference.get(chrom)?;
+    let mut best: Option<(i32, i32, i32, i32)> = None;
+    for end in left.ref_end - INTERNAL_SPLICE_CORRECTION_WINDOW
+        ..=left.ref_end + INTERNAL_SPLICE_CORRECTION_WINDOW
+    {
+        if end < left.ref_start || end >= right.ref_start {
+            continue;
+        }
+        for start in right.ref_start - INTERNAL_SPLICE_CORRECTION_WINDOW
+            ..=right.ref_start + INTERNAL_SPLICE_CORRECTION_WINDOW
+        {
+            if start > right.ref_end || end >= start {
+                continue;
+            }
+            let Some(score) = splice_motif_score(chr_seq, end, start, token_strand) else {
+                continue;
+            };
+            let movement = (end - left.ref_end).abs() + (start - right.ref_start).abs();
+            let key = (
+                score,
+                -movement,
+                -(end.abs_diff(left.ref_end) as i32),
+                -(start.abs_diff(right.ref_start) as i32),
+            );
+            if best.is_none_or(|current| key > current) {
+                best = Some((key.0, key.1, end, start));
+            }
+        }
+    }
+    best.map(|(_, _, end, start)| (end, start))
+}
+
+/// Scores the intronic dinucleotides implied by one genomic-order junction.
+fn splice_motif_score(chr_seq: &str, end: i32, start: i32, token_strand: char) -> Option<i32> {
+    if start - end < 3 {
+        return None;
+    }
+    let low = reference_dinucleotide(chr_seq, end + 1)?;
+    let high = reference_dinucleotide(chr_seq, start - 2)?;
+    match token_strand {
+        '+' => match (low.as_str(), high.as_str()) {
+            ("GT", "AG") => Some(100),
+            ("GC", "AG") | ("AT", "AC") => Some(60),
+            _ => None,
+        },
+        '-' => match (low.as_str(), high.as_str()) {
+            ("CT", "AC") => Some(100),
+            ("CT", "GC") | ("GT", "AT") => Some(60),
+            _ => None,
+        },
+        _ => match (low.as_str(), high.as_str()) {
+            ("GT", "AG") | ("CT", "AC") => Some(80),
+            ("GC", "AG") | ("AT", "AC") | ("CT", "GC") | ("GT", "AT") => Some(50),
+            _ => None,
+        },
+    }
+}
+
+/// Returns a 1-based two-base genomic sequence.
+fn reference_dinucleotide(chr_seq: &str, start: i32) -> Option<String> {
+    if start <= 0 {
+        return None;
+    }
+    let start_idx = (start - 1) as usize;
+    let end_idx = start_idx + 2;
+    if end_idx > chr_seq.len() {
+        return None;
+    }
+    Some(chr_seq[start_idx..end_idx].to_ascii_uppercase())
 }
 
 /// Returns the query-interval overlap between two parsed alignments.
@@ -3272,67 +5027,87 @@ fn wraps_in_read_order(prev: &SegmentBlock, next: &SegmentBlock, strand: char) -
     }
 }
 
-/// Detects the BSJ transition inside a known circRNA span.
-fn is_bsj_transition(prev: &SegmentBlock, next: &SegmentBlock, circ: &CircRecord) -> bool {
+/// Returns the opposite genomic traversal direction for mate2 chain reversal.
+fn opposite_strand(strand: char) -> char {
+    match strand {
+        '+' => '-',
+        '-' => '+',
+        _ => strand,
+    }
+}
+
+/// Detects the output-chain BSJ transition inside a known circRNA span.
+///
+/// The circRNA strand determines token strand, but the adjacent block order is
+/// determined by the normalized alignment/read chain. Reverse-strand alignments
+/// therefore use the opposite genomic wrap direction after query-coordinate
+/// normalization.
+fn is_bsj_transition(
+    prev: &SegmentBlock,
+    next: &SegmentBlock,
+    circ: &CircRecord,
+    order_strand: char,
+) -> bool {
     let prev_near_start = prev.ref_start <= circ.start + 6;
     let prev_near_end = prev.ref_end >= circ.end - 6;
     let next_near_start = next.ref_start <= circ.start + 6;
     let next_near_end = next.ref_end >= circ.end - 6;
-    (prev_near_start && next_near_end) || (prev_near_end && next_near_start)
+    ((prev_near_start && next_near_end) || (prev_near_end && next_near_start))
+        && wraps_in_read_order(prev, next, order_strand)
 }
 
-/// Converts one optional chain to output text and BSJ flag.
-fn chain_text(chain: Option<&MateChain>) -> (String, usize) {
-    chain.map_or_else(
-        || ("NA".to_string(), 0),
-        |chain| (chain.tokens.join("|"), usize::from(chain.is_bsj)),
-    )
-}
-
-/// Summarizes the coarse genomic context for a non-BSJ row.
-fn summarize_non_bsj_context(chains: &[Option<MateChain>; 2]) -> (String, String, String, String) {
-    let mut best: Option<&MateChain> = None;
-    for chain in chains.iter().flatten() {
-        if best.is_none_or(|current| chain.query_coverage > current.query_coverage) {
-            best = Some(chain);
-        }
-    }
-    let Some(best) = best else {
-        return (
-            "NA".to_string(),
-            "NA".to_string(),
-            "NA".to_string(),
-            "NA".to_string(),
-        );
-    };
-    let mut start = i32::MAX;
-    let mut end = i32::MIN;
-    for chain in chains
+/// Applies final `.bsj` mate-level evidence to selected mate chains.
+///
+/// The chain builder can miss a BSJ flag when the mapper reports a single
+/// soft-clipped alignment and the CIRI validator recognizes the clipped mate as
+/// BSJ evidence. The final `.bsj` row is a post-Summary annotation, so using it
+/// here improves mate-level segment labels without changing which reads Summary
+/// counted as CIRI3-compatible junction reads.
+fn apply_mate_bsj_evidence(
+    chains: &mut [Option<MateChain>; 2],
+    mate_bsj_evidence: &[MateBsjEvidence],
+    circ: &CircRecord,
+) {
+    for evidence in mate_bsj_evidence
         .iter()
-        .flatten()
-        .filter(|chain| chain.chrom == best.chrom)
+        .filter(|evidence| evidence_matches_circ(evidence, circ))
     {
-        for block in &chain.blocks {
-            start = start.min(block.ref_start);
-            end = end.max(block.ref_end);
+        if let Some(chain) = chains
+            .get_mut(evidence.mate_bucket)
+            .and_then(Option::as_mut)
+        {
+            chain.is_bsj = true;
+            chain.is_circular = true;
+            if chain.token_strand == '?' {
+                chain.token_strand = evidence
+                    .strand
+                    .chars()
+                    .next()
+                    .filter(|strand| matches!(strand, '+' | '-'))
+                    .unwrap_or('?');
+            }
         }
     }
-    (
-        best.chrom.clone(),
-        if start == i32::MAX {
-            "NA".to_string()
-        } else {
-            start.to_string()
-        },
-        if end == i32::MIN {
-            "NA".to_string()
-        } else {
-            end.to_string()
-        },
-        if best.token_strand == '?' {
-            "unknown".to_string()
-        } else {
-            best.token_strand.to_string()
+}
+
+/// Returns whether a mate-level BSJ row belongs to the confirmed circRNA row.
+fn evidence_matches_circ(evidence: &MateBsjEvidence, circ: &CircRecord) -> bool {
+    evidence.chr == circ.chr
+        && evidence.start == circ.start
+        && evidence.end == circ.end
+        && (evidence.strand == circ.strand || evidence.strand == "NA" || circ.strand == "NA")
+}
+
+/// Converts one optional chain to output segment text, CIGAR, and BSJ flag.
+fn chain_text(chain: Option<&MateChain>) -> (String, String, usize) {
+    chain.map_or_else(
+        || ("NA".to_string(), "NA".to_string(), 0),
+        |chain| {
+            (
+                chain.tokens.join("|"),
+                chain.cigar.clone(),
+                usize::from(chain.is_bsj),
+            )
         },
     )
 }
@@ -3411,12 +5186,12 @@ fn write_segments(path: &str, records: &[SegmentRecord]) -> Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     writeln!(
         writer,
-        "read_id\ttype\tcirc_id\tchrom\tstart\tend\tstrand\tis_circular\tis_bsj\tr1_segments\tr1_is_bsj\tr2_segments\tr2_is_bsj"
+        "read_id\ttype\tcirc_id\tchrom\tstart\tend\tstrand\tis_circular\tis_r1_bsj\tis_r2_bsj\tr1_cigar\tr1_segments\tr2_cigar\tr2_segments"
     )?;
     for record in records {
         writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             record.read_id,
             record.type_name,
             record.circ_id,
@@ -3425,11 +5200,12 @@ fn write_segments(path: &str, records: &[SegmentRecord]) -> Result<()> {
             record.end,
             record.strand,
             record.is_circular,
-            record.is_bsj,
+            record.is_r1_bsj,
+            record.is_r2_bsj,
+            record.r1_cigar,
             record.r1_segments,
-            record.r1_is_bsj,
-            record.r2_segments,
-            record.r2_is_bsj
+            record.r2_cigar,
+            record.r2_segments
         )?;
     }
     Ok(())
@@ -3442,6 +5218,19 @@ fn mate_bucket(flag: i32) -> usize {
     } else {
         1
     }
+}
+
+/// Stable sidecar-order key for raw mapper alignments.
+///
+/// The final chain builder still performs biological/topology ranking; this key
+/// only makes de-duplicated sidecar input deterministic across Scan1/Scan2 shard
+/// merge order without preferring secondary alignments ahead of primary ones.
+fn as_alignment_order_key(record: &AsAlignment) -> (usize, usize, i32) {
+    (
+        usize::from(is_secondary(record.flag)),
+        usize::from(is_supplementary(record.flag)),
+        -record.mapq,
+    )
 }
 
 /// Returns whether one SAM flag represents a secondary alignment.
@@ -3549,9 +5338,13 @@ mod tests {
             chr_cov.insert(pos, 10);
         }
         coverage.insert("chr1".to_string(), chr_cov);
+        let reference = HashMap::new();
         let state = ScanState {
             circ_by_id: HashMap::new(),
             junction_read_to_circ: HashMap::new(),
+            mate_bsj_evidence: HashMap::new(),
+            reference: &reference,
+            annotation: None,
             clusters_by_chr: HashMap::new(),
             read_len: 100,
             candidates: Vec::new(),
@@ -3683,6 +5476,8 @@ mod tests {
             mapq: 60,
             cigar: "10S90M".to_string(),
             seq: "A".repeat(100),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
         };
 
         let blocks = parse_alignment_blocks(&record, 100).unwrap();
@@ -3704,6 +5499,8 @@ mod tests {
                 mapq: 60,
                 cigar: "50M50S".to_string(),
                 seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
             },
             AsAlignment {
                 flag: 0x40 | 0x800,
@@ -3712,11 +5509,17 @@ mod tests {
                 mapq: 60,
                 cigar: "50S50M".to_string(),
                 seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
             },
         ];
+        let reference = HashMap::new();
         let state = ScanState {
             circ_by_id: HashMap::new(),
             junction_read_to_circ: HashMap::new(),
+            mate_bsj_evidence: HashMap::new(),
+            reference: &reference,
+            annotation: None,
             clusters_by_chr: HashMap::new(),
             read_len: 100,
             candidates: Vec::new(),
@@ -3731,17 +5534,569 @@ mod tests {
             "read1",
             &records,
             infer_read_token_strand("read1", &state),
+            &[],
+            None,
             100,
         )
         .unwrap();
 
         assert_eq!(record.type_name, "backward");
         assert_eq!(record.circ_id, "NA");
-        assert_eq!(record.strand, "unknown");
+        assert_eq!(record.chrom, "chr1");
+        assert_eq!(record.start, "100");
+        assert_eq!(record.end, "249");
+        assert_eq!(record.strand, "NA");
         assert_eq!(record.is_circular, 1);
-        assert_eq!(record.is_bsj, 0);
         assert_eq!(record.r1_segments, "200-249:?|100-149:?");
-        assert_eq!(record.r1_is_bsj, 0);
+        assert_eq!(record.r1_cigar, "50M50N50M");
+        assert_eq!(record.is_r1_bsj, 0);
+    }
+
+    #[test]
+    fn backward_segments_reject_weak_supplementary_when_xa_makes_linear_chain() {
+        let records = vec![
+            AsAlignment {
+                flag: 0x40 | 0x10,
+                chr: "chr1".to_string(),
+                pos: 92091,
+                mapq: 0,
+                cigar: "27S123M".to_string(),
+                seq: "A".repeat(150),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 0x40 | 0x10 | 0x800,
+                chr: "chr1".to_string(),
+                pos: 521712,
+                mapq: 0,
+                cigar: "29M121H".to_string(),
+                seq: "A".repeat(29),
+                from_local_clip: false,
+                xa_alternatives: vec![XaAlternative {
+                    chr: "chr1".to_string(),
+                    strand: '-',
+                    pos: 91603,
+                    cigar: "29M121S".to_string(),
+                    edit_distance: 0,
+                }],
+            },
+        ];
+
+        let record =
+            build_backward_segment_record("sim:433108", &records, Some('-'), &[], None, 150);
+
+        assert!(record.is_none());
+    }
+
+    #[test]
+    fn backward_segments_reject_long_anchor_when_xa_makes_linear_chain() {
+        let records = vec![
+            AsAlignment {
+                flag: 0x40,
+                chr: "chr1".to_string(),
+                pos: 2000,
+                mapq: 0,
+                cigar: "50M50S".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 0x40 | 0x800,
+                chr: "chr1".to_string(),
+                pos: 100,
+                mapq: 0,
+                cigar: "50S50M".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: vec![XaAlternative {
+                    chr: "chr1".to_string(),
+                    strand: '+',
+                    pos: 2050,
+                    cigar: "50S50M".to_string(),
+                    edit_distance: 0,
+                }],
+            },
+        ];
+
+        let record =
+            build_backward_segment_record("long_anchor", &records, Some('+'), &[], None, 100);
+
+        assert!(record.is_none());
+    }
+
+    #[test]
+    fn backward_segments_reject_linear_xa_before_circular_repair() {
+        let records = vec![
+            AsAlignment {
+                flag: 83,
+                chr: "chr1".to_string(),
+                pos: 92_091,
+                mapq: 0,
+                cigar: "42S108M".to_string(),
+                seq: "A".repeat(150),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 2131,
+                chr: "chr1".to_string(),
+                pos: 521_697,
+                mapq: 0,
+                cigar: "44M106H".to_string(),
+                seq: "A".repeat(44),
+                from_local_clip: false,
+                xa_alternatives: vec![
+                    XaAlternative {
+                        chr: "chr1".to_string(),
+                        strand: '-',
+                        pos: 237_914,
+                        cigar: "44M106S".to_string(),
+                        edit_distance: 0,
+                    },
+                    XaAlternative {
+                        chr: "chr1".to_string(),
+                        strand: '-',
+                        pos: 91_588,
+                        cigar: "44M106S".to_string(),
+                        edit_distance: 0,
+                    },
+                ],
+            },
+        ];
+
+        let record =
+            build_backward_segment_record("sim:432652", &records, Some('-'), &[], None, 150);
+
+        assert!(record.is_none());
+    }
+
+    #[test]
+    fn backward_segments_joint_xa_replacement_can_reject_linear_pair() {
+        let records = vec![
+            AsAlignment {
+                flag: 81,
+                chr: "chr1".to_string(),
+                pos: 120_775,
+                mapq: 0,
+                cigar: "60S90M".to_string(),
+                seq: "A".repeat(150),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 2129,
+                chr: "chr1".to_string(),
+                pos: 238_508,
+                mapq: 0,
+                cigar: "62M88H".to_string(),
+                seq: "A".repeat(62),
+                from_local_clip: false,
+                xa_alternatives: vec![XaAlternative {
+                    chr: "chr1".to_string(),
+                    strand: '-',
+                    pos: 92_181,
+                    cigar: "62M88S".to_string(),
+                    edit_distance: 0,
+                }],
+            },
+            AsAlignment {
+                flag: 161,
+                chr: "chr1".to_string(),
+                pos: 91_547,
+                mapq: 55,
+                cigar: "85M65S".to_string(),
+                seq: "A".repeat(150),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 2209,
+                chr: "chr1".to_string(),
+                pos: 238_418,
+                mapq: 0,
+                cigar: "83H67M".to_string(),
+                seq: "A".repeat(67),
+                from_local_clip: false,
+                xa_alternatives: vec![XaAlternative {
+                    chr: "chr1".to_string(),
+                    strand: '+',
+                    pos: 92_091,
+                    cigar: "83S67M".to_string(),
+                    edit_distance: 0,
+                }],
+            },
+        ];
+
+        let record =
+            build_backward_segment_record("sim:432594", &records, Some('-'), &[], None, 150);
+
+        assert!(record.is_none());
+    }
+
+    #[test]
+    fn backward_segments_uses_primary_mapq0_xa_in_joint_ranking() {
+        let records = vec![
+            AsAlignment {
+                flag: 81,
+                chr: "chr1".to_string(),
+                pos: 92_091,
+                mapq: 0,
+                cigar: "44S106M".to_string(),
+                seq: "A".repeat(150),
+                from_local_clip: false,
+                xa_alternatives: vec![XaAlternative {
+                    chr: "chr1".to_string(),
+                    strand: '-',
+                    pos: 238_418,
+                    cigar: "44S106M".to_string(),
+                    edit_distance: 0,
+                }],
+            },
+            AsAlignment {
+                flag: 2129,
+                chr: "chr1".to_string(),
+                pos: 521_695,
+                mapq: 0,
+                cigar: "46M104H".to_string(),
+                seq: "A".repeat(46),
+                from_local_clip: false,
+                xa_alternatives: vec![XaAlternative {
+                    chr: "chr1".to_string(),
+                    strand: '-',
+                    pos: 237_912,
+                    cigar: "46M104S".to_string(),
+                    edit_distance: 0,
+                }],
+            },
+            AsAlignment {
+                flag: 161,
+                chr: "chr1".to_string(),
+                pos: 237_835,
+                mapq: 23,
+                cigar: "123M27S".to_string(),
+                seq: "A".repeat(150),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 2209,
+                chr: "chr1".to_string(),
+                pos: 238_418,
+                mapq: 0,
+                cigar: "121H29M".to_string(),
+                seq: "A".repeat(29),
+                from_local_clip: false,
+                xa_alternatives: vec![XaAlternative {
+                    chr: "chr1".to_string(),
+                    strand: '+',
+                    pos: 92_091,
+                    cigar: "121S29M".to_string(),
+                    edit_distance: 0,
+                }],
+            },
+        ];
+
+        let record =
+            build_backward_segment_record("sim:4599148", &records, Some('-'), &[], None, 150);
+
+        assert!(record.is_none());
+    }
+
+    #[test]
+    fn backward_segments_accepts_nm1_xa_when_span_is_better() {
+        let records = vec![
+            AsAlignment {
+                flag: 0x40,
+                chr: "chr1".to_string(),
+                pos: 2_000,
+                mapq: 0,
+                cigar: "50M50S".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 0x40 | 0x800,
+                chr: "chr1".to_string(),
+                pos: 100,
+                mapq: 0,
+                cigar: "50S50M".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: vec![XaAlternative {
+                    chr: "chr1".to_string(),
+                    strand: '+',
+                    pos: 2_050,
+                    cigar: "50S50M".to_string(),
+                    edit_distance: 1,
+                }],
+            },
+        ];
+
+        let record =
+            build_backward_segment_record("nm1_linear_xa", &records, Some('+'), &[], None, 100);
+
+        assert!(record.is_none());
+    }
+
+    #[test]
+    fn backward_segments_choose_best_spanning_xa_regardless_of_topology() {
+        let records = vec![
+            AsAlignment {
+                flag: 0x40,
+                chr: "chr1".to_string(),
+                pos: 5_000,
+                mapq: 60,
+                cigar: "50M50S".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 0x40 | 0x800,
+                chr: "chr1".to_string(),
+                pos: 100,
+                mapq: 0,
+                cigar: "50S50M".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: vec![
+                    XaAlternative {
+                        chr: "chr1".to_string(),
+                        strand: '+',
+                        pos: 4_990,
+                        cigar: "50S50M".to_string(),
+                        edit_distance: 0,
+                    },
+                    XaAlternative {
+                        chr: "chr1".to_string(),
+                        strand: '+',
+                        pos: 9_000,
+                        cigar: "50S50M".to_string(),
+                        edit_distance: 0,
+                    },
+                ],
+            },
+        ];
+
+        let record =
+            build_backward_segment_record("best_circular_xa", &records, Some('+'), &[], None, 100)
+                .unwrap();
+
+        assert_eq!(record.start, "4990");
+        assert_eq!(record.end, "5049");
+        assert_eq!(record.r1_segments, "5000-5049:+|4990-5039:+");
+    }
+
+    #[test]
+    fn backward_segments_reject_span_above_ciri3_max_span() {
+        let records = vec![
+            AsAlignment {
+                flag: 0x40,
+                chr: "chr1".to_string(),
+                pos: 300_000,
+                mapq: 60,
+                cigar: "50M50S".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 0x40 | 0x800,
+                chr: "chr1".to_string(),
+                pos: 100,
+                mapq: 60,
+                cigar: "50S50M".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+        ];
+
+        let record =
+            build_backward_segment_record("wide_span", &records, Some('+'), &[], None, 100);
+
+        assert!(record.is_none());
+    }
+
+    #[test]
+    fn backward_segments_repair_remote_supplementary_with_local_xa() {
+        let records = vec![
+            AsAlignment {
+                flag: 99,
+                chr: "chr1".to_string(),
+                pos: 203_745_131,
+                mapq: 60,
+                cigar: "115M35S".to_string(),
+                seq: "A".repeat(150),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 2147,
+                chr: "chr1".to_string(),
+                pos: 203_741_196,
+                mapq: 60,
+                cigar: "115H35M".to_string(),
+                seq: "A".repeat(35),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 147,
+                chr: "chr1".to_string(),
+                pos: 203_741_196,
+                mapq: 60,
+                cigar: "22S80M48S".to_string(),
+                seq: "A".repeat(150),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 2195,
+                chr: "chr1".to_string(),
+                pos: 203_743_002,
+                mapq: 60,
+                cigar: "101H49M".to_string(),
+                seq: "A".repeat(49),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 2195,
+                chr: "chr1".to_string(),
+                pos: 90_982,
+                mapq: 0,
+                cigar: "23M127H".to_string(),
+                seq: "A".repeat(23),
+                from_local_clip: false,
+                xa_alternatives: vec![XaAlternative {
+                    chr: "chr1".to_string(),
+                    strand: '-',
+                    pos: 203_745_224,
+                    cigar: "22M128S".to_string(),
+                    edit_distance: 0,
+                }],
+            },
+        ];
+
+        let record =
+            build_backward_segment_record("sim:3966179", &records, Some('+'), &[], None, 150)
+                .unwrap();
+
+        assert_eq!(record.start, "203741196");
+        assert_eq!(record.end, "203745245");
+        assert_eq!(
+            record.r2_segments,
+            "203745224-203745245:+|203741196-203741275:+|203743002-203743050:+"
+        );
+        assert_eq!(record.r2_cigar, "22M3948N80M1726N49M");
+    }
+
+    #[test]
+    fn backward_segments_filter_mixed_chromosome_chains() {
+        let records = vec![
+            AsAlignment {
+                flag: 0x40,
+                chr: "chr1".to_string(),
+                pos: 200,
+                mapq: 60,
+                cigar: "50M50S".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 0x40 | 0x800,
+                chr: "chr1".to_string(),
+                pos: 100,
+                mapq: 60,
+                cigar: "50S50M".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 0x80,
+                chr: "chr2".to_string(),
+                pos: 500,
+                mapq: 60,
+                cigar: "100M".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+        ];
+
+        let record = build_backward_segment_record("read1", &records, None, &[], None, 100);
+
+        assert!(record.is_none());
+    }
+
+    #[test]
+    fn segment_records_sort_by_genomic_position() {
+        let mut records = vec![
+            SegmentRecord {
+                read_id: "read3".to_string(),
+                type_name: "backward",
+                circ_id: "NA".to_string(),
+                chrom: "chr2".to_string(),
+                start: "20".to_string(),
+                end: "40".to_string(),
+                strand: "NA".to_string(),
+                is_circular: 1,
+                is_r1_bsj: 0,
+                is_r2_bsj: 0,
+                r1_cigar: "NA".to_string(),
+                r1_segments: "NA".to_string(),
+                r2_cigar: "NA".to_string(),
+                r2_segments: "NA".to_string(),
+            },
+            SegmentRecord {
+                read_id: "read2".to_string(),
+                type_name: "backward",
+                circ_id: "NA".to_string(),
+                chrom: "chr1".to_string(),
+                start: "100".to_string(),
+                end: "250".to_string(),
+                strand: "NA".to_string(),
+                is_circular: 1,
+                is_r1_bsj: 0,
+                is_r2_bsj: 0,
+                r1_cigar: "NA".to_string(),
+                r1_segments: "NA".to_string(),
+                r2_cigar: "NA".to_string(),
+                r2_segments: "NA".to_string(),
+            },
+            SegmentRecord {
+                read_id: "read1".to_string(),
+                type_name: "bsj",
+                circ_id: "chr1:100|200".to_string(),
+                chrom: "chr1".to_string(),
+                start: "100".to_string(),
+                end: "200".to_string(),
+                strand: "+".to_string(),
+                is_circular: 1,
+                is_r1_bsj: 1,
+                is_r2_bsj: 0,
+                r1_cigar: "NA".to_string(),
+                r1_segments: "NA".to_string(),
+                r2_cigar: "NA".to_string(),
+                r2_segments: "NA".to_string(),
+            },
+        ];
+
+        sort_segment_records(&mut records);
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.read_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read1", "read2", "read3"]
+        );
     }
 
     #[test]
@@ -3768,6 +6123,8 @@ mod tests {
                 mapq: 60,
                 cigar: "50M50S".to_string(),
                 seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
             },
             AsAlignment {
                 flag: 0x40 | 0x800,
@@ -3776,20 +6133,212 @@ mod tests {
                 mapq: 60,
                 cigar: "50S50M".to_string(),
                 seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
             },
         ];
 
-        let record = build_bsj_segment_record("read1", &records, &circ, 100).unwrap();
+        let record =
+            build_bsj_segment_record("read1", &records, &circ, &[], &[], None, 100).unwrap();
 
         assert_eq!(record.type_name, "bsj");
         assert_eq!(record.circ_id, circ.id);
-        assert_eq!(record.is_bsj, 1);
         assert_eq!(record.r1_segments, "150-199:+|<bsj>|100-149:+");
-        assert_eq!(record.r1_is_bsj, 1);
+        assert_eq!(record.r1_cigar, "50M0B50M");
+        assert_eq!(record.is_r1_bsj, 1);
     }
 
     #[test]
-    fn bsj_transition_is_detected_in_either_read_order() {
+    fn bsj_marker_follows_read_order_wrap_in_three_block_chain() {
+        let circ = CircRecord {
+            id: "chr1:100|349".to_string(),
+            chr: "chr1".to_string(),
+            start: 100,
+            end: 349,
+            junction_reads: vec!["read1".to_string()],
+            junction_read_count: "1".to_string(),
+            pcc: "1_0_0".to_string(),
+            non_junction_reads: "0".to_string(),
+            junction_reads_ratio: "1.00".to_string(),
+            circ_type: "exon".to_string(),
+            gene_id: "GENE1".to_string(),
+            strand: "+".to_string(),
+        };
+        let parsed = vec![ParsedAlignment {
+            flag: 0,
+            chrom: "chr1".to_string(),
+            strand: '+',
+            mapq: 60,
+            blocks: vec![
+                SegmentBlock {
+                    read_start: 1,
+                    read_end: 10,
+                    ref_start: 200,
+                    ref_end: 209,
+                    from_local_clip: false,
+                },
+                SegmentBlock {
+                    read_start: 11,
+                    read_end: 60,
+                    ref_start: 300,
+                    ref_end: 349,
+                    from_local_clip: false,
+                },
+                SegmentBlock {
+                    read_start: 61,
+                    read_end: 110,
+                    ref_start: 100,
+                    ref_end: 149,
+                    from_local_clip: false,
+                },
+            ],
+        }];
+
+        let chain = materialize_chain(&parsed, 110, Some(&circ), '+', &[], None, false).unwrap();
+
+        assert_eq!(
+            chain.tokens,
+            vec![
+                "200-209:+".to_string(),
+                "300-349:+".to_string(),
+                "<bsj>".to_string(),
+                "100-149:+".to_string(),
+            ]
+        );
+        assert_eq!(chain.cigar, "10M90N50M150B50M");
+        assert!(chain.is_bsj);
+    }
+
+    #[test]
+    fn bsj_marker_uses_start_side_block_for_reverse_wrap_order() {
+        let circ = CircRecord {
+            id: "chr1:100|349".to_string(),
+            chr: "chr1".to_string(),
+            start: 100,
+            end: 349,
+            junction_reads: vec!["read1".to_string()],
+            junction_read_count: "1".to_string(),
+            pcc: "1_0_0".to_string(),
+            non_junction_reads: "0".to_string(),
+            junction_reads_ratio: "1.00".to_string(),
+            circ_type: "exon".to_string(),
+            gene_id: "GENE1".to_string(),
+            strand: "-".to_string(),
+        };
+        let parsed = vec![ParsedAlignment {
+            flag: 0x10,
+            chrom: "chr1".to_string(),
+            strand: '-',
+            mapq: 60,
+            blocks: vec![
+                SegmentBlock {
+                    read_start: 1,
+                    read_end: 50,
+                    ref_start: 100,
+                    ref_end: 149,
+                    from_local_clip: false,
+                },
+                SegmentBlock {
+                    read_start: 51,
+                    read_end: 110,
+                    ref_start: 300,
+                    ref_end: 349,
+                    from_local_clip: false,
+                },
+                SegmentBlock {
+                    read_start: 111,
+                    read_end: 120,
+                    ref_start: 200,
+                    ref_end: 209,
+                    from_local_clip: false,
+                },
+            ],
+        }];
+
+        let chain = materialize_chain(&parsed, 120, Some(&circ), '-', &[], None, false).unwrap();
+
+        assert_eq!(
+            chain.tokens,
+            vec![
+                "100-149:-".to_string(),
+                "<bsj>".to_string(),
+                "300-349:-".to_string(),
+                "200-209:-".to_string(),
+            ]
+        );
+        assert_eq!(chain.cigar, "50M150B50M90N10M");
+        assert!(chain.is_bsj);
+    }
+
+    #[test]
+    fn mate_bsj_evidence_marks_soft_clipped_mate() {
+        let circ = CircRecord {
+            id: "chr1:100|199".to_string(),
+            chr: "chr1".to_string(),
+            start: 100,
+            end: 199,
+            junction_reads: vec!["read1".to_string()],
+            junction_read_count: "1".to_string(),
+            pcc: "1_0_0".to_string(),
+            non_junction_reads: "0".to_string(),
+            junction_reads_ratio: "1.00".to_string(),
+            circ_type: "exon".to_string(),
+            gene_id: "GENE1".to_string(),
+            strand: "+".to_string(),
+        };
+        let records = vec![AsAlignment {
+            flag: 0x80,
+            chr: "chr1".to_string(),
+            pos: 100,
+            mapq: 60,
+            cigar: "10S90M".to_string(),
+            seq: "A".repeat(100),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        }];
+        let evidence = vec![MateBsjEvidence {
+            mate_bucket: 1,
+            chr: "chr1".to_string(),
+            start: 100,
+            end: 199,
+            strand: "+".to_string(),
+            priority: 0,
+            source_stage: "scan2".to_string(),
+        }];
+
+        let record =
+            build_bsj_segment_record("read1", &records, &circ, &evidence, &[], None, 100).unwrap();
+
+        assert_eq!(record.is_r1_bsj, 0);
+        assert_eq!(record.r2_segments, "100-189:+");
+        assert_eq!(record.r2_cigar, "90M10S");
+        assert_eq!(record.is_r2_bsj, 1);
+    }
+
+    #[test]
+    fn materialize_chain_preserves_terminal_soft_clips_in_output_cigar() {
+        let parsed = vec![ParsedAlignment {
+            flag: 0,
+            chrom: "chr1".to_string(),
+            strand: '+',
+            mapq: 60,
+            blocks: vec![SegmentBlock {
+                read_start: 11,
+                read_end: 90,
+                ref_start: 100,
+                ref_end: 179,
+                from_local_clip: false,
+            }],
+        }];
+
+        let chain = materialize_chain(&parsed, 100, None, '+', &[], None, false).unwrap();
+
+        assert_eq!(chain.tokens, vec!["100-179:+".to_string()]);
+        assert_eq!(chain.cigar, "10S80M10S");
+    }
+
+    #[test]
+    fn bsj_transition_follows_output_chain_wrap() {
         let circ = CircRecord {
             id: "chr1:100|199".to_string(),
             chr: "chr1".to_string(),
@@ -3811,18 +6360,42 @@ mod tests {
                 read_end: 90,
                 ref_start: 100,
                 ref_end: 149,
+                from_local_clip: false,
             },
             SegmentBlock {
                 read_start: 91,
                 read_end: 150,
                 ref_start: 150,
                 ref_end: 199,
+                from_local_clip: false,
             },
         );
         let high_then_low = (low_then_high.1.clone(), low_then_high.0.clone());
 
-        assert!(is_bsj_transition(&low_then_high.0, &low_then_high.1, &circ));
-        assert!(is_bsj_transition(&high_then_low.0, &high_then_low.1, &circ));
+        assert!(is_bsj_transition(
+            &low_then_high.0,
+            &low_then_high.1,
+            &circ,
+            '-'
+        ));
+        assert!(!is_bsj_transition(
+            &high_then_low.0,
+            &high_then_low.1,
+            &circ,
+            '-'
+        ));
+        assert!(!is_bsj_transition(
+            &low_then_high.0,
+            &low_then_high.1,
+            &circ,
+            '+'
+        ));
+        assert!(is_bsj_transition(
+            &high_then_low.0,
+            &high_then_low.1,
+            &circ,
+            '+'
+        ));
     }
 
     #[test]
@@ -3838,6 +6411,7 @@ mod tests {
                     read_end: 29,
                     ref_start: 93811203,
                     ref_end: 93811231,
+                    from_local_clip: false,
                 }],
             },
             ParsedAlignment {
@@ -3850,6 +6424,7 @@ mod tests {
                     read_end: 83,
                     ref_start: 93806014,
                     ref_end: 93806068,
+                    from_local_clip: false,
                 }],
             },
             ParsedAlignment {
@@ -3862,11 +6437,12 @@ mod tests {
                     read_end: 150,
                     ref_start: 93811273,
                     ref_end: 93811340,
+                    from_local_clip: false,
                 }],
             },
         ];
 
-        let chain = materialize_chain(&parsed, None, '-').unwrap();
+        let chain = materialize_chain(&parsed, 150, None, '-', &[], None, false).unwrap();
 
         assert_eq!(
             chain.tokens,
@@ -3876,6 +6452,370 @@ mod tests {
                 "93811273-93811340:-".to_string(),
             ]
         );
+        assert_eq!(chain.cigar, "29M5134N55M5204N68M");
+    }
+
+    #[test]
+    fn materialize_chain_corrects_internal_splice_boundaries_with_annotation() {
+        let mut annotation = Annotation::new();
+        annotation
+            .chr_exon_end_map
+            .insert("chr1\t171292331".to_string(), "GENE1\t+".to_string());
+        annotation
+            .chr_exon_start_map
+            .insert("chr1\t171300779".to_string(), "GENE1\t+".to_string());
+        let reference = HashMap::new();
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: Some(&annotation),
+            junction_support: None,
+        };
+        let parsed = vec![ParsedAlignment {
+            flag: 0,
+            chrom: "chr1".to_string(),
+            strand: '+',
+            mapq: 60,
+            blocks: vec![
+                SegmentBlock {
+                    read_start: 1,
+                    read_end: 88,
+                    ref_start: 171292245,
+                    ref_end: 171292332,
+                    from_local_clip: false,
+                },
+                SegmentBlock {
+                    read_start: 89,
+                    read_end: 146,
+                    ref_start: 171300777,
+                    ref_end: 171300834,
+                    from_local_clip: false,
+                },
+            ],
+        }];
+
+        let chain =
+            materialize_chain(&parsed, 146, None, '+', &[], Some(&correction), false).unwrap();
+
+        assert_eq!(
+            chain.tokens,
+            vec![
+                "171292245-171292331:+".to_string(),
+                "171300779-171300834:+".to_string(),
+            ]
+        );
+        assert_eq!(chain.cigar, "87M8447N56M");
+    }
+
+    #[test]
+    fn materialize_chain_prefers_transcript_consistent_boundary() {
+        let mut annotation = Annotation::new();
+        annotation
+            .chr_exon_end_map
+            .insert("chr1\t196".to_string(), "GENE1\t+".to_string());
+        annotation
+            .chr_exon_start_map
+            .insert("chr1\t300".to_string(), "GENE1\t+".to_string());
+        annotation
+            .chr_exon_end_map
+            .insert("chr1\t199".to_string(), "GENE1\t+".to_string());
+        annotation
+            .chr_exon_start_map
+            .insert("chr1\t304".to_string(), "GENE1\t+".to_string());
+        annotation
+            .transcript_splice_map
+            .insert("chr1\t199\t304\t+".to_string());
+        let reference = HashMap::new();
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: Some(&annotation),
+            junction_support: None,
+        };
+        let parsed = vec![ParsedAlignment {
+            flag: 0,
+            chrom: "chr1".to_string(),
+            strand: '+',
+            mapq: 60,
+            blocks: vec![
+                SegmentBlock {
+                    read_start: 1,
+                    read_end: 97,
+                    ref_start: 100,
+                    ref_end: 196,
+                    from_local_clip: false,
+                },
+                SegmentBlock {
+                    read_start: 98,
+                    read_end: 148,
+                    ref_start: 300,
+                    ref_end: 350,
+                    from_local_clip: false,
+                },
+            ],
+        }];
+
+        let chain =
+            materialize_chain(&parsed, 148, None, '+', &[], Some(&correction), false).unwrap();
+
+        assert_eq!(
+            chain.tokens,
+            vec!["100-199:+".to_string(), "304-350:+".to_string()]
+        );
+        assert_eq!(chain.cigar, "100M104N47M");
+    }
+
+    #[test]
+    fn materialize_chain_prefers_supported_boundary_for_local_clip() {
+        let reference = HashMap::new();
+        let mut support: JunctionSupportMap = HashMap::new();
+        support
+            .entry("chr1".to_string())
+            .or_default()
+            .insert((199, 328, '+'), 12);
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: None,
+            junction_support: Some(&support),
+        };
+        let parsed = vec![ParsedAlignment {
+            flag: 0,
+            chrom: "chr1".to_string(),
+            strand: '+',
+            mapq: 60,
+            blocks: vec![
+                SegmentBlock {
+                    read_start: 1,
+                    read_end: 100,
+                    ref_start: 100,
+                    ref_end: 199,
+                    from_local_clip: false,
+                },
+                SegmentBlock {
+                    read_start: 131,
+                    read_end: 150,
+                    ref_start: 340,
+                    ref_end: 359,
+                    from_local_clip: true,
+                },
+            ],
+        }];
+
+        let chain =
+            materialize_chain(&parsed, 150, None, '+', &[], Some(&correction), false).unwrap();
+
+        assert_eq!(
+            chain.tokens,
+            vec!["100-199:+".to_string(), "328-359:+".to_string()]
+        );
+        assert_eq!(chain.cigar, "100M128N32M");
+    }
+
+    #[test]
+    fn supported_alternative_filter_marks_only_nearby_different_junctions() {
+        let mut support_map: JunctionSupportMap = HashMap::new();
+        support_map
+            .entry("chr1".to_string())
+            .or_default()
+            .insert((199, 328, '+'), 12);
+        let support = build_junction_support_index(&support_map);
+        assert!(segments_have_supported_alternative(
+            "100-199:+|340-359:+",
+            support.get("chr1").unwrap()
+        ));
+
+        let mut same_support_map: JunctionSupportMap = HashMap::new();
+        same_support_map
+            .entry("chr1".to_string())
+            .or_default()
+            .insert((199, 340, '+'), 12);
+        let same_support = build_junction_support_index(&same_support_map);
+        assert!(!segments_have_supported_alternative(
+            "100-199:+|340-359:+",
+            same_support.get("chr1").unwrap()
+        ));
+    }
+
+    #[test]
+    fn materialize_chain_widens_annotation_window_for_local_clip_block() {
+        let mut annotation = Annotation::new();
+        annotation
+            .chr_exon_end_map
+            .insert("chr1\t199".to_string(), "GENE1\t+".to_string());
+        annotation
+            .chr_exon_start_map
+            .insert("chr1\t328".to_string(), "GENE1\t+".to_string());
+        let reference = HashMap::new();
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: Some(&annotation),
+            junction_support: None,
+        };
+        let parsed = vec![ParsedAlignment {
+            flag: 0,
+            chrom: "chr1".to_string(),
+            strand: '+',
+            mapq: 60,
+            blocks: vec![
+                SegmentBlock {
+                    read_start: 1,
+                    read_end: 100,
+                    ref_start: 100,
+                    ref_end: 199,
+                    from_local_clip: false,
+                },
+                SegmentBlock {
+                    read_start: 131,
+                    read_end: 150,
+                    ref_start: 340,
+                    ref_end: 359,
+                    from_local_clip: true,
+                },
+            ],
+        }];
+
+        let chain =
+            materialize_chain(&parsed, 150, None, '+', &[], Some(&correction), false).unwrap();
+
+        assert_eq!(
+            chain.tokens,
+            vec!["100-199:+".to_string(), "328-359:+".to_string()]
+        );
+        assert_eq!(chain.cigar, "100M128N32M");
+    }
+
+    #[test]
+    fn materialize_chain_skips_bsj_gap_but_corrects_adjacent_internal_junction() {
+        let circ = CircRecord {
+            id: "chr1:100|349".to_string(),
+            chr: "chr1".to_string(),
+            start: 100,
+            end: 349,
+            junction_reads: vec!["read1".to_string()],
+            junction_read_count: "1".to_string(),
+            pcc: "1_0_0".to_string(),
+            non_junction_reads: "0".to_string(),
+            junction_reads_ratio: "1.00".to_string(),
+            circ_type: "exon".to_string(),
+            gene_id: "GENE1".to_string(),
+            strand: "+".to_string(),
+        };
+        let mut annotation = Annotation::new();
+        annotation
+            .chr_exon_end_map
+            .insert("chr1\t149".to_string(), "GENE1\t+".to_string());
+        annotation
+            .chr_exon_start_map
+            .insert("chr1\t200".to_string(), "GENE1\t+".to_string());
+        annotation
+            .chr_exon_end_map
+            .insert("chr1\t345".to_string(), "GENE1\t+".to_string());
+        annotation
+            .chr_exon_start_map
+            .insert("chr1\t104".to_string(), "GENE1\t+".to_string());
+        let reference = HashMap::new();
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: Some(&annotation),
+            junction_support: None,
+        };
+        let parsed = vec![ParsedAlignment {
+            flag: 0,
+            chrom: "chr1".to_string(),
+            strand: '+',
+            mapq: 60,
+            blocks: vec![
+                SegmentBlock {
+                    read_start: 1,
+                    read_end: 50,
+                    ref_start: 300,
+                    ref_end: 349,
+                    from_local_clip: false,
+                },
+                SegmentBlock {
+                    read_start: 51,
+                    read_end: 101,
+                    ref_start: 100,
+                    ref_end: 150,
+                    from_local_clip: false,
+                },
+                SegmentBlock {
+                    read_start: 102,
+                    read_end: 153,
+                    ref_start: 198,
+                    ref_end: 249,
+                    from_local_clip: false,
+                },
+            ],
+        }];
+
+        let chain = materialize_chain(
+            &parsed,
+            153,
+            Some(&circ),
+            '+',
+            &[],
+            Some(&correction),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            chain.tokens,
+            vec![
+                "300-349:+".to_string(),
+                "<bsj>".to_string(),
+                "100-149:+".to_string(),
+                "200-249:+".to_string(),
+            ]
+        );
+        assert_eq!(chain.cigar, "50M150B50M50N50M");
+    }
+
+    #[test]
+    fn materialize_chain_uses_splice_signal_without_annotation() {
+        let mut chr = vec![b'N'; 300];
+        chr[149] = b'G';
+        chr[150] = b'T';
+        chr[198] = b'A';
+        chr[199] = b'G';
+        let chr = String::from_utf8(chr).unwrap();
+        let mut reference = HashMap::new();
+        reference.insert("chr1".to_string(), chr);
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: None,
+            junction_support: None,
+        };
+        let parsed = vec![ParsedAlignment {
+            flag: 0,
+            chrom: "chr1".to_string(),
+            strand: '+',
+            mapq: 60,
+            blocks: vec![
+                SegmentBlock {
+                    read_start: 1,
+                    read_end: 52,
+                    ref_start: 100,
+                    ref_end: 151,
+                    from_local_clip: false,
+                },
+                SegmentBlock {
+                    read_start: 53,
+                    read_end: 105,
+                    ref_start: 198,
+                    ref_end: 250,
+                    from_local_clip: false,
+                },
+            ],
+        }];
+
+        let chain =
+            materialize_chain(&parsed, 105, None, '+', &[], Some(&correction), false).unwrap();
+
+        assert_eq!(
+            chain.tokens,
+            vec!["100-149:+".to_string(), "201-250:+".to_string()]
+        );
+        assert_eq!(chain.cigar, "50M51N50M");
     }
 
     fn test_cirexon_record(start: i32, end: i32) -> CirexonRecord {

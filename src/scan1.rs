@@ -9,7 +9,9 @@ use crate::annotation::Annotation;
 use crate::is_bsj_hg2::{java_substring, report_scan1_hg_profile, IsBSJHg2};
 use crate::misd::misd;
 use crate::runtime::{emit_debug_line, emit_perf_line, scan1_profile_enabled, should_trace_read};
-use crate::utils::{bam_shard_count, part_path, AlignmentRecord};
+use crate::utils::{
+    bam_shard_count, clip_sequence_payload, local_clip_evidence_lines, part_path, AlignmentRecord,
+};
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
@@ -303,14 +305,31 @@ impl Scan1 {
         fasta_map: &HashMap<String, String>,
         annotation: &Annotation,
     ) -> Result<HashSet<String>> {
+        self.run_with_priority_and_segments(sam_file, bsj_path, None, fasta_map, annotation)
+    }
+
+    /// Runs Scan1 while writing both Summary-compatible BSJ rows and a segments sidecar.
+    ///
+    /// The sidecar records full read-group alignments only for reads that produced
+    /// Scan1 BSJ evidence. Keeping it out of `.bsj1` preserves CIRI3 parity while
+    /// giving the post-Summary segments stage enough mapper blocks to avoid a
+    /// second BAM/SAM scan for confirmed BSJ reads.
+    pub fn run_with_priority_and_segments(
+        &mut self,
+        sam_file: &str,
+        bsj_path: &str,
+        segments_path: Option<&str>,
+        fasta_map: &HashMap<String, String>,
+        annotation: &Annotation,
+    ) -> Result<HashSet<String>> {
         use crate::sam_bam::{detect_format, InputFormat};
         let format = detect_format(sam_file)?;
         match format {
             InputFormat::Sam => {
-                self.run_sam_with_priority(sam_file, bsj_path, fasta_map, annotation)
+                self.run_sam_with_priority(sam_file, bsj_path, segments_path, fasta_map, annotation)
             }
             InputFormat::Bam => {
-                self.run_bam_with_priority(sam_file, bsj_path, fasta_map, annotation)
+                self.run_bam_with_priority(sam_file, bsj_path, segments_path, fasta_map, annotation)
             }
         }
     }
@@ -358,6 +377,7 @@ impl Scan1 {
             &pb,
             &shard_out,
             display_shard_out.as_deref(),
+            None,
             false,
         )?;
         self.read_len = stats.max_read_len;
@@ -383,6 +403,7 @@ impl Scan1 {
         &mut self,
         sam_file: &str,
         bsj_path: &str,
+        segments_path: Option<&str>,
         fasta_map: &HashMap<String, String>,
         annotation: &Annotation,
     ) -> Result<HashSet<String>> {
@@ -397,8 +418,16 @@ impl Scan1 {
         pb.enable_steady_tick(Duration::from_millis(120));
 
         let shard_out = part_path(bsj_path, 0);
+        let segments_shard_out = segments_path.map(|path| part_path(path, 0));
         let stats = self.process_sam_file_to_file(
-            sam_file, fasta_map, annotation, &pb, &shard_out, None, true,
+            sam_file,
+            fasta_map,
+            annotation,
+            &pb,
+            &shard_out,
+            None,
+            segments_shard_out.as_deref(),
+            true,
         )?;
         self.read_len = stats.max_read_len;
         self.mapped_reads = stats.mapped_reads;
@@ -410,6 +439,9 @@ impl Scan1 {
         );
         pb.finish_with_message("");
         let scan1_ids = self.merge_and_collect_ids(bsj_path, 1)?;
+        if let Some(path) = segments_path {
+            self.merge_segment_shards(path, 1)?;
+        }
         self.bsj1_reads = scan1_ids.len();
         Ok(scan1_ids)
     }
@@ -427,10 +459,16 @@ impl Scan1 {
         pb: &ProgressBar,
         out_path: &str,
         display_out_path: Option<&str>,
+        segments_out_path: Option<&str>,
         priority_inline: bool,
     ) -> Result<Scan1TraversalStats> {
         let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
         let mut display_writer = if let Some(path) = display_out_path {
+            Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
+        } else {
+            None
+        };
+        let mut segments_writer = if let Some(path) = segments_out_path {
             Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
         } else {
             None
@@ -448,6 +486,7 @@ impl Scan1 {
                 self.process_sam_group_batch(
                     &mut writer,
                     display_writer.as_mut(),
+                    segments_writer.as_mut(),
                     &mut batch,
                     fasta_map,
                     annotation,
@@ -462,6 +501,9 @@ impl Scan1 {
 
         writer.flush()?;
         if let Some(writer) = display_writer.as_mut() {
+            writer.flush()?;
+        }
+        if let Some(writer) = segments_writer.as_mut() {
             writer.flush()?;
         }
         Ok(stats)
@@ -637,18 +679,19 @@ impl Scan1 {
         &self,
         writer: &mut BufWriter<File>,
         mut display_writer: Option<&mut BufWriter<File>>,
+        mut segments_writer: Option<&mut BufWriter<File>>,
         batch: &mut Vec<SamOwnedGroup>,
         fasta_map: &HashMap<String, String>,
         annotation: &Annotation,
         priority_inline: bool,
     ) -> Result<()> {
         let groups = std::mem::take(batch);
-        let results: Vec<(Option<(String, String)>, Vec<String>)> = groups
+        let results: Vec<(Option<(String, String)>, Vec<String>, Vec<String>)> = groups
             .into_par_iter()
             .map(|owned| {
                 let non_empty_groups = owned.group.iter().filter(|g| !g.is_empty()).count();
                 if owned.align_num <= 2 && non_empty_groups != 1 {
-                    return (None, Vec::new());
+                    return (None, Vec::new(), Vec::new());
                 }
                 let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
                 let main = self
@@ -676,11 +719,29 @@ impl Scan1 {
                 } else {
                     Vec::new()
                 };
-                (main, display)
+                let has_bsj = main.is_some() || !display.is_empty();
+                let evidence = if has_bsj {
+                    let mut bsj_lines = Vec::new();
+                    if let Some((_, res_line)) = &main {
+                        bsj_lines.push(res_line.clone());
+                    }
+                    bsj_lines.extend(display.iter().cloned());
+                    Self::segment_evidence_lines_with_local(
+                        &owned.read_id,
+                        "scan1",
+                        "scan1_local",
+                        &owned.group,
+                        &bsj_lines,
+                        fasta_map,
+                    )
+                } else {
+                    Vec::new()
+                };
+                (main, display, evidence)
             })
             .collect();
 
-        for (main, display) in results {
+        for (main, display, evidence) in results {
             if priority_inline {
                 for line in Self::prioritize_scan1_display_lines(main, display) {
                     writeln!(writer, "{}", line)?;
@@ -693,6 +754,11 @@ impl Scan1 {
                     for line in display {
                         writeln!(display_writer, "{}", line)?;
                     }
+                }
+            }
+            if let Some(segments_writer) = segments_writer.as_deref_mut() {
+                for line in evidence {
+                    writeln!(segments_writer, "{}", line)?;
                 }
             }
         }
@@ -815,10 +881,19 @@ impl Scan1 {
         &mut self,
         bam_file: &str,
         bsj_path: &str,
+        segments_path: Option<&str>,
         fasta_map: &HashMap<String, String>,
         annotation: &Annotation,
     ) -> Result<HashSet<String>> {
-        self.run_bam_with_display_impl(bam_file, bsj_path, None, fasta_map, annotation, true)
+        self.run_bam_with_display_impl(
+            bam_file,
+            bsj_path,
+            None,
+            segments_path,
+            fasta_map,
+            annotation,
+            true,
+        )
     }
 
     /// Runs Scan1 on BAM input and optionally emits display rows in the same pass.
@@ -834,6 +909,7 @@ impl Scan1 {
             bam_file,
             bsj_path,
             display_path,
+            None,
             fasta_map,
             annotation,
             false,
@@ -845,6 +921,7 @@ impl Scan1 {
         bam_file: &str,
         bsj_path: &str,
         display_path: Option<&str>,
+        segments_path: Option<&str>,
         fasta_map: &HashMap<String, String>,
         annotation: &Annotation,
         priority_inline: bool,
@@ -894,6 +971,7 @@ impl Scan1 {
                 };
                 let shard_out = part_path(bsj_path, i);
                 let display_shard_out = display_path.map(|path| part_path(path, i));
+                let segments_shard_out = segments_path.map(|path| part_path(path, i));
                 self.process_bam_shard_to_file(
                     i,
                     &mmap,
@@ -905,6 +983,7 @@ impl Scan1 {
                     &pb,
                     &shard_out,
                     display_shard_out.as_deref(),
+                    segments_shard_out.as_deref(),
                     priority_inline,
                     profile_ref,
                 )
@@ -938,6 +1017,9 @@ impl Scan1 {
         let scan1_ids = result?;
         if let Some(path) = display_path {
             let _ = self.merge_display_shards(path, num_threads)?;
+        }
+        if let Some(path) = segments_path {
+            self.merge_segment_shards(path, num_threads)?;
         }
         self.bsj1_reads = scan1_ids.len();
         Ok(scan1_ids)
@@ -982,6 +1064,84 @@ impl Scan1 {
         Ok(claims)
     }
 
+    /// Merges shard-local Scan1 segments sidecars without changing row order.
+    fn merge_segment_shards(&self, output_path: &str, num_threads: usize) -> Result<()> {
+        let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(output_path)?);
+        for i in 0..num_threads {
+            let shard_path = part_path(output_path, i);
+            if let Ok(shard_file) = File::open(&shard_path) {
+                let mut reader = BufReader::new(shard_file);
+                let mut line = String::new();
+                while reader.read_line(&mut line)? != 0 {
+                    writer.write_all(line.as_bytes())?;
+                    line.clear();
+                }
+            }
+            let _ = std::fs::remove_file(shard_path);
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Formats read-group alignments for the Scan1 `<prefix>.segments1` sidecar.
+    ///
+    /// Rows are intentionally mapper-block evidence, not final segments. The
+    /// post-Summary segments stage filters by confirmed `.out` read assignments
+    /// and applies the same chain selection/circ correction used by `.segments`.
+    fn segment_evidence_lines<'a>(
+        read_id: &str,
+        stage: &str,
+        group: &[Vec<AlignmentRecord<'a>>; 2],
+    ) -> Vec<String> {
+        let mut rows = Vec::new();
+        for bucket in group {
+            for aln in bucket {
+                if aln.chrom.as_ref() == "*" || aln.cigar.as_ref() == "*" {
+                    continue;
+                }
+                let mate = if aln.flag & 0x40 != 0 { "R1" } else { "R2" };
+                let clips = clip_sequence_payload(aln.cigar.as_ref(), aln.seq.as_ref());
+                rows.push(format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    read_id,
+                    stage,
+                    mate,
+                    aln.flag,
+                    aln.chrom,
+                    aln.pos,
+                    aln.mapq,
+                    aln.cigar,
+                    aln.seq.len(),
+                    clips
+                ));
+            }
+        }
+        rows
+    }
+
+    /// Formats mapper rows plus validator-accepted local clip pseudo rows.
+    fn segment_evidence_lines_with_local<'a>(
+        read_id: &str,
+        stage: &str,
+        local_stage: &str,
+        group: &[Vec<AlignmentRecord<'a>>; 2],
+        bsj_lines: &[String],
+        fasta_map: &HashMap<String, String>,
+    ) -> Vec<String> {
+        let mut rows = Self::segment_evidence_lines(read_id, stage, group);
+        let alignments: Vec<&AlignmentRecord<'_>> =
+            group.iter().flat_map(|bucket| bucket.iter()).collect();
+        rows.extend(local_clip_evidence_lines(
+            read_id,
+            local_stage,
+            &alignments,
+            bsj_lines,
+            fasta_map,
+            10,
+        ));
+        rows
+    }
+
     /// Processes one BAM shard into a temporary BSJ1 shard file.
     ///
     /// The shard starts at the first BGZF header found at or after `start`; the
@@ -999,6 +1159,7 @@ impl Scan1 {
         pb: &ProgressBar,
         out_path: &str,
         display_out_path: Option<&str>,
+        segments_out_path: Option<&str>,
         priority_inline: bool,
         profile: Option<&Scan1Profile>,
     ) -> Result<Scan1ShardStats> {
@@ -1006,6 +1167,11 @@ impl Scan1 {
         let shard_started = profile.map(|_| Instant::now());
         let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
         let mut display_writer = if let Some(path) = display_out_path {
+            Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
+        } else {
+            None
+        };
+        let mut segments_writer = if let Some(path) = segments_out_path {
             Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
         } else {
             None
@@ -1190,6 +1356,27 @@ impl Scan1 {
                                 annotation,
                                 &mut display_validator,
                             );
+                            let write_segments_evidence =
+                                main.is_some() || !display_lines.is_empty();
+                            if let Some(segments_writer) = segments_writer.as_mut() {
+                                if write_segments_evidence {
+                                    let mut bsj_lines = Vec::new();
+                                    if let Some((_, _, res_line)) = &main {
+                                        bsj_lines.push(res_line.clone());
+                                    }
+                                    bsj_lines.extend(display_lines.iter().cloned());
+                                    for line in Self::segment_evidence_lines_with_local(
+                                        &id_str,
+                                        "scan1",
+                                        "scan1_local",
+                                        &group,
+                                        &bsj_lines,
+                                        fasta_map,
+                                    ) {
+                                        writeln!(segments_writer, "{}", line)?;
+                                    }
+                                }
+                            }
                             if priority_inline {
                                 let main =
                                     main.map(|(_, mate_label, res_line)| (mate_label, res_line));
@@ -1201,6 +1388,23 @@ impl Scan1 {
                             } else if let Some(display_writer) = display_writer.as_mut() {
                                 for line in display_lines {
                                     writeln!(display_writer, "{}", line)?;
+                                }
+                            }
+                        } else if let Some(segments_writer) = segments_writer.as_mut() {
+                            if main.is_some() {
+                                let mut bsj_lines = Vec::new();
+                                if let Some((_, _, res_line)) = &main {
+                                    bsj_lines.push(res_line.clone());
+                                }
+                                for line in Self::segment_evidence_lines_with_local(
+                                    &id_str,
+                                    "scan1",
+                                    "scan1_local",
+                                    &group,
+                                    &bsj_lines,
+                                    fasta_map,
+                                ) {
+                                    writeln!(segments_writer, "{}", line)?;
                                 }
                             }
                         }
@@ -1306,6 +1510,26 @@ impl Scan1 {
                     annotation,
                     &mut display_validator,
                 );
+                let write_segments_evidence = main.is_some() || !display_lines.is_empty();
+                if let Some(segments_writer) = segments_writer.as_mut() {
+                    if write_segments_evidence {
+                        let mut bsj_lines = Vec::new();
+                        if let Some((_, _, res_line)) = &main {
+                            bsj_lines.push(res_line.clone());
+                        }
+                        bsj_lines.extend(display_lines.iter().cloned());
+                        for line in Self::segment_evidence_lines_with_local(
+                            &id_str,
+                            "scan1",
+                            "scan1_local",
+                            &group,
+                            &bsj_lines,
+                            fasta_map,
+                        ) {
+                            writeln!(segments_writer, "{}", line)?;
+                        }
+                    }
+                }
                 if priority_inline {
                     let main = main.map(|(_, mate_label, res_line)| (mate_label, res_line));
                     for line in Self::prioritize_scan1_display_lines(main, display_lines) {
@@ -1316,11 +1540,31 @@ impl Scan1 {
                         writeln!(display_writer, "{}", line)?;
                     }
                 }
+            } else if let Some(segments_writer) = segments_writer.as_mut() {
+                if main.is_some() {
+                    let mut bsj_lines = Vec::new();
+                    if let Some((_, _, res_line)) = &main {
+                        bsj_lines.push(res_line.clone());
+                    }
+                    for line in Self::segment_evidence_lines_with_local(
+                        &id_str,
+                        "scan1",
+                        "scan1_local",
+                        &group,
+                        &bsj_lines,
+                        fasta_map,
+                    ) {
+                        writeln!(segments_writer, "{}", line)?;
+                    }
+                }
             }
         }
         writer.flush()?;
         if let Some(display_writer) = display_writer.as_mut() {
             display_writer.flush()?;
+        }
+        if let Some(segments_writer) = segments_writer.as_mut() {
+            segments_writer.flush()?;
         }
         if let (Some(profile), Some(shard_started)) = (profile, shard_started) {
             profile

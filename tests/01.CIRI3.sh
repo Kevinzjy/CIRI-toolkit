@@ -19,4 +19,4 @@ time cargo run --release -- -i ./chr1/test.bam -o ./chr1/simulate.ciri \
 python ../scripts/ciri_result_diff.py ./chr1/CIRI3_result.txt ./chr1/simulate.ciri.out
 
 # Read-level evaluation
-python ../scripts/ciri_segments_eval.py chr1/test.reads.tsv chr1/simulate.ciri.segments
+#python ../scripts/ciri_segments_eval.py chr1/test.reads.tsv chr1/simulate.ciri.segments

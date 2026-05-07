@@ -4,8 +4,7 @@
 mod tests {
     use crate::scan2::Scan2;
     use crate::utils::{
-        bsj1_path_for_output, bsj2_path_for_output, bsj_path_for_output, fsj_path_for_output,
-        result_path_for_output,
+        bsj1_path_for_output, bsj2_path_for_output, fsj_path_for_output, result_path_for_output,
     };
     use std::fs::File;
     use tempfile::tempdir;
@@ -59,7 +58,6 @@ mod tests {
         let mut scan2 = Scan2::new(10, 5, 100);
         let bsj1_path = bsj1_path_for_output(&out_prefix);
         let bsj2_path = bsj2_path_for_output(&out_prefix);
-        let bsj_path = bsj_path_for_output(&out_prefix);
         let fsj_path = fsj_path_for_output(&out_prefix);
         let result_path = result_path_for_output(&out_prefix);
         // Ensure the file exists if scan1 didn't find anything
@@ -70,8 +68,6 @@ mod tests {
         scan2
             .run(
                 sam_path.to_str().unwrap(),
-                &bsj1_path,
-                &bsj_path,
                 &bsj2_path,
                 &fsj_path,
                 &fasta.chr_tcga_map,
@@ -80,8 +76,8 @@ mod tests {
 
         let mut summary = Summary::new(0);
         summary
-            .run(
-                &bsj_path,
+            .run_from_bsj_files(
+                &[&bsj1_path, &bsj2_path],
                 &result_path,
                 &scan2.fsj_map,
                 &fasta.chr_tcga_map,
@@ -125,25 +121,17 @@ mod tests {
         let mut scan2 = Scan2::new(10, 5, 100);
         let bsj1_path = bsj1_path_for_output(&out_prefix);
         let bsj2_path = bsj2_path_for_output(&out_prefix);
-        let bsj_path = bsj_path_for_output(&out_prefix);
         let fsj_path = fsj_path_for_output(&out_prefix);
         let result_path = result_path_for_output(&out_prefix);
         scan2.build_index(&bsj1_path).unwrap();
         scan2
-            .run(
-                bam_path,
-                &bsj1_path,
-                &bsj_path,
-                &bsj2_path,
-                &fsj_path,
-                &fasta.chr_tcga_map,
-            )
+            .run(bam_path, &bsj2_path, &fsj_path, &fasta.chr_tcga_map)
             .unwrap();
 
         let mut summary = Summary::new(0);
         summary
-            .run(
-                &bsj_path,
+            .run_from_bsj_files(
+                &[&bsj1_path, &bsj2_path],
                 &result_path,
                 &scan2.fsj_map,
                 &fasta.chr_tcga_map,

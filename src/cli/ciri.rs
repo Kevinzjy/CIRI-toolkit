@@ -22,7 +22,7 @@ use crate::summary::Summary;
 use crate::utils::{
     bsj1_path_for_output, bsj2_path_for_output, bsj_path_for_output, debug_path_for_output,
     fsj_path_for_output, log_path_for_output, parse_mem_str, perf_path_for_output,
-    result_path_for_output,
+    result_path_for_output, segments1_path_for_output, segments2_path_for_output,
 };
 
 /// Parsed command-line arguments for the end-to-end pipeline.
@@ -169,6 +169,8 @@ pub fn main() -> Result<()> {
     let bsj1_output = bsj1_path_for_output(&args.out_prefix);
     let bsj_output = bsj_path_for_output(&args.out_prefix);
     let bsj2_output = bsj2_path_for_output(&args.out_prefix);
+    let segments1_output = segments1_path_for_output(&args.out_prefix);
+    let segments2_output = segments2_path_for_output(&args.out_prefix);
     let fsj_output = fsj_path_for_output(&args.out_prefix);
     let mut log_writer = BufWriter::new(File::create(&log_output)?);
 
@@ -229,7 +231,13 @@ pub fn main() -> Result<()> {
         args.linear_range_size_min,
     );
     scan1.set_mem_limit(mem_limit);
-    scan1.run_with_priority(&args.in_sam, &bsj1_output, &fasta.chr_tcga_map, &annotation)?;
+    scan1.run_with_priority_and_segments(
+        &args.in_sam,
+        &bsj1_output,
+        Some(&segments1_output),
+        &fasta.chr_tcga_map,
+        &annotation,
+    )?;
     log_info(
         &mut log_writer,
         "Scan 1 summary",
@@ -259,12 +267,13 @@ pub fn main() -> Result<()> {
         "Running scan 2",
         "Curating splicing signals & counting FSJs...",
     )?;
-    scan2.run_with_display(
+    scan2.run_with_display_and_segments(
         &args.in_sam,
         &bsj2_output,
         &fsj_output,
         Some(&bsj1_output),
         None,
+        Some(&segments2_output),
         &fasta.chr_tcga_map,
     )?;
     log_info(
@@ -318,6 +327,8 @@ pub fn main() -> Result<()> {
     run_ciri_as(AsConfig {
         input_path: &args.in_sam,
         circ_path: &result_output,
+        bsj_path: Some(&bsj_output),
+        segment_evidence_paths: vec![&segments1_output, &segments2_output],
         out_prefix: &args.out_prefix,
         reference: &fasta.chr_tcga_map,
         annotation: args.gtf.as_ref().map(|_| &annotation),

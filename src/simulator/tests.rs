@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{
-    run, sample_circular_insert_len, sample_insert_len, select_fastq_compressor_from_availability,
-    FastqCompressor, Lcg64, SimulateArgs,
+    format_segments, run, sample_circular_insert_len, sample_insert_len,
+    select_fastq_compressor_from_availability, FastqCompressor, Lcg64, SimulateArgs, SourceBase,
 };
 
 const ISOFORM_HEADER: &str = "circ_id\tchrom\tstart\tend\tstrand\tgene_id\ttranscript_id\tcoverage\tread_cnt\tbsj_read_cnt\tisoform_cnt\tisoform_exons\tisoform_len\tisoform_read_cnt\tisoform_bsj_read_cnt";
@@ -72,6 +72,54 @@ fn short_circ_sampling_biases_insert_toward_circ_length() {
         (circ_mean - short_circ_len as f64).abs() < 30.0,
         "short circ insert mean should stay close to circ length: circ_mean={circ_mean}, circ_len={short_circ_len}"
     );
+}
+
+#[test]
+fn simulator_segments_keep_read_chain_bsj_order() {
+    let source_map = vec![
+        SourceBase {
+            coord: 100,
+            exon_idx: 0,
+        },
+        SourceBase {
+            coord: 101,
+            exon_idx: 0,
+        },
+        SourceBase {
+            coord: 200,
+            exon_idx: 1,
+        },
+        SourceBase {
+            coord: 201,
+            exon_idx: 1,
+        },
+    ];
+
+    let plus = format_segments(&source_map, '+', 2, 3, true);
+    assert_eq!(plus.text, "200-201:+|<bsj>|100-100:+");
+    assert!(plus.is_bsj);
+
+    let minus_source_map = vec![
+        SourceBase {
+            coord: 201,
+            exon_idx: 1,
+        },
+        SourceBase {
+            coord: 200,
+            exon_idx: 1,
+        },
+        SourceBase {
+            coord: 101,
+            exon_idx: 0,
+        },
+        SourceBase {
+            coord: 100,
+            exon_idx: 0,
+        },
+    ];
+    let minus = format_segments(&minus_source_map, '-', 2, 3, true);
+    assert_eq!(minus.text, "100-101:-|<bsj>|201-201:-");
+    assert!(minus.is_bsj);
 }
 
 #[test]
