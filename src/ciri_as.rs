@@ -3924,11 +3924,12 @@ fn chains_use_record_as_backward(
 ///
 /// The CIRI3 parity path does not inspect XA tags, but this sidecar resolver
 /// uses them to choose a better read-level chain. We require a minimum mapped
-/// anchor so tiny clips do not drive the decision, and deliberately avoid a
-/// maximum anchor length because exact XA alternatives can also explain longer
-/// repetitive supplementary blocks.
+/// anchor so tiny clips do not drive the decision, and deliberately avoid both
+/// MAPQ and maximum-anchor limits because exact XA alternatives can also
+/// explain longer repetitive supplementary blocks that BWA scored confidently
+/// in a non-splice-aware placement.
 fn ambiguous_alignment_with_xa(record: &AsAlignment, read_len: i32) -> bool {
-    if record.xa_alternatives.is_empty() || record.from_local_clip || record.mapq != 0 {
+    if record.xa_alternatives.is_empty() || record.from_local_clip {
         return false;
     }
     alignment_mapped_len(record, read_len).is_some_and(|len| len >= XA_REJECT_MIN_ANCHOR_LEN)
@@ -4419,15 +4420,19 @@ fn materialize_chain(
     }
 
     let mut output_blocks = blocks.clone();
-    let bsj_gap_idx = if is_bsj {
+    let boundary_gap_idxs = if is_bsj {
         circ.and_then(|circ| read_order_bsj_gap_index(&output_blocks, circ, order_strand))
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else if is_circular {
+        read_order_wrap_gap_indexes(&output_blocks, order_strand)
     } else {
-        None
+        Vec::new()
     };
     apply_segment_boundary_corrections(
         &mut output_blocks,
         &chrom,
-        bsj_gap_idx,
+        &boundary_gap_idxs,
         junction_hints,
         correction,
         token_strand,
@@ -4435,7 +4440,7 @@ fn materialize_chain(
     let (tokens, token_spans, cigar) = materialize_read_chain_output(
         &output_blocks,
         token_strand,
-        bsj_gap_idx,
+        &boundary_gap_idxs,
         read_len,
         reverse_chain_order,
     );
@@ -4459,18 +4464,20 @@ fn materialize_chain(
 /// Builds read-chain segment tokens and the matching CIRI-specific CIGAR.
 ///
 /// `N` and `B` both encode the genomic interval skipped between adjacent
-/// read-chain blocks. `B` is deliberately tied to the read-order circular wrap;
-/// re-sorting these blocks by coordinate would turn `C|B|A` circRNA evidence
+/// read-chain blocks. `B` is deliberately tied to read-order circular wraps:
+/// confirmed BSJ reads mark the annotated circ boundary, while `type=backward`
+/// rows mark every selected wrap even when the boundary is not a confirmed BSJ.
+/// Re-sorting these blocks by coordinate would turn `C|B|A` circRNA evidence
 /// into a linear-looking `A|B|C` chain.
 fn materialize_read_chain_output(
     blocks: &[SegmentBlock],
     token_strand: char,
-    bsj_gap_idx: Option<usize>,
+    boundary_gap_idxs: &[usize],
     read_len: i32,
     reverse_chain_order: bool,
 ) -> (Vec<String>, Vec<(i32, i32)>, String) {
     let mut token_spans = Vec::with_capacity(blocks.len());
-    let mut tokens = Vec::with_capacity(blocks.len() + usize::from(bsj_gap_idx.is_some()));
+    let mut tokens = Vec::with_capacity(blocks.len() + boundary_gap_idxs.len());
     let mut cigar = String::new();
     if let Some(first) = blocks.first() {
         let leading_clip = if reverse_chain_order {
@@ -4486,7 +4493,11 @@ fn materialize_read_chain_output(
         if idx > 0 {
             let prev = &blocks[idx - 1];
             let gap = interval_gap(prev, block);
-            let op = if bsj_gap_idx == Some(idx) { 'B' } else { 'N' };
+            let op = if boundary_gap_idxs.contains(&idx) {
+                'B'
+            } else {
+                'N'
+            };
             let _ = write!(&mut cigar, "{}{}", gap, op);
             if op == 'B' {
                 tokens.push("<bsj>".to_string());
@@ -4522,6 +4533,22 @@ fn read_order_bsj_gap_index(
     read_blocks.windows(2).enumerate().find_map(|(idx, pair)| {
         is_bsj_transition(&pair[0], &pair[1], circ, order_strand).then_some(idx + 1)
     })
+}
+
+/// Returns read-chain gap indexes that wrap against strand-specific linear order.
+///
+/// These indexes are used for non-BSJ backward rows. They are not treated as
+/// strong BSJ evidence, but the `.segments` CIGAR still needs `B` operators at
+/// the actual read-order wrap positions so downstream graph code can distinguish
+/// backward topology from ordinary splice `N` gaps.
+fn read_order_wrap_gap_indexes(read_blocks: &[SegmentBlock], order_strand: char) -> Vec<usize> {
+    read_blocks
+        .windows(2)
+        .enumerate()
+        .filter_map(|(idx, pair)| {
+            wraps_in_read_order(&pair[0], &pair[1], order_strand).then_some(idx + 1)
+        })
+        .collect()
 }
 
 /// Returns the skipped genomic distance between two read-chain blocks.
@@ -4564,7 +4591,7 @@ fn apply_circ_boundary_corrections(blocks: &mut [SegmentBlock], circ: Option<&Ci
 fn apply_segment_boundary_corrections(
     blocks: &mut [SegmentBlock],
     chrom: &str,
-    bsj_gap_idx: Option<usize>,
+    boundary_gap_idxs: &[usize],
     junction_hints: &[(i32, i32)],
     correction: Option<&SegmentCorrectionContext<'_>>,
     token_strand: char,
@@ -4573,7 +4600,7 @@ fn apply_segment_boundary_corrections(
         return;
     }
     for idx in 0..blocks.len() - 1 {
-        if bsj_gap_idx == Some(idx + 1) {
+        if boundary_gap_idxs.contains(&(idx + 1)) {
             continue;
         }
         let (left_idx, right_idx) = if blocks[idx].ref_start <= blocks[idx + 1].ref_start {
@@ -5547,8 +5574,8 @@ mod tests {
         assert_eq!(record.end, "249");
         assert_eq!(record.strand, "NA");
         assert_eq!(record.is_circular, 1);
-        assert_eq!(record.r1_segments, "200-249:?|100-149:?");
-        assert_eq!(record.r1_cigar, "50M50N50M");
+        assert_eq!(record.r1_segments, "200-249:?|<bsj>|100-149:?");
+        assert_eq!(record.r1_cigar, "50M50B50M");
         assert_eq!(record.is_r1_bsj, 0);
     }
 
@@ -5887,7 +5914,8 @@ mod tests {
 
         assert_eq!(record.start, "4990");
         assert_eq!(record.end, "5049");
-        assert_eq!(record.r1_segments, "5000-5049:+|4990-5039:+");
+        assert_eq!(record.r1_segments, "5000-5049:+|<bsj>|4990-5039:+");
+        assert_eq!(record.r1_cigar, "50M0B50M");
     }
 
     #[test]
@@ -5990,9 +6018,9 @@ mod tests {
         assert_eq!(record.end, "203745245");
         assert_eq!(
             record.r2_segments,
-            "203745224-203745245:+|203741196-203741275:+|203743002-203743050:+"
+            "203745224-203745245:+|<bsj>|203741196-203741275:+|203743002-203743050:+"
         );
-        assert_eq!(record.r2_cigar, "22M3948N80M1726N49M");
+        assert_eq!(record.r2_cigar, "22M3948B80M1726N49M");
     }
 
     #[test]
@@ -6449,10 +6477,11 @@ mod tests {
             vec![
                 "93811203-93811231:-".to_string(),
                 "93806014-93806068:-".to_string(),
+                "<bsj>".to_string(),
                 "93811273-93811340:-".to_string(),
             ]
         );
-        assert_eq!(chain.cigar, "29M5134N55M5204N68M");
+        assert_eq!(chain.cigar, "29M5134N55M5204B68M");
     }
 
     #[test]

@@ -287,6 +287,7 @@ start-end:strand
 - `S` 只在 chain 开头或结尾输出，不表示内部 splice / BSJ 结构，也不生成对应 segment token；
 - CIGAR 和 segments 都必须按相同的 read-chain order 输出；
 - `<bsj>` / `B` 的位置必须是 read-chain 中真实发生 circular wrap 的位置，不能把 chain 重排成 genomic order 后再插入；
+- `type=backward` rows 也必须在触发 backward topology 的 read-chain wrap 处输出 `<bsj>` / `B`，但这只是 read-level topology marker，不代表 confirmed BSJ evidence；
 - 对于已经完整 materialize 的 BSJ chain，`is_r*_bsj=1` 应该等价于对应 `r*_cigar` 中存在 `B`。
 
 示例：
@@ -372,6 +373,7 @@ approximate local junction rescue 暂不进入当前 `<prefix>.segments` strong 
 - `chrom` 必须能由 selected R1/R2 chain 唯一确定；跨染色体或无法确定单一 chromosome 的 read 不进入最终 `<prefix>.segments`
 - `start / end` 表示该 read pair 所有 retained alignment segments 覆盖到的最小 / 最大 genomic position，不表示 candidate BSJ boundary
 - `is_circular=1`
+- 触发 backward topology 的 mate chain 必须在对应 `r*_segments` 中写出 `<bsj>` marker，并在 `r*_cigar` 中用 `B` 标记该 read-order wrap；`is_r*_bsj` 仍保持 0，因为它不是 Summary-confirmed BSJ mate
 - 必须输出最终 `r1_cigar / r1_segments / r2_cigar / r2_segments`
 - `is_r1_bsj=0` 且 `is_r2_bsj=0`，因为该 read pair 不是 Summary-confirmed BSJ read
 
