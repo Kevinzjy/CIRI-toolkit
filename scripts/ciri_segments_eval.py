@@ -11,14 +11,14 @@ extra views that are useful during the current development stage:
 - mate-level genomic segment sets from `r1_segments` / `r2_segments`
 - mate-level read-chain segment strings from `r1_segments` / `r2_segments`
 - mate-level junction chains derived from retained read-chain segments
-- mate-level `is_r1_bsj` / `is_r2_bsj` in prediction output
+- mate-level `is_r1_bsj` / `is_r2_bsj` for confirmed `type=bsj` rows only
 
 Additional summaries:
 
 - `BSJ_ONLY`: read-pair and mate-level metrics restricted to predicted `type=bsj`
-- `BACKWARD_AS_MISSED_BSJ`: how many predicted `type=backward` rows are actually
-  BSJ reads in simulator truth, which is useful while backward output is still
-  acting as a pool of missed-BSJ candidates
+- `BACKWARD_TRUTH_COMPOSITION`: how predicted `type=backward` rows overlap
+  simulator truth. In backward rows, `<bsj>` / `B` is treated only as a topology
+  marker and chain break, not as confirmed mate-level BSJ evidence.
 
 The default output format is a compact human-readable report. Use `--format tsv`
 to emit tidy rows that are easier to redirect into downstream shell tooling.
@@ -65,6 +65,24 @@ def pred_mate_bsj_key(mate: str) -> str:
 def truth_mate_bsj_key(mate: str) -> str:
     """Return the simulator truth mate-level BSJ column name."""
     return f"{mate}_is_bsj"
+
+
+def example_keys_for_type(pred_type: str) -> list[str]:
+    """Return example metric keys that are meaningful for one predicted type.
+
+    `type=backward` rows can contain `<bsj>` / `B` markers, but those markers
+    encode read-chain topology rather than Summary-confirmed mate BSJ evidence.
+    For that reason, backward examples deliberately exclude `is_r*_bsj`.
+    """
+    keys = (
+        [*PAIR_KEYS_BY_TYPE[pred_type]]
+        + [f"{mate}_segment_set" for mate in MATE_NAMES]
+        + [f"{mate}_segment_chain" for mate in MATE_NAMES]
+        + [f"{mate}_junction_chain" for mate in MATE_NAMES]
+    )
+    if pred_type == "bsj":
+        keys += [pred_mate_bsj_key(mate) for mate in MATE_NAMES]
+    return keys
 
 
 def parse_segment_token(token: str) -> tuple[int, int, str] | None:
@@ -394,14 +412,15 @@ def main() -> None:
                             "|".join(truth_junction_chain),
                         )
                     )
-                bsj_key = pred_mate_bsj_key(mate)
-                truth_bsj_key = truth_mate_bsj_key(mate)
-                if row[bsj_key] == truth_row[truth_bsj_key]:
-                    exact[(pred_type, bsj_key)] += 1
-                elif len(examples[(pred_type, bsj_key)]) < args.examples:
-                    examples[(pred_type, bsj_key)].append(
-                        (read_id, row[bsj_key], truth_row[truth_bsj_key])
-                    )
+                if pred_type == "bsj":
+                    bsj_key = pred_mate_bsj_key(mate)
+                    truth_bsj_key = truth_mate_bsj_key(mate)
+                    if row[bsj_key] == truth_row[truth_bsj_key]:
+                        exact[(pred_type, bsj_key)] += 1
+                    elif len(examples[(pred_type, bsj_key)]) < args.examples:
+                        examples[(pred_type, bsj_key)].append(
+                            (read_id, row[bsj_key], truth_row[truth_bsj_key])
+                        )
 
     recall_counts: Counter[str] = Counter()
     for read_id, truth_row in truth.items():
@@ -502,39 +521,27 @@ def main() -> None:
                 exact[("backward", f"{mate}_junction_chain")],
                 pred_counts["backward"],
             )
-            emit_summary(
-                "BACKWARD_ONLY",
-                f"backward_is_{mate}_bsj_exact",
-                exact[("backward", pred_mate_bsj_key(mate))],
-                pred_counts["backward"],
-            )
-        emit_summary("BACKWARD_AS_MISSED_BSJ", "backward_truth_is_bsj", backward_truth_bsj, backward_total)
+        emit_summary("BACKWARD_TRUTH_COMPOSITION", "backward_truth_is_bsj", backward_truth_bsj, backward_total)
         emit_summary(
-            "BACKWARD_AS_MISSED_BSJ",
+            "BACKWARD_TRUTH_COMPOSITION",
             "backward_truth_is_backward",
             backward_truth_backward,
             backward_total,
         )
         emit_summary(
-            "BACKWARD_AS_MISSED_BSJ",
+            "BACKWARD_TRUTH_COMPOSITION",
             "backward_truth_is_forward",
             backward_truth_forward,
             backward_total,
         )
         emit_summary(
-            "BACKWARD_AS_MISSED_BSJ",
+            "BACKWARD_TRUTH_COMPOSITION",
             "backward_truth_is_circular",
             backward_truth_bsj + backward_truth_backward,
             backward_total,
         )
         for pred_type in ("bsj", "backward"):
-            for key in (
-                [*PAIR_KEYS_BY_TYPE[pred_type]]
-                + [f"{mate}_segment_set" for mate in MATE_NAMES]
-                + [f"{mate}_segment_chain" for mate in MATE_NAMES]
-                + [f"{mate}_junction_chain" for mate in MATE_NAMES]
-                + [pred_mate_bsj_key(mate) for mate in MATE_NAMES]
-            ):
+            for key in example_keys_for_type(pred_type):
                 example_rows = examples.get((pred_type, key))
                 if not example_rows:
                     continue
@@ -609,8 +616,6 @@ def main() -> None:
         ["group", "metric", "matched", "total", "rate"],
         [
             ["pair", "is_circular", str(exact[("backward", "is_circular")]), str(pred_counts["backward"]), format_rate(exact[("backward", "is_circular")], pred_counts["backward"])],
-            ["r1", "is_bsj", str(exact[("backward", "is_r1_bsj")]), str(pred_counts["backward"]), format_rate(exact[("backward", "is_r1_bsj")], pred_counts["backward"])],
-            ["r2", "is_bsj", str(exact[("backward", "is_r2_bsj")]), str(pred_counts["backward"]), format_rate(exact[("backward", "is_r2_bsj")], pred_counts["backward"])],
             ["r1", "segment_set", str(exact[("backward", "r1_segment_set")]), str(pred_counts["backward"]), format_rate(exact[("backward", "r1_segment_set")], pred_counts["backward"])],
             ["r2", "segment_set", str(exact[("backward", "r2_segment_set")]), str(pred_counts["backward"]), format_rate(exact[("backward", "r2_segment_set")], pred_counts["backward"])],
             ["r1", "segment_chain", str(exact[("backward", "r1_segment_chain")]), str(pred_counts["backward"]), format_rate(exact[("backward", "r1_segment_chain")], pred_counts["backward"])],
@@ -640,7 +645,7 @@ def main() -> None:
     )
 
     print_table(
-        "BACKWARD_AS_MISSED_BSJ",
+        "BACKWARD_TRUTH_COMPOSITION",
         ["metric", "matched", "total", "rate"],
         [
             ["truth_is_bsj", str(backward_truth_bsj), str(backward_total), format_rate(backward_truth_bsj, backward_total)],
@@ -656,13 +661,7 @@ def main() -> None:
     )
 
     for pred_type in ("bsj", "backward"):
-        for key in (
-            [*PAIR_KEYS_BY_TYPE[pred_type]]
-            + [f"{mate}_segment_set" for mate in MATE_NAMES]
-            + [f"{mate}_segment_chain" for mate in MATE_NAMES]
-            + [f"{mate}_junction_chain" for mate in MATE_NAMES]
-            + [pred_mate_bsj_key(mate) for mate in MATE_NAMES]
-        ):
+        for key in example_keys_for_type(pred_type):
             example_rows = examples.get((pred_type, key))
             if not example_rows:
                 continue
