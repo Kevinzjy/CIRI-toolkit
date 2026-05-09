@@ -5,7 +5,7 @@ Use this after running the default post-Summary segments phase on simulator
 fixtures. The script focuses on the current read-level contract and prints two
 extra views that are useful during the current development stage:
 
-- predicted `type` (`bsj` / `backward`)
+- predicted `type` (`bsj` / `backward` / `outward`)
 - `circ_id`
 - `is_circular`
 - mate-level genomic segment sets from `r1_segments` / `r2_segments`
@@ -19,6 +19,9 @@ Additional summaries:
 - `BACKWARD_TRUTH_COMPOSITION`: how predicted `type=backward` rows overlap
   simulator truth. In backward rows, `<bsj>` / `B` is treated only as a topology
   marker and chain break, not as confirmed mate-level BSJ evidence.
+- `OUTWARD_TRUTH_COMPOSITION`: how predicted `type=outward` rows overlap
+  simulator truth. Outward rows carry pair-level circular topology support but
+  do not encode a mate-level BSJ junction.
 
 The default output format is a compact human-readable report. Use `--format tsv`
 to emit tidy rows that are easier to redirect into downstream shell tooling.
@@ -43,7 +46,11 @@ PAIR_KEYS_BY_TYPE = {
     "backward": [
         "is_circular",
     ],
+    "outward": [
+        "is_circular",
+    ],
 }
+PRED_TYPES = ("bsj", "backward", "outward")
 
 MATE_NAMES = ("r1", "r2")
 SEGMENT_ERROR_CLASSES = (
@@ -70,9 +77,10 @@ def truth_mate_bsj_key(mate: str) -> str:
 def example_keys_for_type(pred_type: str) -> list[str]:
     """Return example metric keys that are meaningful for one predicted type.
 
-    `type=backward` rows can contain `<bsj>` / `B` markers, but those markers
-    encode read-chain topology rather than Summary-confirmed mate BSJ evidence.
-    For that reason, backward examples deliberately exclude `is_r*_bsj`.
+    `type=backward` rows can contain `<bsj>` / `B` markers and `type=outward`
+    rows carry pair-level circular topology, but neither marker is
+    Summary-confirmed mate BSJ evidence. For that reason, non-BSJ examples
+    deliberately exclude `is_r*_bsj`.
     """
     keys = (
         [*PAIR_KEYS_BY_TYPE[pred_type]]
@@ -431,6 +439,10 @@ def main() -> None:
     backward_truth_bsj = confusion[("backward", "bsj")]
     backward_truth_backward = confusion[("backward", "backward")]
     backward_truth_forward = confusion[("backward", "forward")]
+    outward_total = pred_counts["outward"]
+    outward_truth_bsj = confusion[("outward", "bsj")]
+    outward_truth_backward = confusion[("outward", "backward")]
+    outward_truth_forward = confusion[("outward", "forward")]
 
     if args.format == "tsv":
         emit_summary("GLOBAL", "truth_bsj", truth_counts["bsj"])
@@ -438,7 +450,8 @@ def main() -> None:
         emit_summary("GLOBAL", "truth_forward", truth_counts["forward"])
         emit_summary("GLOBAL", "pred_bsj", pred_counts["bsj"])
         emit_summary("GLOBAL", "pred_backward", pred_counts["backward"])
-        for pred_type in ("bsj", "backward"):
+        emit_summary("GLOBAL", "pred_outward", pred_counts["outward"])
+        for pred_type in PRED_TYPES:
             for truth_type in ("bsj", "backward", "forward"):
                 emit_summary(
                     "CONFUSION",
@@ -521,6 +534,39 @@ def main() -> None:
                 exact[("backward", f"{mate}_junction_chain")],
                 pred_counts["backward"],
             )
+        for key in PAIR_KEYS_BY_TYPE["outward"]:
+            emit_summary(
+                "OUTWARD_ONLY",
+                f"outward_{key}_exact",
+                exact[("outward", key)],
+                pred_counts["outward"],
+            )
+        for mate in MATE_NAMES:
+            emit_summary(
+                "OUTWARD_ONLY",
+                f"outward_{mate}_segment_set_exact",
+                exact[("outward", f"{mate}_segment_set")],
+                pred_counts["outward"],
+            )
+            for error_class in SEGMENT_ERROR_CLASSES:
+                emit_summary(
+                    "OUTWARD_SEGMENT_ERRORS",
+                    f"{mate}_{error_class}",
+                    segment_errors[("outward", mate, error_class)],
+                    pred_counts["outward"],
+                )
+            emit_summary(
+                "OUTWARD_ONLY",
+                f"outward_{mate}_segment_chain_exact",
+                exact[("outward", f"{mate}_segment_chain")],
+                pred_counts["outward"],
+            )
+            emit_summary(
+                "OUTWARD_ONLY",
+                f"outward_{mate}_junction_chain_exact",
+                exact[("outward", f"{mate}_junction_chain")],
+                pred_counts["outward"],
+            )
         emit_summary("BACKWARD_TRUTH_COMPOSITION", "backward_truth_is_bsj", backward_truth_bsj, backward_total)
         emit_summary(
             "BACKWARD_TRUTH_COMPOSITION",
@@ -540,7 +586,26 @@ def main() -> None:
             backward_truth_bsj + backward_truth_backward,
             backward_total,
         )
-        for pred_type in ("bsj", "backward"):
+        emit_summary("OUTWARD_TRUTH_COMPOSITION", "outward_truth_is_bsj", outward_truth_bsj, outward_total)
+        emit_summary(
+            "OUTWARD_TRUTH_COMPOSITION",
+            "outward_truth_is_backward",
+            outward_truth_backward,
+            outward_total,
+        )
+        emit_summary(
+            "OUTWARD_TRUTH_COMPOSITION",
+            "outward_truth_is_forward",
+            outward_truth_forward,
+            outward_total,
+        )
+        emit_summary(
+            "OUTWARD_TRUTH_COMPOSITION",
+            "outward_truth_is_circular",
+            outward_truth_bsj + outward_truth_backward,
+            outward_total,
+        )
+        for pred_type in PRED_TYPES:
             for key in example_keys_for_type(pred_type):
                 example_rows = examples.get((pred_type, key))
                 if not example_rows:
@@ -551,14 +616,15 @@ def main() -> None:
 
     print_table(
         "GLOBAL",
-        ["source", "bsj", "backward", "forward"],
+        ["source", "bsj", "backward", "outward", "forward"],
         [
-            ["truth", str(truth_counts["bsj"]), str(truth_counts["backward"]), str(truth_counts["forward"])],
-            ["pred", str(pred_counts["bsj"]), str(pred_counts["backward"]), "NA"],
+            ["truth", str(truth_counts["bsj"]), str(truth_counts["backward"]), "NA", str(truth_counts["forward"])],
+            ["pred", str(pred_counts["bsj"]), str(pred_counts["backward"]), str(pred_counts["outward"]), "NA"],
             [
                 "recall/precision",
                 f"{format_rate(recall_counts['bsj'], truth_counts['bsj'])} / {format_rate(confusion[('bsj', 'bsj')], pred_counts['bsj'])}",
                 f"{format_rate(recall_counts['backward'], truth_counts['backward'])} / {format_rate(confusion[('backward', 'backward')], pred_counts['backward'])}",
+                f"NA / {format_rate(confusion[('outward', 'forward')], pred_counts['outward'])}",
                 "NA",
             ],
         ],
@@ -574,6 +640,12 @@ def main() -> None:
                 str(confusion[("backward", "bsj")]),
                 str(confusion[("backward", "backward")]),
                 str(confusion[("backward", "forward")]),
+            ],
+            [
+                "outward",
+                str(confusion[("outward", "bsj")]),
+                str(confusion[("outward", "backward")]),
+                str(confusion[("outward", "forward")]),
             ],
         ],
     )
@@ -645,6 +717,39 @@ def main() -> None:
     )
 
     print_table(
+        "OUTWARD",
+        ["group", "metric", "matched", "total", "rate"],
+        [
+            ["pair", "is_circular", str(exact[("outward", "is_circular")]), str(pred_counts["outward"]), format_rate(exact[("outward", "is_circular")], pred_counts["outward"])],
+            ["r1", "segment_set", str(exact[("outward", "r1_segment_set")]), str(pred_counts["outward"]), format_rate(exact[("outward", "r1_segment_set")], pred_counts["outward"])],
+            ["r2", "segment_set", str(exact[("outward", "r2_segment_set")]), str(pred_counts["outward"]), format_rate(exact[("outward", "r2_segment_set")], pred_counts["outward"])],
+            ["r1", "segment_chain", str(exact[("outward", "r1_segment_chain")]), str(pred_counts["outward"]), format_rate(exact[("outward", "r1_segment_chain")], pred_counts["outward"])],
+            ["r2", "segment_chain", str(exact[("outward", "r2_segment_chain")]), str(pred_counts["outward"]), format_rate(exact[("outward", "r2_segment_chain")], pred_counts["outward"])],
+            ["r1", "junction_chain", str(exact[("outward", "r1_junction_chain")]), str(pred_counts["outward"]), format_rate(exact[("outward", "r1_junction_chain")], pred_counts["outward"])],
+            ["r2", "junction_chain", str(exact[("outward", "r2_junction_chain")]), str(pred_counts["outward"]), format_rate(exact[("outward", "r2_junction_chain")], pred_counts["outward"])],
+        ],
+    )
+
+    print_table(
+        f"OUTWARD_SEGMENT_ERRORS min_seg_len={args.min_seg_len}",
+        ["mate", "error_class", "count", "total", "rate"],
+        [
+            [
+                mate,
+                error_class,
+                str(segment_errors[("outward", mate, error_class)]),
+                str(pred_counts["outward"]),
+                format_rate(
+                    segment_errors[("outward", mate, error_class)],
+                    pred_counts["outward"],
+                ),
+            ]
+            for mate in MATE_NAMES
+            for error_class in SEGMENT_ERROR_CLASSES
+        ],
+    )
+
+    print_table(
         "BACKWARD_TRUTH_COMPOSITION",
         ["metric", "matched", "total", "rate"],
         [
@@ -660,7 +765,23 @@ def main() -> None:
         ],
     )
 
-    for pred_type in ("bsj", "backward"):
+    print_table(
+        "OUTWARD_TRUTH_COMPOSITION",
+        ["metric", "matched", "total", "rate"],
+        [
+            ["truth_is_bsj", str(outward_truth_bsj), str(outward_total), format_rate(outward_truth_bsj, outward_total)],
+            ["truth_is_backward", str(outward_truth_backward), str(outward_total), format_rate(outward_truth_backward, outward_total)],
+            ["truth_is_forward", str(outward_truth_forward), str(outward_total), format_rate(outward_truth_forward, outward_total)],
+            [
+                "truth_is_circular",
+                str(outward_truth_bsj + outward_truth_backward),
+                str(outward_total),
+                format_rate(outward_truth_bsj + outward_truth_backward, outward_total),
+            ],
+        ],
+    )
+
+    for pred_type in PRED_TYPES:
         for key in example_keys_for_type(pred_type):
             example_rows = examples.get((pred_type, key))
             if not example_rows:

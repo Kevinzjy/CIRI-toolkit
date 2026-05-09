@@ -122,8 +122,8 @@ struct XaAlternative {
 ///
 /// This is the formal handoff format between the CIRI-AS-style evidence capture
 /// and future full-length reconstruction. The current default CLI path emits
-/// confirmed `bsj` rows only; `backward` and `forward` remain supported by the
-/// internal builders for later extra-scan phases.
+/// confirmed `bsj` rows, mate-chain `backward` rows, and pair-orientation
+/// `outward` rows; `forward` remains reserved for later circ-span extraction.
 struct SegmentRecord {
     read_id: String,
     type_name: &'static str,
@@ -349,6 +349,19 @@ struct CircCluster {
     end: i32,
 }
 
+/// Exact Summary circRNA span used for pair-level outward evidence gating.
+///
+/// Clusters are intentionally broader because CIRI-AS uses them as a scan-time
+/// prefilter. `type=outward` rows are weaker graph evidence, so they should at
+/// least be contained by one detected circRNA span even though read-level output
+/// still keeps `circ_id=NA` for later circRNA-level assignment.
+#[derive(Debug, Clone, Copy)]
+struct CircSpan {
+    start: i32,
+    end: i32,
+    max_end_through: i32,
+}
+
 /// Parsed result of the CIRI-AS `MSID` CIGAR classifier.
 ///
 /// `kind`, `clip1`, `clip2`, and `ref_len` map directly to the four values
@@ -464,12 +477,14 @@ pub fn run_ciri_as(config: AsConfig<'_>) -> Result<()> {
         mate_bsj_evidence,
         reference: config.reference,
         annotation: config.annotation,
+        circ_spans_by_chr: circ_spans_by_chr(&circ_records),
         clusters_by_chr: clusters_by_chr(clusters),
         read_len,
         candidates: Vec::new(),
         coverage: HashMap::new(),
         read_mappings: HashMap::new(),
         seen_junction_reads: HashSet::new(),
+        outward_read_ids: HashSet::new(),
         segment_groups,
         stats: AsStats::default(),
     };
@@ -532,12 +547,14 @@ struct ScanState<'a> {
     mate_bsj_evidence: HashMap<String, Vec<MateBsjEvidence>>,
     reference: &'a HashMap<String, String>,
     annotation: Option<&'a Annotation>,
+    circ_spans_by_chr: HashMap<String, Vec<CircSpan>>,
     clusters_by_chr: HashMap<String, Vec<CircCluster>>,
     read_len: i32,
     candidates: Vec<PositiveCandidate>,
     coverage: HashMap<String, HashMap<i32, u32>>,
     read_mappings: HashMap<String, [Vec<ReadMapping>; 2]>,
     seen_junction_reads: HashSet<String>,
+    outward_read_ids: HashSet<String>,
     segment_groups: HashMap<String, Vec<AsAlignment>>,
     stats: AsStats,
 }
@@ -815,6 +832,27 @@ fn build_circ_clusters(records: &[CircRecord]) -> Vec<CircCluster> {
         });
     }
     clusters
+}
+
+/// Indexes exact Summary circRNA spans by chromosome for outward-pair gating.
+fn circ_spans_by_chr(records: &[CircRecord]) -> HashMap<String, Vec<CircSpan>> {
+    let mut map: HashMap<String, Vec<CircSpan>> = HashMap::new();
+    for record in records {
+        map.entry(record.chr.clone()).or_default().push(CircSpan {
+            start: record.start,
+            end: record.end,
+            max_end_through: record.end,
+        });
+    }
+    for spans in map.values_mut() {
+        spans.sort_by_key(|span| (span.start, span.end));
+        let mut max_end = i32::MIN;
+        for span in spans {
+            max_end = max_end.max(span.end);
+            span.max_end_through = max_end;
+        }
+    }
+    map
 }
 
 /// Indexes compact circ clusters by chromosome for fast overlap checks.
@@ -1133,6 +1171,13 @@ fn process_backward_group(
     if records.is_empty() || state.junction_read_to_circ.contains_key(read_id) {
         return Ok(());
     }
+    if is_outward_pair_group(records, state) {
+        state
+            .segment_groups
+            .entry(read_id.to_string())
+            .or_insert_with(|| records.to_vec());
+        state.outward_read_ids.insert(read_id.to_string());
+    }
     if records.len() > 2 && overlaps_any_circ_cluster(records, state) {
         state
             .segment_groups
@@ -1252,6 +1297,75 @@ fn overlaps_any_circ_cluster(records: &[AsAlignment], state: &ScanState) -> bool
         }
     }
     false
+}
+
+/// Returns whether one non-BSJ read group is pair-level outward circ evidence.
+///
+/// Unlike `type=backward`, this detector does not require a mate-internal read
+/// chain wrap. It keeps the common RO-like case where both mates align linearly
+/// but the pair faces outward inside at least one detected circRNA span. The row
+/// remains `circ_id=NA`; later graph construction may project it onto every
+/// compatible circRNA instead of forcing a read-level unique assignment.
+fn is_outward_pair_group(records: &[AsAlignment], state: &ScanState) -> bool {
+    let Some((r1, r2)) = primary_mate_pair(records) else {
+        return false;
+    };
+    if r1.chr != r2.chr || r1.chr == "*" || r1.mapq < MAPQ_THRES || r2.mapq < MAPQ_THRES {
+        return false;
+    }
+    let Some((r1_start, r1_end)) = alignment_ref_span(r1, state.read_len) else {
+        return false;
+    };
+    let Some((r2_start, r2_end)) = alignment_ref_span(r2, state.read_len) else {
+        return false;
+    };
+    let (left, right) = if r1_start <= r2_start {
+        (r1, r2)
+    } else {
+        (r2, r1)
+    };
+    if !is_reverse_strand(left.flag) || is_reverse_strand(right.flag) {
+        return false;
+    }
+    let span_start = r1_start.min(r2_start);
+    let span_end = r1_end.max(r2_end);
+    span_contained_in_any_circ(&r1.chr, span_start, span_end, state)
+}
+
+/// Selects the single primary R1/R2 pair used for outward orientation checks.
+fn primary_mate_pair(records: &[AsAlignment]) -> Option<(&AsAlignment, &AsAlignment)> {
+    let mut r1: Option<&AsAlignment> = None;
+    let mut r2: Option<&AsAlignment> = None;
+    for record in records {
+        if is_secondary(record.flag) || is_supplementary(record.flag) || record.flag & 0x4 != 0 {
+            continue;
+        }
+        match mate_bucket(record.flag) {
+            0 if r1.is_none() => r1 = Some(record),
+            0 => return None,
+            1 if r2.is_none() => r2 = Some(record),
+            1 => return None,
+            _ => return None,
+        }
+    }
+    Some((r1?, r2?))
+}
+
+/// Returns the reference span covered by one alignment's retained blocks.
+fn alignment_ref_span(record: &AsAlignment, read_len: i32) -> Option<(i32, i32)> {
+    let blocks = parse_alignment_blocks(record, read_len)?;
+    let start = blocks.iter().map(|block| block.ref_start).min()?;
+    let end = blocks.iter().map(|block| block.ref_end).max()?;
+    Some((start, end))
+}
+
+/// Tests whether one read-pair span is contained by any detected circRNA span.
+fn span_contained_in_any_circ(chrom: &str, start: i32, end: i32, state: &ScanState) -> bool {
+    let Some(spans) = state.circ_spans_by_chr.get(chrom) else {
+        return false;
+    };
+    let idx = spans.partition_point(|span| span.start <= start);
+    idx > 0 && spans[idx - 1].max_end_through >= end
 }
 
 /// Splits one read group by reverse-strand flag and runs CIRI-AS pair matching.
@@ -1481,6 +1595,11 @@ fn reverse_bit(flag: i32) -> i32 {
     } else {
         0
     }
+}
+
+/// Returns whether the SAM reverse-complement flag is set.
+fn is_reverse_strand(flag: i32) -> bool {
+    flag & 0x10 != 0
 }
 
 /// Checks the full circ-boundary predicate used by the product `-1` branch.
@@ -3184,7 +3303,13 @@ fn build_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
 /// interval arbitration for them.
 fn build_sidecar_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
     let mut out = build_confirmed_bsj_segment_records(state)?;
-    out.extend(build_backward_segment_records(state)?);
+    let backward_records = build_backward_segment_records(state)?;
+    let backward_read_ids: HashSet<String> = backward_records
+        .iter()
+        .map(|record| record.read_id.clone())
+        .collect();
+    out.extend(backward_records);
+    out.extend(build_outward_segment_records(state, &backward_read_ids)?);
     sort_segment_records(&mut out);
     Ok(out)
 }
@@ -3339,6 +3464,34 @@ fn build_backward_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord
                 Some(&correction),
                 state.read_len,
             )
+        })
+        .collect();
+    Ok(records)
+}
+
+/// Converts pair-level outward evidence into `type=outward` segment rows.
+///
+/// Backward rows win when the same read also has a mate-internal circular chain:
+/// that evidence is stronger because it materializes a read-chain wrap. Outward
+/// rows deliberately keep `circ_id=NA` and contain no `B` operator so later
+/// circRNA-level graph construction can project one read onto every compatible
+/// circRNA without confusing pair orientation with a junction.
+fn build_outward_segment_records(
+    state: &ScanState,
+    backward_read_ids: &HashSet<String>,
+) -> Result<Vec<SegmentRecord>> {
+    let mut read_ids: Vec<&str> = state
+        .outward_read_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|read_id| !backward_read_ids.contains(*read_id))
+        .collect();
+    read_ids.sort_unstable();
+    let records = read_ids
+        .par_iter()
+        .filter_map(|read_id| {
+            let records = state.segment_groups.get(*read_id)?;
+            build_outward_segment_record(*read_id, records, state.read_len)
         })
         .collect();
     Ok(records)
@@ -3647,6 +3800,51 @@ fn build_backward_segment_record(
         end: span_end.to_string(),
         strand: "NA".to_string(),
         is_circular,
+        is_r1_bsj: 0,
+        is_r2_bsj: 0,
+        r1_cigar,
+        r1_segments,
+        r2_cigar,
+        r2_segments,
+    })
+}
+
+/// Builds one `type=outward` row from a primary outward R1/R2 pair.
+///
+/// This materializes only ordinary linear mate chains. Pair orientation is the
+/// circular signal, so the row must not write `<bsj>` or `B`; any internal `N`
+/// operators come solely from the original mate CIGAR and can support graph
+/// exon-exon edges independently of the outward pair-level evidence.
+fn build_outward_segment_record(
+    read_id: &str,
+    records: &[AsAlignment],
+    read_len: i32,
+) -> Option<SegmentRecord> {
+    let (r1, r2) = primary_mate_pair(records)?;
+    let mut chains = build_pair_chains(records, read_len, None, "outward", '?', &[], None);
+    if chains.iter().flatten().any(|chain| chain.is_circular) {
+        let selected = [r1.clone(), r2.clone()];
+        chains = build_pair_chains(&selected, read_len, None, "outward", '?', &[], None);
+    }
+    if chains.iter().flatten().any(|chain| chain.is_circular) {
+        return None;
+    }
+    let chrom = selected_chain_chrom(&chains)?;
+    let (span_start, span_end) = selected_chain_span(&chains)?;
+    if span_end - span_start + 1 > BACKWARD_MAX_SPAN {
+        return None;
+    }
+    let (r1_segments, r1_cigar, _) = chain_text(chains[0].as_ref());
+    let (r2_segments, r2_cigar, _) = chain_text(chains[1].as_ref());
+    Some(SegmentRecord {
+        read_id: read_id.to_string(),
+        type_name: "outward",
+        circ_id: "NA".to_string(),
+        chrom,
+        start: span_start.to_string(),
+        end: span_end.to_string(),
+        strand: "NA".to_string(),
+        is_circular: 1,
         is_r1_bsj: 0,
         is_r2_bsj: 0,
         r1_cigar,
@@ -4052,8 +4250,9 @@ fn type_sort_rank(type_name: &str) -> u8 {
     match type_name {
         "bsj" => 0,
         "backward" => 1,
-        "forward" => 2,
-        _ => 3,
+        "outward" => 2,
+        "forward" => 3,
+        _ => 4,
     }
 }
 
@@ -4156,6 +4355,7 @@ fn select_best_chain_for_mate(
         &non_secondary,
         read_len,
         circ,
+        type_name,
         token_strand,
         junction_hints,
         correction,
@@ -4165,6 +4365,7 @@ fn select_best_chain_for_mate(
         records,
         read_len,
         circ,
+        type_name,
         token_strand,
         junction_hints,
         correction,
@@ -4199,6 +4400,7 @@ fn build_chain_from_pool(
     records: &[&AsAlignment],
     read_len: i32,
     circ: Option<&CircRecord>,
+    type_name: &str,
     token_strand: char,
     junction_hints: &[(i32, i32)],
     correction: Option<&SegmentCorrectionContext<'_>>,
@@ -4263,7 +4465,8 @@ fn build_chain_from_pool(
             reverse_chain_order,
         )?;
         if best.as_ref().is_none_or(|current| {
-            chain_generic_rank(&chain, circ) > chain_generic_rank(current, circ)
+            chain_generic_rank(&chain, type_name, circ)
+                > chain_generic_rank(current, type_name, circ)
         }) {
             best = Some(chain);
         }
@@ -5014,10 +5217,18 @@ fn parsed_alignment_rank(record: &ParsedAlignment) -> (i32, i32, i32, i32) {
 }
 
 /// Generic chain ranking used before type-specific filtering.
-fn chain_generic_rank(chain: &MateChain, circ: Option<&CircRecord>) -> (i32, i32, i32, i32, i32) {
+fn chain_generic_rank(
+    chain: &MateChain,
+    type_name: &str,
+    circ: Option<&CircRecord>,
+) -> (i32, i32, i32, i32, i32) {
+    let topology_rank = match type_name {
+        "outward" => i32::from(!chain.is_circular),
+        _ => i32::from(chain.is_circular),
+    };
     (
         i32::from(circ.is_none_or(|circ| chain.chrom == circ.chr)),
-        i32::from(chain.is_circular),
+        topology_rank,
         i32::from(chain.is_bsj),
         -(chain.used_secondary as i32),
         chain.query_coverage,
@@ -5033,12 +5244,17 @@ fn chain_rank(
     let valid_type = match type_name {
         "bsj" => i32::from(chain.is_bsj),
         "backward" => i32::from(chain.is_circular && !chain.is_bsj),
+        "outward" => i32::from(!chain.is_circular),
         _ => 0,
+    };
+    let topology_rank = match type_name {
+        "outward" => i32::from(!chain.is_circular),
+        _ => i32::from(chain.is_circular),
     };
     (
         valid_type,
         i32::from(circ.is_none_or(|circ| chain.chrom == circ.chr)),
-        i32::from(chain.is_circular),
+        topology_rank,
         -(chain.used_secondary as i32),
         -(chain.used_supplementary as i32),
         chain.query_coverage,
@@ -5372,12 +5588,14 @@ mod tests {
             mate_bsj_evidence: HashMap::new(),
             reference: &reference,
             annotation: None,
+            circ_spans_by_chr: HashMap::new(),
             clusters_by_chr: HashMap::new(),
             read_len: 100,
             candidates: Vec::new(),
             coverage,
             read_mappings: HashMap::new(),
             seen_junction_reads: HashSet::new(),
+            outward_read_ids: HashSet::new(),
             segment_groups: HashMap::new(),
             stats: AsStats::default(),
         };
@@ -5547,12 +5765,14 @@ mod tests {
             mate_bsj_evidence: HashMap::new(),
             reference: &reference,
             annotation: None,
+            circ_spans_by_chr: HashMap::new(),
             clusters_by_chr: HashMap::new(),
             read_len: 100,
             candidates: Vec::new(),
             coverage: HashMap::new(),
             read_mappings: HashMap::new(),
             seen_junction_reads: HashSet::new(),
+            outward_read_ids: HashSet::new(),
             segment_groups: HashMap::new(),
             stats: AsStats::default(),
         };
@@ -5577,6 +5797,79 @@ mod tests {
         assert_eq!(record.r1_segments, "200-249:?|<bsj>|100-149:?");
         assert_eq!(record.r1_cigar, "50M50B50M");
         assert_eq!(record.is_r1_bsj, 0);
+    }
+
+    #[test]
+    fn outward_pair_groups_emit_linear_pair_support_without_b_marker() {
+        let records = vec![
+            AsAlignment {
+                flag: 0x40 | 0x10,
+                chr: "chr1".to_string(),
+                pos: 100,
+                mapq: 60,
+                cigar: "50M".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 0x80,
+                chr: "chr1".to_string(),
+                pos: 200,
+                mapq: 60,
+                cigar: "50M100N50M".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+        ];
+        let reference = HashMap::new();
+        let state = ScanState {
+            circ_by_id: HashMap::new(),
+            junction_read_to_circ: HashMap::new(),
+            mate_bsj_evidence: HashMap::new(),
+            reference: &reference,
+            annotation: None,
+            circ_spans_by_chr: {
+                let mut map = HashMap::new();
+                map.insert(
+                    "chr1".to_string(),
+                    vec![CircSpan {
+                        start: 90,
+                        end: 410,
+                        max_end_through: 410,
+                    }],
+                );
+                map
+            },
+            clusters_by_chr: HashMap::new(),
+            read_len: 100,
+            candidates: Vec::new(),
+            coverage: HashMap::new(),
+            read_mappings: HashMap::new(),
+            seen_junction_reads: HashSet::new(),
+            outward_read_ids: HashSet::new(),
+            segment_groups: HashMap::new(),
+            stats: AsStats::default(),
+        };
+
+        assert!(is_outward_pair_group(&records, &state));
+        let record = build_outward_segment_record("read1", &records, 100).unwrap();
+
+        assert_eq!(record.type_name, "outward");
+        assert_eq!(record.circ_id, "NA");
+        assert_eq!(record.chrom, "chr1");
+        assert_eq!(record.start, "100");
+        assert_eq!(record.end, "399");
+        assert_eq!(record.is_circular, 1);
+        assert_eq!(record.is_r1_bsj, 0);
+        assert_eq!(record.is_r2_bsj, 0);
+        assert_eq!(record.r2_cigar, "50M100N50M");
+        assert_eq!(record.r2_segments, "350-399:?|200-249:?");
+        assert!(!record.r1_segments.contains("<bsj>"));
+        assert!(!record.r2_segments.contains("<bsj>"));
+        assert!(!record.r1_cigar.contains('B'));
+        assert!(!record.r2_cigar.contains('B'));
     }
 
     #[test]

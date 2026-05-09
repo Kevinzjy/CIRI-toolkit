@@ -145,7 +145,7 @@ clips
 - `flag/chrom/pos/mapq/cigar/read_len` 是最终 chain reconstruction 需要的 mapper block；
 - `clips` 只在 CIGAR 含 soft clip 时写入 `L:<seq>` / `R:<seq>` clipped subsequence，否则写 `*`，用于追踪 validator 接受时可定位的 clip 序列；
 - validator 接受 BSJ 后，长度 `>=10bp` 且能在 circ 区间 exact match 的 soft clip 会在同一 sidecar 中追加为 `scan1_local` / `scan2_local` pseudo-alignment row；若整段 clip 无法 exact match，则允许记录最长 prefix/suffix partial exact match，但仍要求 retained match 长度 `>=10bp`；
-- 最终 `<prefix>.segments` 会用 `<prefix>.out` 的 `junction_reads_ID` 过滤 confirmed BSJ reads；`type=backward` rows 来自 Summary 后额外扫描的非 BSJ read groups；
+- 最终 `<prefix>.segments` 会用 `<prefix>.out` 的 `junction_reads_ID` 过滤 confirmed BSJ reads；`type=backward` / `type=outward` rows 来自 Summary 后额外扫描的非 BSJ read groups；
 - sidecar 文件不得反向影响 `.bsj1` / `.bsj2` / `.out`。
 
 ## 5. `<prefix>.segments` 协议
@@ -175,7 +175,7 @@ r2_segments
 chrom, start, end, type_rank, circ_id, read_id
 ```
 
-其中 `type_rank` 当前为 `bsj < backward < forward`。行内 `r1_segments / r2_segments` 仍保持 read-chain order，不改成 genomic order。
+其中 `type_rank` 当前为 `bsj < backward < outward < forward`。行内 `r1_segments / r2_segments` 仍保持 read-chain order，不改成 genomic order。
 
 ### 5.2 `type` 枚举
 
@@ -183,12 +183,14 @@ chrom, start, end, type_rank, circ_id, read_id
 
 - `bsj`
 - `backward`
+- `outward`
 - `forward`
 
 其中当前 `v1` 只实际输出：
 
 - `bsj`
 - `backward`
+- `outward`
 
 `forward` 保留给后续 circ span 内部普通线性 reads / linear-compatible reads；当前版本暂不输出。
 
@@ -198,6 +200,7 @@ pair-level `is_bsj` 不再单独输出，因为它和 `type` 完全重复：
 
 - `type=bsj` 本身表示该 read pair 是 confirmed BSJ read；
 - `type=backward` 表示非 confirmed BSJ、但 topology 呈 circular/backward 的 read；
+- `type=outward` 表示非 confirmed BSJ、R1/R2 各自 linear-compatible，但 pair orientation 呈 outward circular-compatible 的 read；
 - `type=forward` 为后续 linear-compatible reads 预留。
 
 mate-level BSJ 只保留：
@@ -213,6 +216,8 @@ mate-level BSJ 只保留：
   - 必须写唯一 `circ_id`
 - `type=backward`
   - 当前写 `NA`
+- `type=outward`
+  - 当前写 `NA`，因为同一 read 可以在 circRNA-level graph 阶段兼容多个 circ span
 - `type=forward`
   - 未来定义，当前不输出
 
@@ -223,6 +228,9 @@ mate-level BSJ 只保留：
 - `type=backward`
   - `chrom` 来自 selected R1/R2 chains 的唯一 chromosome
   - `start / end` 是该 read pair 所有 retained alignment segments 的最小 / 最大 genomic position
+- `type=outward`
+  - `chrom` 来自 selected R1/R2 primary chains 的唯一 chromosome
+  - `start / end` 是该 read pair 所有 retained alignment segments 的最小 / 最大 genomic position，不表示 candidate BSJ boundary，也不做 read-level circRNA 唯一归属
   - 这两个坐标只用于后续 genomic-position 排序和局部建图，不表示已确定 candidate BSJ boundary
 
 ### 5.5 `is_circular` 约定
@@ -377,7 +385,25 @@ approximate local junction rescue 暂不进入当前 `<prefix>.segments` strong 
 - 必须输出最终 `r1_cigar / r1_segments / r2_cigar / r2_segments`
 - `is_r1_bsj=0` 且 `is_r2_bsj=0`，因为该 read pair 不是 Summary-confirmed BSJ read
 
-### 7.3 当前暂缓
+### 7.3 `type=outward`
+
+来源：
+
+- Summary 后额外扫描到的非 BSJ read pair；
+- R1/R2 各自都能形成 linear-compatible primary chain；
+- 两个 mate 的 genomic order / strand orientation 呈 outward circular-compatible pattern，例如 plus-strand coordinate order 下的 `<-R1 R2->`。
+
+要求：
+
+- 不强行分配 `circ_id / strand`，统一写 `NA`；同一 read 可以在后续 circRNA-level graph 阶段投到所有兼容 circ span；
+- `chrom` 必须能由 selected R1/R2 primary chains 唯一确定；跨染色体或无法确定单一 chromosome 的 read 不进入最终 `<prefix>.segments`；
+- `start / end` 表示该 read pair 所有 retained alignment segments 覆盖到的最小 / 最大 genomic position；
+- `is_circular=1`，因为它是 pair-level circular-compatible topology support；
+- 不写 `<bsj>` marker，也不在 `r*_cigar` 中写 `B`，因为该 read 没有明确的 mate-chain backward junction；
+- `is_r1_bsj=0` 且 `is_r2_bsj=0`；
+- graph completeness 评估中，`type=outward` 只能贡献自身 CIGAR 中已经存在的普通 `N` junction；没有 `N` 的 outward read 只作为 circRNA-level pair/path support，不能凭空生成 exon-exon junction。
+
+### 7.4 当前暂缓
 
 以下范围明确不进入 `v1`：
 
@@ -549,9 +575,10 @@ approximate local junction rescue 暂不进入当前 `<prefix>.segments` strong 
 4. Summary 只读取 `.bsj1/.bsj2` 并输出 `<prefix>.out`
 5. segments 阶段读取 `<prefix>.out + <prefix>.segments1/2`，生成 confirmed `type=bsj` rows
 6. 用 simulator `.reads.tsv` 做 read-level 对照
-7. Summary 后额外扫描非 BSJ read groups，补充 `type=backward` rows
-8. 在 sidecar chain selection 中评估 XA-aware alternative alignment，只修复 read-level segments，不改变 CIRI3 parity 主流程
-9. 后续再通过 circRNA-level region extraction 补 `forward` / internal linear reads，并重新评估 full-length path 层
+7. Summary 后额外扫描非 BSJ read groups，补充 mate-chain wrap 型 `type=backward` rows
+8. 同一扫描中补充 pair-orientation 型 `type=outward` rows；这些 rows 不写 `<bsj>` / `B`，只作为 circRNA-level graph support
+9. 在 sidecar chain selection 中评估 XA-aware alternative alignment，只修复 read-level segments，不改变 CIRI3 parity 主流程
+10. 后续再通过 circRNA-level region extraction 补 `forward` / internal linear reads，并重新评估 full-length path 层
 
 ---
 最后更新：2026-05-07
