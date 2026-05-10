@@ -251,7 +251,7 @@ pub fn main() -> Result<()> {
     log_info(
         &mut log_writer,
         "Loading BSJ sites",
-        "generating candidate BSJ index...",
+        "Generating candidate BSJ index...",
     )?;
     let scan2_seq_len = (scan1.read_len - 12).max(1);
     // Scan1 is no longer needed once its output file and derived read length have
@@ -324,7 +324,7 @@ pub fn main() -> Result<()> {
         "Running segments",
         "Reconstructing circRNA read-level segments...",
     )?;
-    run_ciri_as(AsConfig {
+    let segment_summary = run_ciri_as(AsConfig {
         input_path: &args.in_sam,
         circ_path: &result_output,
         bsj_path: Some(&bsj_output),
@@ -337,6 +337,17 @@ pub fn main() -> Result<()> {
         &mut log_writer,
         "Segments output",
         &format!("{}.segments", args.out_prefix),
+    )?;
+    log_info(
+        &mut log_writer,
+        "Segments summary",
+        &format!(
+            "{} rows ({} BSJ, {} backward, {} outward)",
+            segment_summary.total_segments,
+            segment_summary.bsj_segments,
+            segment_summary.backward_segments,
+            segment_summary.outward_segments
+        ),
     )?;
 
     log_info(

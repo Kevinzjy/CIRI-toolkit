@@ -10,6 +10,7 @@
 //! of it.
 
 use anyhow::{anyhow, bail, Context, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use noodles::bam;
 use noodles::sam::alignment::record::data::field::{Tag, Value};
 use rayon::prelude::*;
@@ -17,8 +18,8 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::time::Instant;
+use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
+use std::time::{Duration, Instant};
 
 use crate::annotation::Annotation;
 use crate::sam_bam::{detect_format, InputFormat};
@@ -92,6 +93,23 @@ pub struct AsConfig<'a> {
     /// The Rust sidecar deliberately uses annotation as a deterministic
     /// biological tie-break before falling back to the lowest offset.
     pub annotation: Option<&'a Annotation>,
+}
+
+/// User-facing counts produced by the post-Summary segments phase.
+///
+/// These counts are computed after final segment rows have been selected, so
+/// they reflect the actual `<prefix>.segments` output rather than intermediate
+/// candidate pools.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SegmentRunSummary {
+    /// Total rows written to `<prefix>.segments`.
+    pub total_segments: usize,
+    /// Confirmed Summary-assigned BSJ rows.
+    pub bsj_segments: usize,
+    /// Non-BSJ mate-chain wrap rows.
+    pub backward_segments: usize,
+    /// Non-BSJ pair-orientation rows.
+    pub outward_segments: usize,
 }
 
 /// Compact alignment representation for CIRI-AS read-group matching.
@@ -442,7 +460,7 @@ struct AsStats {
 /// preserving CIRI3 `.out` parity. If no sidecar paths are supplied, the older
 /// CIRI-AS-style second sweep remains available for focused development and
 /// tests; full-length cirexon/path reconstruction stays dormant in this module.
-pub fn run_ciri_as(config: AsConfig<'_>) -> Result<()> {
+pub fn run_ciri_as(config: AsConfig<'_>) -> Result<SegmentRunSummary> {
     let profile = segments_profile_enabled();
     let phase_started = profile.then(Instant::now);
     let (circ_records, junction_read_to_circ) = load_circ_records(config.circ_path)?;
@@ -533,10 +551,28 @@ pub fn run_ciri_as(config: AsConfig<'_>) -> Result<()> {
     };
     log_segments_profile(profile, "build_segments", phase_started);
     state.stats.final_segments = segments.len();
+    let summary = segment_run_summary(&segments);
     let phase_started = profile.then(Instant::now);
     write_segments(&format!("{}.segments", config.out_prefix), &segments)?;
     log_segments_profile(profile, "write_segments", phase_started);
-    Ok(())
+    Ok(summary)
+}
+
+/// Summarizes final segment row counts by evidence type.
+fn segment_run_summary(records: &[SegmentRecord]) -> SegmentRunSummary {
+    let mut summary = SegmentRunSummary {
+        total_segments: records.len(),
+        ..SegmentRunSummary::default()
+    };
+    for record in records {
+        match record.type_name {
+            "bsj" => summary.bsj_segments += 1,
+            "backward" => summary.backward_segments += 1,
+            "outward" => summary.outward_segments += 1,
+            _ => {}
+        }
+    }
+    summary
 }
 
 /// Returns whether segments-phase profiling is enabled.
@@ -899,7 +935,7 @@ fn infer_read_length(path: &str) -> Result<i32> {
     let mut seen: [HashSet<String>; 2] = [HashSet::new(), HashSet::new()];
     let mut length_types: [HashMap<usize, usize>; 2] = [HashMap::new(), HashMap::new()];
     let mut fallback = None;
-    for_group_records(path, |read_id, records| {
+    for_group_records(path, false, |read_id, records| {
         for record in records {
             if record.seq.is_empty() || record.seq == "*" {
                 continue;
@@ -932,7 +968,7 @@ fn infer_read_length(path: &str) -> Result<i32> {
 
 /// Scans queryname-sorted SAM/BAM groups and records CIRI-AS splice candidates.
 fn scan_alignment_groups(path: &str, state: &mut ScanState) -> Result<()> {
-    for_group_records(path, |read_id, records| {
+    for_group_records(path, true, |read_id, records| {
         process_group(read_id, records, state)?;
         Ok(false)
     })
@@ -945,7 +981,7 @@ fn scan_alignment_groups(path: &str, state: &mut ScanState) -> Result<()> {
 /// so it can supplement `<prefix>.segments` with `type=backward` rows without
 /// overwriting the richer BSJ sidecar evidence or changing Summary parity.
 fn scan_backward_alignment_groups(path: &str, state: &mut ScanState) -> Result<()> {
-    for_group_records(path, |read_id, records| {
+    for_group_records(path, true, |read_id, records| {
         process_backward_group(read_id, records, state)?;
         Ok(false)
     })
@@ -957,36 +993,120 @@ fn scan_backward_alignment_groups(path: &str, state: &mut ScanState) -> Result<(
 /// decision code remains format-agnostic. BAM support is sequential in this first
 /// parity stage; the state boundary above is deliberately ready for sharded
 /// merging once splice output is aligned to the Perl reference.
-fn for_group_records<F>(path: &str, mut on_group: F) -> Result<()>
+fn for_group_records<F>(path: &str, show_progress: bool, mut on_group: F) -> Result<()>
 where
     F: FnMut(&str, &[AsAlignment]) -> Result<bool>,
 {
-    match detect_format(path)? {
-        InputFormat::Sam => scan_sam_groups(path, &mut on_group),
-        InputFormat::Bam => scan_bam_groups(path, &mut on_group),
+    let pb = if show_progress {
+        Some(segment_scan_progress_bar(path)?)
+    } else {
+        None
+    };
+    let result = match detect_format(path)? {
+        InputFormat::Sam => scan_sam_groups(path, &mut on_group, pb.as_ref()),
+        InputFormat::Bam => scan_bam_groups(path, &mut on_group, pb.as_ref()),
+    };
+    if let Some(pb) = pb {
+        if result.is_ok() {
+            if let Some(len) = pb.length() {
+                pb.set_position(len);
+            }
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")?
+                    .progress_chars("#>-"),
+            );
+            pb.finish_with_message("");
+        } else {
+            pb.abandon();
+        }
+    }
+    result
+}
+
+/// Creates the byte-progress display used by the segments BAM/SAM sweep.
+///
+/// This sweep can dominate whole-genome runtime because it re-reads the original
+/// queryname-sorted alignment file to collect non-BSJ backward/outward evidence.
+/// Reusing the Scan1/Scan2 progress style makes that cost visible without
+/// changing the parser or evidence semantics.
+fn segment_scan_progress_bar(path: &str) -> Result<ProgressBar> {
+    let file_size = std::fs::metadata(path)?.len();
+    let pb = ProgressBar::new(file_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {percent:>3}% ({eta}) {msg}")?
+            .progress_chars("#>-"),
+    );
+    pb.set_message("");
+    pb.enable_steady_tick(Duration::from_millis(120));
+    Ok(pb)
+}
+
+/// Updates an optional byte-progress bar from the reader position.
+fn update_segment_progress<R: Seek>(
+    reader: &mut R,
+    pb: Option<&ProgressBar>,
+    last_progress_pos: &mut u64,
+) -> Result<()> {
+    let pos = reader.stream_position()?;
+    update_segment_progress_position(pos, pb, last_progress_pos);
+    Ok(())
+}
+
+/// Applies a monotonic byte-position update to an optional progress bar.
+fn update_segment_progress_position(
+    pos: u64,
+    pb: Option<&ProgressBar>,
+    last_progress_pos: &mut u64,
+) {
+    if let Some(pb) = pb {
+        if pos > *last_progress_pos {
+            pb.inc(pos - *last_progress_pos);
+            *last_progress_pos = pos;
+        }
     }
 }
 
+/// Finishes any remaining byte-progress after the stream reaches EOF.
+fn finish_segment_progress<R: Seek>(
+    reader: &mut R,
+    pb: Option<&ProgressBar>,
+    last_progress_pos: &mut u64,
+) -> Result<()> {
+    update_segment_progress(reader, pb, last_progress_pos)
+}
+
 /// Iterates queryname-sorted SAM groups.
-fn scan_sam_groups<F>(path: &str, on_group: &mut F) -> Result<()>
+fn scan_sam_groups<F>(path: &str, on_group: &mut F, pb: Option<&ProgressBar>) -> Result<()>
 where
     F: FnMut(&str, &[AsAlignment]) -> Result<bool>,
 {
     let file = File::open(path).with_context(|| format!("open SAM {}", path))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
     let mut current_id = String::new();
     let mut group = Vec::with_capacity(8);
-    for line in BufReader::new(file).lines() {
-        let line = line?;
+    let mut records_since_progress = 0usize;
+    let mut last_progress_pos = reader.stream_position()?;
+    while reader.read_line(&mut line)? != 0 {
         if line.is_empty() || line.starts_with('@') {
+            line.clear();
             continue;
         }
-        let mut cols = line.split('\t');
+        let record_line = line.trim_end_matches(&['\r', '\n'][..]);
+        let mut cols = record_line.split('\t');
         let read_id = cols.next().unwrap_or_default();
         if !current_id.is_empty() && read_id != current_id {
             if on_group(&current_id, &group)? {
                 return Ok(());
             }
             group.clear();
+        }
+        records_since_progress += 1;
+        if records_since_progress >= 4096 {
+            update_segment_progress(&mut reader, pb, &mut last_progress_pos)?;
+            records_since_progress = 0;
         }
         current_id.clear();
         current_id.push_str(read_id);
@@ -1011,15 +1131,17 @@ where
             from_local_clip: false,
             xa_alternatives,
         });
+        line.clear();
     }
     if !group.is_empty() {
         on_group(&current_id, &group)?;
     }
+    finish_segment_progress(&mut reader, pb, &mut last_progress_pos)?;
     Ok(())
 }
 
 /// Iterates queryname-sorted BAM groups through noodles.
-fn scan_bam_groups<F>(path: &str, on_group: &mut F) -> Result<()>
+fn scan_bam_groups<F>(path: &str, on_group: &mut F, pb: Option<&ProgressBar>) -> Result<()>
 where
     F: FnMut(&str, &[AsAlignment]) -> Result<bool>,
 {
@@ -1033,6 +1155,8 @@ where
     let mut group = Vec::with_capacity(8);
     let mut cigar_buf = String::with_capacity(64);
     let mut seq_buf = String::with_capacity(256);
+    let mut records_since_progress = 0usize;
+    let mut last_progress_pos = reader.get_mut().position();
     while reader.read_record(&mut record)? != 0 {
         let read_id = record
             .name()
@@ -1043,6 +1167,15 @@ where
                 return Ok(());
             }
             group.clear();
+        }
+        records_since_progress += 1;
+        if records_since_progress >= 4096 {
+            update_segment_progress_position(
+                reader.get_mut().position(),
+                pb,
+                &mut last_progress_pos,
+            );
+            records_since_progress = 0;
         }
         current_id.clear();
         current_id.extend_from_slice(read_id);
@@ -1094,6 +1227,7 @@ where
         let id = String::from_utf8_lossy(&current_id);
         on_group(&id, &group)?;
     }
+    update_segment_progress_position(reader.get_mut().position(), pb, &mut last_progress_pos);
     Ok(())
 }
 
@@ -3710,7 +3844,11 @@ fn build_sidecar_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>
     log_segments_profile(profile, "unified_collect_junction_support", phase_started);
     let phase_started = profile.then(Instant::now);
     let junction_support_index = build_junction_support_index(&junction_support);
-    log_segments_profile(profile, "unified_build_junction_support_index", phase_started);
+    log_segments_profile(
+        profile,
+        "unified_build_junction_support_index",
+        phase_started,
+    );
     let correction = SegmentCorrectionContext {
         reference: state.reference,
         annotation: state.annotation,
@@ -3941,7 +4079,9 @@ fn rebuild_segment_record_with_correction(
             read_strand_hints,
             read_junction_hints,
         ),
-        "outward" => build_outward_segment_record(read_id, records, Some(correction), state.read_len),
+        "outward" => {
+            build_outward_segment_record(read_id, records, Some(correction), state.read_len)
+        }
         _ => None,
     }
 }
