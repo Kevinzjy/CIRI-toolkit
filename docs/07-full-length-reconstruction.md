@@ -327,8 +327,9 @@ r1_cigar    = 5S21M90B50M30N20M4S
 
 - read-specific validated junction hint 优先级最高；
 - transcript-consistent splice pair 高于普通 exon-boundary pair；
-- confirmed BSJ reads 的 preliminary segment junction support 可作为第二轮 support-aware tie breaker；
-- 第二轮不是全量重建：只有 preliminary chain 中某个 internal `N` junction 附近存在不同的 supported splice pair 时，才重新 materialize 该 read；其他 confirmed BSJ reads 直接复用第一轮结果；
+- `type=bsj/backward/outward` 的 preliminary internal `N` junction support 会合并成统一 support map，作为第二轮 support-aware tie breaker；
+- 第二轮不是全量重建：只有 preliminary chain 中某个 internal `N` junction 附近存在不同的 supported splice pair 时，才重新 materialize 该 read；其他 reads 直接复用第一轮结果；
+- `type=bsj` 只在 confirmed BSJ gap 处保留特殊处理；除该 `B` gap 外，BSJ reads 的内部 `N` 与 `backward/outward` reads 的内部 `N` 使用同一套校正和 support 逻辑；
 - splice motif score 参与排序，但 motif-only 校正仍限制在保守窗口内；
 - offset movement 只作为上述信号同级时的最后 tie breaker。
 
@@ -577,8 +578,9 @@ approximate local junction rescue 暂不进入当前 `<prefix>.segments` strong 
 6. 用 simulator `.reads.tsv` 做 read-level 对照
 7. Summary 后额外扫描非 BSJ read groups，补充 mate-chain wrap 型 `type=backward` rows
 8. 同一扫描中补充 pair-orientation 型 `type=outward` rows；这些 rows 不写 `<bsj>` / `B`，只作为 circRNA-level graph support
-9. 在 sidecar chain selection 中评估 XA-aware alternative alignment，只修复 read-level segments，不改变 CIRI3 parity 主流程
-10. 后续再通过 circRNA-level region extraction 补 `forward` / internal linear reads，并重新评估 full-length path 层
+9. 对 `type=bsj/backward/outward` 的普通 internal `N` junction 统一执行 annotation / splice-signal / support-aware correction；只有 confirmed BSJ gap 使用 BSJ-specific 逻辑
+10. 在 sidecar chain selection 中评估 XA-aware alternative alignment，只修复 read-level segments，不改变 CIRI3 parity 主流程
+11. 后续再通过 circRNA-level region extraction 补 `forward` / internal linear reads，并重新评估 full-length path 层
 
 ---
-最后更新：2026-05-07
+最后更新：2026-05-10

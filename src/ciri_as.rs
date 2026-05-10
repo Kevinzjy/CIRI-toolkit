@@ -3661,46 +3661,56 @@ fn build_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
 ///
 /// Confirmed BSJ reads are materialized from Scan1/Scan2 sidecar alignments so
 /// the output keeps local clip pseudo rows captured during validation. Backward
-/// rows are appended from the supplemental non-BSJ scan and intentionally carry
-/// no circRNA assignment because the current stage has not run circRNA-level
-/// interval arbitration for them.
+/// and outward rows come from the supplemental non-BSJ scan and intentionally
+/// carry no circRNA assignment. All three evidence classes share the same
+/// internal-junction support pass; only the confirmed BSJ gap itself remains
+/// type-specific.
 fn build_sidecar_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
-    let mut out = build_confirmed_bsj_segment_records(state)?;
-    let backward_records = build_backward_segment_records(state)?;
-    let backward_read_ids: HashSet<String> = backward_records
-        .iter()
-        .map(|record| record.read_id.clone())
-        .collect();
-    out.extend(backward_records);
-    out.extend(build_outward_segment_records(state, &backward_read_ids)?);
-    sort_segment_records(&mut out);
-    Ok(out)
-}
-
-/// Converts sidecar evidence into confirmed `type=bsj` segment rows only.
-///
-/// This is the default post-Summary path: Scan1/Scan2 have already captured
-/// mapper blocks for BSJ-supporting read groups, and `.out` supplies the final
-/// circRNA assignment. Backward/internal reads are deliberately excluded here
-/// because they require a later extra scan and must not be inferred from the
-/// CIRI3 Summary-only evidence set.
-fn build_confirmed_bsj_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
     let profile = segments_profile_enabled();
+    let read_strand_hints = build_read_strand_hints(state);
+    let read_junction_hints = build_read_junction_hints(state);
     let first_pass_correction = SegmentCorrectionContext {
         reference: state.reference,
         annotation: state.annotation,
         junction_support: None,
     };
+
     let phase_started = profile.then(Instant::now);
-    let mut out =
-        build_confirmed_bsj_segment_records_with_correction(state, &first_pass_correction)?;
-    log_segments_profile(profile, "confirmed_bsj_first_pass", phase_started);
+    let mut out = build_confirmed_bsj_segment_records_with_correction(
+        state,
+        &first_pass_correction,
+        &read_junction_hints,
+    )?;
+    log_segments_profile(profile, "unified_bsj_first_pass", phase_started);
+
+    let phase_started = profile.then(Instant::now);
+    let backward_records = build_backward_segment_records_with_correction(
+        state,
+        &first_pass_correction,
+        &read_strand_hints,
+        &read_junction_hints,
+    );
+    log_segments_profile(profile, "unified_backward_first_pass", phase_started);
+    let backward_read_ids: HashSet<String> = backward_records
+        .iter()
+        .map(|record| record.read_id.clone())
+        .collect();
+    out.extend(backward_records);
+
+    let phase_started = profile.then(Instant::now);
+    out.extend(build_outward_segment_records_with_correction(
+        state,
+        &backward_read_ids,
+        &first_pass_correction,
+    ));
+    log_segments_profile(profile, "unified_outward_first_pass", phase_started);
+
     let phase_started = profile.then(Instant::now);
     let junction_support = collect_junction_support(&out);
-    log_segments_profile(profile, "collect_junction_support", phase_started);
+    log_segments_profile(profile, "unified_collect_junction_support", phase_started);
     let phase_started = profile.then(Instant::now);
     let junction_support_index = build_junction_support_index(&junction_support);
-    log_segments_profile(profile, "build_junction_support_index", phase_started);
+    log_segments_profile(profile, "unified_build_junction_support_index", phase_started);
     let correction = SegmentCorrectionContext {
         reference: state.reference,
         annotation: state.annotation,
@@ -3715,22 +3725,12 @@ fn build_confirmed_bsj_segment_records(state: &ScanState) -> Result<Vec<SegmentR
             if !segment_record_has_supported_alternative(record, &junction_support_index) {
                 return None;
             }
-            let read_id = record.read_id.as_str();
-            let records = state.segment_groups.get(read_id)?;
-            let circ_id = state.junction_read_to_circ.get(read_id)?;
-            let circ = state.circ_by_id.get(circ_id)?;
-            build_bsj_segment_record(
-                read_id,
-                records,
-                circ,
-                state
-                    .mate_bsj_evidence
-                    .get(read_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-                &[],
-                Some(&correction),
-                state.read_len,
+            rebuild_segment_record_with_correction(
+                record,
+                state,
+                &correction,
+                &read_strand_hints,
+                &read_junction_hints,
             )
             .map(|record| (idx, record))
         })
@@ -3739,13 +3739,14 @@ fn build_confirmed_bsj_segment_records(state: &ScanState) -> Result<Vec<SegmentR
     for (idx, record) in replacements {
         out[idx] = record;
     }
-    log_segments_profile(profile, "selective_second_pass", phase_started);
+    log_segments_profile(profile, "unified_selective_second_pass", phase_started);
     if profile {
         eprintln!(
-            "[CIRI_PROFILE_SEGMENTS] selective_second_pass_records: {ambiguous_records}/{}",
+            "[CIRI_PROFILE_SEGMENTS] unified_second_pass_records: {ambiguous_records}/{}",
             out.len()
         );
     }
+    sort_segment_records(&mut out);
     Ok(out)
 }
 
@@ -3753,6 +3754,7 @@ fn build_confirmed_bsj_segment_records(state: &ScanState) -> Result<Vec<SegmentR
 fn build_confirmed_bsj_segment_records_with_correction(
     state: &ScanState,
     correction: &SegmentCorrectionContext<'_>,
+    read_junction_hints: &HashMap<String, Vec<(i32, i32)>>,
 ) -> Result<Vec<SegmentRecord>> {
     let mut read_ids: Vec<&str> = state
         .junction_read_to_circ
@@ -3782,7 +3784,10 @@ fn build_confirmed_bsj_segment_records_with_correction(
                     .get(*read_id)
                     .map(Vec::as_slice)
                     .unwrap_or(&[]),
-                &[],
+                read_junction_hints
+                    .get(*read_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
                 Some(correction),
                 state.read_len,
             ))
@@ -3796,56 +3801,77 @@ fn build_confirmed_bsj_segment_records_with_correction(
 /// These reads do not have a reliable circRNA ID at this stage. The row-level
 /// topology and mate chains are still useful for downstream circRNA-level
 /// assembly, but assignment to a specific circRNA remains deferred.
-fn build_backward_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
+fn build_backward_segment_records_with_correction(
+    state: &ScanState,
+    correction: &SegmentCorrectionContext<'_>,
+    read_strand_hints: &HashMap<String, Option<char>>,
+    read_junction_hints: &HashMap<String, Vec<(i32, i32)>>,
+) -> Vec<SegmentRecord> {
     let backward_ids: HashSet<&str> = state
         .candidates
         .iter()
         .map(|candidate| candidate.read_id.as_str())
         .filter(|read_id| !state.junction_read_to_circ.contains_key(*read_id))
         .collect();
-    let read_strand_hints = build_read_strand_hints(state);
-    let read_junction_hints = build_read_junction_hints(state);
-    let correction = SegmentCorrectionContext {
-        reference: state.reference,
-        annotation: state.annotation,
-        junction_support: None,
-    };
     let mut read_ids: Vec<&str> = backward_ids.into_iter().collect();
     read_ids.sort_unstable();
-    let records = read_ids
+    read_ids
         .par_iter()
         .filter_map(|read_id| {
             let records = state.segment_groups.get(*read_id)?;
-            let base = build_backward_segment_record(
+            build_backward_segment_record_from_group(
                 *read_id,
                 records,
-                read_strand_hints.get(*read_id).copied().flatten(),
-                read_junction_hints
-                    .get(*read_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-                Some(&correction),
-                state.read_len,
-            )?;
-            let enriched_records = add_non_bsj_local_clip_alignments(records, state);
-            if enriched_records.len() == records.len() {
-                return Some(base);
-            }
-            build_backward_segment_record(
-                *read_id,
-                &enriched_records,
-                read_strand_hints.get(*read_id).copied().flatten(),
-                read_junction_hints
-                    .get(*read_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-                Some(&correction),
-                state.read_len,
+                state,
+                correction,
+                read_strand_hints,
+                read_junction_hints,
             )
-            .or(Some(base))
         })
-        .collect();
-    Ok(records)
+        .collect()
+}
+
+/// Builds one backward row with clip enrichment gated by original evidence.
+///
+/// Local clip rows may improve the internal path materialization, but they are
+/// deliberately not allowed to create a `type=backward` row. The original mapper
+/// rows must first produce a valid backward topology; enriched rows can only
+/// replace that materialization afterward.
+fn build_backward_segment_record_from_group(
+    read_id: &str,
+    records: &[AsAlignment],
+    state: &ScanState,
+    correction: &SegmentCorrectionContext<'_>,
+    read_strand_hints: &HashMap<String, Option<char>>,
+    read_junction_hints: &HashMap<String, Vec<(i32, i32)>>,
+) -> Option<SegmentRecord> {
+    let base = build_backward_segment_record(
+        read_id,
+        records,
+        read_strand_hints.get(read_id).copied().flatten(),
+        read_junction_hints
+            .get(read_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        Some(correction),
+        state.read_len,
+    )?;
+    let enriched_records = add_non_bsj_local_clip_alignments(records, state);
+    if enriched_records.len() == records.len() {
+        return Some(base);
+    }
+    build_backward_segment_record(
+        read_id,
+        &enriched_records,
+        read_strand_hints.get(read_id).copied().flatten(),
+        read_junction_hints
+            .get(read_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+        Some(correction),
+        state.read_len,
+    )
+    .or(Some(base))
 }
 
 /// Converts pair-level outward evidence into `type=outward` segment rows.
@@ -3855,15 +3881,11 @@ fn build_backward_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord
 /// rows deliberately keep `circ_id=NA` and contain no `B` operator so later
 /// circRNA-level graph construction can project one read onto every compatible
 /// circRNA without confusing pair orientation with a junction.
-fn build_outward_segment_records(
+fn build_outward_segment_records_with_correction(
     state: &ScanState,
     backward_read_ids: &HashSet<String>,
-) -> Result<Vec<SegmentRecord>> {
-    let correction = SegmentCorrectionContext {
-        reference: state.reference,
-        annotation: state.annotation,
-        junction_support: None,
-    };
+    correction: &SegmentCorrectionContext<'_>,
+) -> Vec<SegmentRecord> {
     let mut read_ids: Vec<&str> = state
         .outward_read_ids
         .iter()
@@ -3871,14 +3893,57 @@ fn build_outward_segment_records(
         .filter(|read_id| !backward_read_ids.contains(*read_id))
         .collect();
     read_ids.sort_unstable();
-    let records = read_ids
+    read_ids
         .par_iter()
         .filter_map(|read_id| {
             let records = state.segment_groups.get(*read_id)?;
-            build_outward_segment_record(*read_id, records, Some(&correction), state.read_len)
+            build_outward_segment_record(*read_id, records, Some(correction), state.read_len)
         })
-        .collect();
-    Ok(records)
+        .collect()
+}
+
+/// Rebuilds one preliminary row with the unified internal-junction correction.
+fn rebuild_segment_record_with_correction(
+    record: &SegmentRecord,
+    state: &ScanState,
+    correction: &SegmentCorrectionContext<'_>,
+    read_strand_hints: &HashMap<String, Option<char>>,
+    read_junction_hints: &HashMap<String, Vec<(i32, i32)>>,
+) -> Option<SegmentRecord> {
+    let read_id = record.read_id.as_str();
+    let records = state.segment_groups.get(read_id)?;
+    match record.type_name {
+        "bsj" => {
+            let circ_id = state.junction_read_to_circ.get(read_id)?;
+            let circ = state.circ_by_id.get(circ_id)?;
+            build_bsj_segment_record(
+                read_id,
+                records,
+                circ,
+                state
+                    .mate_bsj_evidence
+                    .get(read_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                read_junction_hints
+                    .get(read_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                Some(correction),
+                state.read_len,
+            )
+        }
+        "backward" => build_backward_segment_record_from_group(
+            read_id,
+            records,
+            state,
+            correction,
+            read_strand_hints,
+            read_junction_hints,
+        ),
+        "outward" => build_outward_segment_record(read_id, records, Some(correction), state.read_len),
+        _ => None,
+    }
 }
 
 /// Counts preliminary non-BSJ junctions for support-aware boundary ranking.
