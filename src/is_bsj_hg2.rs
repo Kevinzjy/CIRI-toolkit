@@ -956,41 +956,12 @@ impl IsBSJHg2 {
         }
     }
 
-    /// Finds the first or last occurrence of each encoded query window in `haystack`.
-    ///
-    /// This is the core retained optimization from Scan1 tuning: the old version
-    /// called `find`/`rfind` repeatedly for each window, while the current
-    /// version scans the haystack once with a rolling code. For the common
-    /// small-query case, a tiny fixed-capacity hash table avoids a nested linear
-    /// scan without changing Java-visible decisions.
-    fn find_window_positions(
-        query_codes: &[u64],
-        haystack: &[u8],
-        out: &mut [i32],
-        window_size: usize,
-        keep_last: bool,
-    ) {
-        let mut hash_keys = [u64::MAX; 128];
-        let mut hash_masks = [0u64; 128];
-        let use_hash_fast_path =
-            Self::build_query_hash(query_codes, &mut hash_keys, &mut hash_masks);
-        Self::scan_window_positions(
-            query_codes,
-            haystack,
-            out,
-            window_size,
-            keep_last,
-            use_hash_fast_path,
-            &hash_keys,
-            &hash_masks,
-        );
-    }
-
     /// Validates the mate-support sequence against circ and linear competitor
     /// regions (`Phase 3`).
     ///
-    /// The branch logic is still Java-shaped; the only substantive optimization is
-    /// the buffer-reusing rolling-window matcher above.
+    /// The branch logic is still Java-shaped. The hot-path optimizations are
+    /// limited to reusable buffers and a per-call matcher table that is shared
+    /// between circ and linear-region scans.
     pub fn is_in_circ_rna_3(
         &mut self,
         ano_read: &str,
@@ -1028,26 +999,37 @@ impl IsBSJHg2 {
                 .push(Self::encode_window(&ano_read_bytes[start..end]));
         }
 
+        let mut hash_keys = [u64::MAX; 128];
+        let mut hash_masks = [0u64; 128];
+        let use_hash_fast_path =
+            Self::build_query_hash(&self.query_code_buf, &mut hash_keys, &mut hash_masks);
+
         self.circ_pos_buf.clear();
         self.circ_pos_buf.resize(window_count, -1);
-        Self::find_window_positions(
+        Self::scan_window_positions(
             &self.query_code_buf,
             circ_range_seq.as_bytes(),
             &mut self.circ_pos_buf,
             WINDOW_SIZE,
             false,
+            use_hash_fast_path,
+            &hash_keys,
+            &hash_masks,
         );
 
         let has_pem_positions = !pem_null_range_seq.is_empty();
         if has_pem_positions {
             self.pem_pos_buf.clear();
             self.pem_pos_buf.resize(window_count, -1);
-            Self::find_window_positions(
+            Self::scan_window_positions(
                 &self.query_code_buf,
                 pem_null_range_seq.as_bytes(),
                 &mut self.pem_pos_buf,
                 WINDOW_SIZE,
                 false,
+                use_hash_fast_path,
+                &hash_keys,
+                &hash_masks,
             );
         }
 

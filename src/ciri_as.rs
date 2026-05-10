@@ -11,21 +11,26 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
+use memmap2::Mmap;
 use noodles::bam;
-use noodles::sam::alignment::record::data::field::{Tag, Value};
+use noodles::sam::{
+    self,
+    alignment::record::data::field::{Tag, Value},
+};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::time::{Duration, Instant};
 
 use crate::annotation::Annotation;
 use crate::sam_bam::{detect_format, InputFormat};
 use crate::utils::{
-    bsj_payload_start, clip_placement_cigar, clip_sequence_payload, exact_clip_match_positions,
-    is_bsj_mate_label, parse_clip_payload, reverse_complement,
+    bam_shard_count, bsj_payload_start, clip_placement_cigar, clip_sequence_payload,
+    exact_clip_match_positions, is_bsj_mate_label, parse_clip_payload, part_path,
+    reverse_complement,
 };
 
 const MIN_INTRON: i32 = 70;
@@ -93,6 +98,14 @@ pub struct AsConfig<'a> {
     /// The Rust sidecar deliberately uses annotation as a deterministic
     /// biological tie-break before falling back to the lowest offset.
     pub annotation: Option<&'a Annotation>,
+    /// Optional user-facing progress logger supplied by the CLI.
+    ///
+    /// The segments phase owns an internal BAM progress bar, but several
+    /// correctness-preserving steps run immediately after that bar completes.
+    /// Routing status through the caller keeps stdout and `<prefix>.log`
+    /// consistent with Scan1/Scan2 without giving this module direct log-file
+    /// ownership.
+    pub progress_log: Option<&'a mut dyn FnMut(&str, &str) -> Result<()>>,
 }
 
 /// User-facing counts produced by the post-Summary segments phase.
@@ -151,6 +164,7 @@ struct XaAlternative {
 /// and future full-length reconstruction. The current default CLI path emits
 /// confirmed `bsj` rows, mate-chain `backward` rows, and pair-orientation
 /// `outward` rows; `forward` remains reserved for later circ-span extraction.
+#[derive(Clone)]
 struct SegmentRecord {
     read_id: String,
     type_name: &'static str,
@@ -460,7 +474,7 @@ struct AsStats {
 /// preserving CIRI3 `.out` parity. If no sidecar paths are supplied, the older
 /// CIRI-AS-style second sweep remains available for focused development and
 /// tests; full-length cirexon/path reconstruction stays dormant in this module.
-pub fn run_ciri_as(config: AsConfig<'_>) -> Result<SegmentRunSummary> {
+pub fn run_ciri_as(mut config: AsConfig<'_>) -> Result<SegmentRunSummary> {
     let profile = segments_profile_enabled();
     let phase_started = profile.then(Instant::now);
     let (circ_records, junction_read_to_circ) = load_circ_records(config.circ_path)?;
@@ -525,6 +539,7 @@ pub fn run_ciri_as(config: AsConfig<'_>) -> Result<SegmentRunSummary> {
         read_mappings: HashMap::new(),
         seen_junction_reads: HashSet::new(),
         outward_read_ids: HashSet::new(),
+        prebuilt_segment_records: Vec::new(),
         segment_groups,
         stats: AsStats::default(),
     };
@@ -540,14 +555,41 @@ pub fn run_ciri_as(config: AsConfig<'_>) -> Result<SegmentRunSummary> {
         build_segment_records(&state)?
     } else {
         let phase_started = profile.then(Instant::now);
-        scan_backward_alignment_groups(config.input_path, &mut state)?;
+        let rescan_group_shards =
+            scan_backward_alignment_groups(config.input_path, config.out_prefix, &mut state)?;
+        log_segments_user_progress(
+            &mut config,
+            "Segments finalize",
+            "Merging shard read results...",
+        )?;
         log_segments_profile(profile, "scan_backward_alignment_groups", phase_started);
         let phase_started = profile.then(Instant::now);
-        validate_splice_motifs(&mut state.candidates, config.reference, config.annotation)?;
-        log_segments_profile(profile, "validate_backward_splice_motifs", phase_started);
+        let rescan_group_indexes = if let Some(shard_paths) = &rescan_group_shards {
+            Some(merge_segment_scan_candidate_shards(
+                &mut state,
+                shard_paths,
+            )?)
+        } else {
+            None
+        };
+        log_segments_profile(profile, "merge_segment_scan_candidates", phase_started);
+        log_segments_user_progress(
+            &mut config,
+            "Segments finalize",
+            "Collecting junction support and correcting ambiguous rows...",
+        )?;
+        let phase_started = profile.then(Instant::now);
+        if let Some(shard_paths) = &rescan_group_shards {
+            debug_assert_eq!(
+                rescan_group_indexes.as_ref().map(Vec::len),
+                Some(shard_paths.len())
+            );
+        }
         state.stats.motif_validated = state.candidates.len();
         state.stats.junction_reads_seen = state.segment_groups.len();
-        build_sidecar_segment_records(&state)?
+        let records = build_sidecar_segment_records(&mut state, rescan_group_indexes)?;
+        log_segments_profile(profile, "build_sidecar_segment_records", phase_started);
+        records
     };
     log_segments_profile(profile, "build_segments", phase_started);
     state.stats.final_segments = segments.len();
@@ -594,6 +636,14 @@ fn log_segments_profile(enabled: bool, label: &str, started: Option<Instant>) {
     }
 }
 
+/// Emits one user-facing segments progress line through the caller's logger.
+fn log_segments_user_progress(config: &mut AsConfig<'_>, label: &str, message: &str) -> Result<()> {
+    if let Some(logger) = config.progress_log.as_deref_mut() {
+        logger(label, message)?;
+    }
+    Ok(())
+}
+
 /// Mutable state accumulated while scanning the original alignment file.
 ///
 /// Perl stores these as package globals. Rust keeps them in one struct so later
@@ -613,8 +663,70 @@ struct ScanState<'a> {
     read_mappings: HashMap<String, [Vec<ReadMapping>; 2]>,
     seen_junction_reads: HashSet<String>,
     outward_read_ids: HashSet<String>,
+    prebuilt_segment_records: Vec<SegmentRecord>,
     segment_groups: HashMap<String, Vec<AsAlignment>>,
     stats: AsStats,
+}
+
+/// Read-only inputs shared by parallel segments BAM shards.
+///
+/// The third-pass segments scan needs the same circRNA indexes in every shard,
+/// but cloning the full `ScanState` would multiply the already-loaded BSJ
+/// sidecar evidence. This view keeps shard workers read-only and lets each
+/// worker return only newly discovered backward/outward evidence.
+struct SegmentScanContext<'a> {
+    junction_read_to_circ: &'a HashMap<String, String>,
+    reference: &'a HashMap<String, String>,
+    annotation: Option<&'a Annotation>,
+    circ_spans_by_chr: &'a HashMap<String, Vec<CircSpan>>,
+    clusters_by_chr: &'a HashMap<String, Vec<CircCluster>>,
+    read_len: i32,
+}
+
+/// Shard-local mutable output from the segments BAM rescan.
+///
+/// Keeping this separate from `ScanState` makes BGZF sharding deterministic:
+/// every read group is owned by exactly one shard, and the main thread performs
+/// the only merge into the final state.
+#[derive(Default)]
+struct SegmentScanAccum {
+    candidates: Vec<PositiveCandidate>,
+    segment_groups: HashMap<String, Vec<AsAlignment>>,
+    outward_read_ids: HashSet<String>,
+    prebuilt_segment_records: Vec<SegmentRecord>,
+    add_candidates: usize,
+}
+
+/// Path for one shard-local segments rescan spill.
+struct SegmentScanShardPaths {
+    path: String,
+}
+
+/// Byte offsets for read-local results inside one shard spill.
+///
+/// The first finalize pass needs only `R/C/S` rows, but support-aware correction
+/// may later need the original `A` rows for a small ambiguous subset. Keeping
+/// offsets lets the second pass seek directly to those read blocks instead of
+/// scanning every shard spill a second time.
+struct SegmentScanShardIndex {
+    path: String,
+    groups: HashMap<String, (u64, u64)>,
+}
+
+/// Parsed first-pass output from one shard spill.
+struct SegmentScanShardMerge {
+    accum: SegmentScanAccum,
+    index: SegmentScanShardIndex,
+}
+
+/// Streaming writer for one segments rescan shard.
+///
+/// Shards can discover many non-BSJ groups on large BAMs. Writing those groups
+/// immediately follows the Scan1/Scan2 pattern and prevents parallel workers
+/// from retaining all candidate evidence in memory until the slowest shard
+/// finishes.
+struct SegmentScanShardWriter {
+    writer: BufWriter<File>,
 }
 
 /// Reference and annotation inputs used only when formatting read-level chains.
@@ -979,12 +1091,30 @@ fn scan_alignment_groups(path: &str, state: &mut ScanState) -> Result<()> {
 /// The default segments path already receives Summary-confirmed BSJ mapper
 /// blocks from Scan1/Scan2 sidecars. This pass deliberately skips those read IDs
 /// so it can supplement `<prefix>.segments` with `type=backward` rows without
-/// overwriting the richer BSJ sidecar evidence or changing Summary parity.
-fn scan_backward_alignment_groups(path: &str, state: &mut ScanState) -> Result<()> {
-    for_group_records(path, true, |read_id, records| {
-        process_backward_group(read_id, records, state)?;
-        Ok(false)
-    })
+/// overwriting the richer BSJ sidecar evidence or changing Summary parity. BAM
+/// shards are returned before candidate merging so the CLI can report the
+/// post-progress finalize phase immediately after the scan progress bar ends.
+fn scan_backward_alignment_groups(
+    path: &str,
+    out_prefix: &str,
+    state: &mut ScanState,
+) -> Result<Option<Vec<SegmentScanShardPaths>>> {
+    let ctx = SegmentScanContext::from_state(state);
+    match detect_format(path)? {
+        InputFormat::Sam => {
+            let mut accum = SegmentScanAccum::default();
+            for_group_records(path, true, |read_id, records| {
+                process_backward_group(read_id, records, &ctx, &mut accum)?;
+                Ok(false)
+            })?;
+            merge_segment_scan_accum(state, accum);
+            Ok(None)
+        }
+        InputFormat::Bam => {
+            let shard_paths = scan_backward_bam_groups_parallel(path, out_prefix, &ctx)?;
+            Ok(Some(shard_paths))
+        }
+    }
 }
 
 /// Iterates queryname-sorted alignment groups from either SAM or BAM.
@@ -1231,6 +1361,673 @@ where
     Ok(())
 }
 
+impl<'a> SegmentScanContext<'a> {
+    /// Borrows the read-only indexes needed by the non-BSJ segments rescan.
+    fn from_state(state: &'a ScanState<'a>) -> Self {
+        Self {
+            junction_read_to_circ: &state.junction_read_to_circ,
+            reference: state.reference,
+            annotation: state.annotation,
+            circ_spans_by_chr: &state.circ_spans_by_chr,
+            clusters_by_chr: &state.clusters_by_chr,
+            read_len: state.read_len,
+        }
+    }
+}
+
+/// Merges one completed segments scan accumulator into the main state.
+fn merge_segment_scan_accum(state: &mut ScanState, accum: SegmentScanAccum) {
+    state.candidates.extend(accum.candidates);
+    state.outward_read_ids.extend(accum.outward_read_ids);
+    state
+        .prebuilt_segment_records
+        .extend(accum.prebuilt_segment_records);
+    state.stats.add_candidates += accum.add_candidates;
+    for (read_id, records) in accum.segment_groups {
+        state.segment_groups.entry(read_id).or_insert(records);
+    }
+}
+
+impl SegmentScanShardPaths {
+    /// Builds deterministic shard spill paths beside the final `.segments` file.
+    fn new(out_prefix: &str, shard_idx: usize) -> Self {
+        Self {
+            path: part_path(&format!("{out_prefix}.segments"), shard_idx),
+        }
+    }
+}
+
+impl SegmentScanShardWriter {
+    /// Opens the shard-local read-result stream for segments rescan evidence.
+    fn new(paths: &SegmentScanShardPaths) -> Result<Self> {
+        Ok(Self {
+            writer: BufWriter::with_capacity(512 * 1024, File::create(&paths.path)?),
+        })
+    }
+
+    /// Writes all retained results for one non-BSJ read group.
+    ///
+    /// The tagged stream keeps evidence read-local while still allowing a cheap
+    /// two-pass merge: `R` and `C` rows are loaded before motif validation, and
+    /// `A` rows are loaded afterward only for read IDs that survived validation
+    /// or were classified as outward.
+    fn write_read_result(
+        &mut self,
+        read_id: &str,
+        records: &[AsAlignment],
+        outward: bool,
+        candidates: &[PositiveCandidate],
+        segment_records: &[SegmentRecord],
+    ) -> Result<()> {
+        writeln!(self.writer, "R\t{read_id}\t{}", u8::from(outward))?;
+        for record in records {
+            writeln!(
+                self.writer,
+                "A\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                read_id,
+                record.flag,
+                record.chr,
+                record.pos,
+                record.mapq,
+                record.cigar,
+                if record.seq.is_empty() {
+                    "*"
+                } else {
+                    &record.seq
+                },
+                u8::from(record.from_local_clip),
+                format_xa_alternatives(&record.xa_alternatives)
+            )?;
+        }
+        for candidate in candidates {
+            writeln!(
+                self.writer,
+                "C\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                candidate.read_id,
+                candidate.chr,
+                candidate.site2,
+                candidate.site1,
+                candidate.adjust1,
+                candidate.adjust2,
+                candidate.strand_hint,
+                option_field(candidate.cigars[0].as_deref()),
+                option_field(candidate.cigars[1].as_deref()),
+                option_field(candidate.cigars[2].as_deref())
+            )?;
+        }
+        for record in segment_records {
+            writeln!(
+                self.writer,
+                "S\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                record.read_id,
+                record.type_name,
+                record.circ_id,
+                record.chrom,
+                record.start,
+                record.end,
+                record.strand,
+                record.is_circular,
+                record.is_r1_bsj,
+                record.is_r2_bsj,
+                record.r1_cigar,
+                record.r1_segments,
+                record.r2_cigar,
+                record.r2_segments
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Flushes all shard-local spill writers before the main thread merges them.
+    fn flush(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        Ok(())
+    }
+}
+
+/// Formats an optional TSV field without introducing empty-column ambiguity.
+fn option_field(value: Option<&str>) -> &str {
+    value.filter(|value| !value.is_empty()).unwrap_or("*")
+}
+
+/// Serializes XA alternatives into a shard-local sidecar field.
+fn format_xa_alternatives(alternatives: &[XaAlternative]) -> String {
+    let mut out = String::new();
+    for alternative in alternatives {
+        let _ = write!(
+            out,
+            "{},{},{},{},{};",
+            alternative.chr,
+            alternative.strand,
+            alternative.pos,
+            alternative.cigar,
+            alternative.edit_distance
+        );
+    }
+    out
+}
+
+/// Parses XA alternatives previously written by a segments rescan shard.
+fn parse_xa_alternatives_field(raw: &str) -> Vec<XaAlternative> {
+    raw.split(';')
+        .filter_map(|entry| {
+            if entry.is_empty() {
+                return None;
+            }
+            let mut parts = entry.split(',');
+            Some(XaAlternative {
+                chr: parts.next()?.to_string(),
+                strand: parts.next()?.chars().next()?,
+                pos: parts.next()?.parse().ok()?,
+                cigar: parts.next()?.to_string(),
+                edit_distance: parts.next()?.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// Merges shard-local candidate/outward evidence, leaving alignments on disk.
+fn merge_segment_scan_candidate_shards(
+    state: &mut ScanState,
+    shard_paths: &[SegmentScanShardPaths],
+) -> Result<Vec<SegmentScanShardIndex>> {
+    let mut merges: Vec<(usize, SegmentScanShardMerge)> = shard_paths
+        .par_iter()
+        .enumerate()
+        .map(|(idx, paths)| merge_segment_candidate_shard(&paths.path).map(|merge| (idx, merge)))
+        .collect::<Result<Vec<_>>>()?;
+    merges.sort_by_key(|(idx, _)| *idx);
+    let mut indexes = Vec::with_capacity(merges.len());
+    for (_, merge) in merges {
+        merge_segment_scan_accum(state, merge.accum);
+        indexes.push(merge.index);
+    }
+    Ok(indexes)
+}
+
+/// Merges the requested shard-local groups after preliminary row screening.
+fn merge_segment_scan_group_shards_for_reads(
+    state: &mut ScanState,
+    shard_indexes: Vec<SegmentScanShardIndex>,
+    required_groups: &HashSet<String>,
+) -> Result<()> {
+    let mut shard_groups: Vec<(usize, Vec<(u64, u64)>)> = shard_indexes
+        .iter()
+        .enumerate()
+        .map(|(idx, shard)| {
+            let mut ranges: Vec<(u64, u64)> = required_groups
+                .iter()
+                .filter_map(|read_id| shard.groups.get(read_id).copied())
+                .collect();
+            ranges.sort_unstable_by_key(|(start, _)| *start);
+            (idx, ranges)
+        })
+        .collect();
+    shard_groups.retain(|(_, ranges)| !ranges.is_empty());
+
+    let mut loaded: Vec<(usize, Vec<(String, Vec<AsAlignment>)>)> = shard_groups
+        .into_par_iter()
+        .map(|(idx, ranges)| {
+            load_segment_groups_by_ranges(&shard_indexes[idx].path, &ranges)
+                .map(|groups| (idx, groups))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    loaded.sort_by_key(|(idx, _)| *idx);
+    for (_, groups) in loaded {
+        for (read_id, records) in groups {
+            state.segment_groups.entry(read_id).or_insert(records);
+        }
+    }
+    for shard in shard_indexes {
+        let _ = std::fs::remove_file(&shard.path);
+    }
+    Ok(())
+}
+
+/// Loads one shard's pre-validation candidate/outward tags and read offsets.
+fn merge_segment_candidate_shard(path: &str) -> Result<SegmentScanShardMerge> {
+    let file = File::open(path).with_context(|| format!("open segments rescan results {path}"))?;
+    let mut reader = BufReader::new(file);
+    let mut accum = SegmentScanAccum::default();
+    let mut index = SegmentScanShardIndex {
+        path: path.to_string(),
+        groups: HashMap::new(),
+    };
+    let mut line = String::new();
+    let mut offset = 0u64;
+    let mut current_read_id: Option<String> = None;
+    let mut current_start = 0u64;
+    let mut current_has_alignment = false;
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
+        }
+        let line_start = offset;
+        offset += bytes as u64;
+        let line = line.trim_end_matches(['\n', '\r']);
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        match parts.first().copied() {
+            Some("R") if parts.len() >= 3 && parts[2] == "1" => {
+                finalize_segment_group_offset(
+                    &mut index,
+                    current_read_id.take(),
+                    current_start,
+                    line_start,
+                    current_has_alignment,
+                );
+                current_read_id = Some(parts[1].to_string());
+                current_start = line_start;
+                current_has_alignment = false;
+                accum.outward_read_ids.insert(parts[1].to_string());
+            }
+            Some("R") if parts.len() >= 2 => {
+                finalize_segment_group_offset(
+                    &mut index,
+                    current_read_id.take(),
+                    current_start,
+                    line_start,
+                    current_has_alignment,
+                );
+                current_read_id = Some(parts[1].to_string());
+                current_start = line_start;
+                current_has_alignment = false;
+            }
+            Some("A") => {
+                current_has_alignment = true;
+            }
+            Some("C") if parts.len() >= 11 => {
+                accum.candidates.push(PositiveCandidate {
+                    read_id: parts[1].to_string(),
+                    index: 0,
+                    chr: parts[2].to_string(),
+                    site2: parts[3].parse().unwrap_or(0),
+                    site1: parts[4].parse().unwrap_or(0),
+                    adjust1: parts[5].parse().unwrap_or(0),
+                    adjust2: parts[6].parse().unwrap_or(0),
+                    strand_hint: parts[7].parse().unwrap_or(0),
+                    cigars: [
+                        parse_optional_field(parts[8]),
+                        parse_optional_field(parts[9]),
+                        parse_optional_field(parts[10]),
+                    ],
+                });
+                accum.add_candidates += 1;
+            }
+            Some("S") if parts.len() >= 15 => {
+                if let Some(record) = segment_record_from_shard_fields(&parts[1..]) {
+                    accum.prebuilt_segment_records.push(record);
+                }
+            }
+            _ => {}
+        }
+    }
+    finalize_segment_group_offset(
+        &mut index,
+        current_read_id,
+        current_start,
+        offset,
+        current_has_alignment,
+    );
+    Ok(SegmentScanShardMerge { accum, index })
+}
+
+/// Stores one read block range when the shard retained alignment rows for it.
+fn finalize_segment_group_offset(
+    index: &mut SegmentScanShardIndex,
+    read_id: Option<String>,
+    start: u64,
+    end: u64,
+    has_alignment: bool,
+) {
+    if has_alignment && end > start {
+        if let Some(read_id) = read_id {
+            index.groups.insert(read_id, (start, end));
+        }
+    }
+}
+
+/// Loads selected read-local alignment rows by byte range from one shard spill.
+fn load_segment_groups_by_ranges(
+    path: &str,
+    ranges: &[(u64, u64)],
+) -> Result<Vec<(String, Vec<AsAlignment>)>> {
+    let mut file =
+        File::open(path).with_context(|| format!("open segments rescan results {path}"))?;
+    let mut groups = Vec::with_capacity(ranges.len());
+    let mut buffer = Vec::new();
+    for &(start, end) in ranges {
+        if end <= start {
+            continue;
+        }
+        buffer.clear();
+        buffer.resize((end - start) as usize, 0);
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer)?;
+        if let Some(group) = parse_segment_group_block(&buffer)? {
+            groups.push(group);
+        }
+    }
+    Ok(groups)
+}
+
+/// Parses the retained alignment rows from one read-local shard block.
+fn parse_segment_group_block(block: &[u8]) -> Result<Option<(String, Vec<AsAlignment>)>> {
+    let text = std::str::from_utf8(block)?;
+    let mut read_id: Option<String> = None;
+    let mut records = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        match parts.first().copied() {
+            Some("R") if parts.len() >= 2 => {
+                read_id = Some(parts[1].to_string());
+            }
+            Some("A") if parts.len() >= 10 => {
+                records.push(AsAlignment {
+                    flag: parts[2].parse().unwrap_or(0),
+                    chr: parts[3].to_string(),
+                    pos: parts[4].parse().unwrap_or(0),
+                    mapq: parts[5].parse().unwrap_or(0),
+                    cigar: parts[6].to_string(),
+                    seq: if parts[7] == "*" {
+                        String::new()
+                    } else {
+                        parts[7].to_string()
+                    },
+                    from_local_clip: parts[8] == "1",
+                    xa_alternatives: parse_xa_alternatives_field(parts[9]),
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(read_id.and_then(|read_id| (!records.is_empty()).then_some((read_id, records))))
+}
+
+/// Parses one shard-local preliminary segment row.
+fn segment_record_from_shard_fields(parts: &[&str]) -> Option<SegmentRecord> {
+    Some(SegmentRecord {
+        read_id: parts.first()?.to_string(),
+        type_name: match *parts.get(1)? {
+            "backward" => "backward",
+            "outward" => "outward",
+            _ => return None,
+        },
+        circ_id: parts.get(2)?.to_string(),
+        chrom: parts.get(3)?.to_string(),
+        start: parts.get(4)?.to_string(),
+        end: parts.get(5)?.to_string(),
+        strand: parts.get(6)?.to_string(),
+        is_circular: parts.get(7)?.parse().ok()?,
+        is_r1_bsj: parts.get(8)?.parse().ok()?,
+        is_r2_bsj: parts.get(9)?.parse().ok()?,
+        r1_cigar: parts.get(10)?.to_string(),
+        r1_segments: parts.get(11)?.to_string(),
+        r2_cigar: parts.get(12)?.to_string(),
+        r2_segments: parts.get(13)?.to_string(),
+    })
+}
+
+/// Parses a shard-local optional text field.
+fn parse_optional_field(value: &str) -> Option<String> {
+    (value != "*").then(|| value.to_string())
+}
+
+/// Processes the segments BAM rescan in BGZF shards.
+///
+/// This mirrors the Scan1/Scan2 ownership rule: a non-zero shard starts
+/// decoding from the previous BGZF block, skips the leading partial read group,
+/// and then owns each subsequent queryname group until it crosses the shard end.
+fn scan_backward_bam_groups_parallel(
+    path: &str,
+    out_prefix: &str,
+    ctx: &SegmentScanContext<'_>,
+) -> Result<Vec<SegmentScanShardPaths>> {
+    let file = File::open(path).with_context(|| format!("open BAM {}", path))?;
+    let file_size = std::fs::metadata(path)?.len();
+    let mmap = unsafe { Mmap::map(&file)? };
+    let num_threads = bam_shard_count(mmap.len(), rayon::current_num_threads());
+    let shard_size = mmap.len() / num_threads;
+    let mut reader = bam::io::Reader::new(file);
+    let header = reader.read_header()?;
+    let pb = segment_scan_progress_bar(path)?;
+
+    unsafe {
+        libc::madvise(
+            mmap.as_ptr() as *mut libc::c_void,
+            mmap.len(),
+            libc::MADV_SEQUENTIAL,
+        );
+    }
+
+    let header_ref = &header;
+    let shard_paths: Vec<SegmentScanShardPaths> = (0..num_threads)
+        .into_par_iter()
+        .map(|i| {
+            let start = i * shard_size;
+            let end = if i == num_threads - 1 {
+                mmap.len()
+            } else {
+                (i + 1) * shard_size
+            };
+            let paths = SegmentScanShardPaths::new(out_prefix, i);
+            process_backward_bam_shard(i, &mmap, start, end, header_ref, ctx, &pb, &paths)?;
+            Ok(paths)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    pb.set_position(file_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}",
+            )?
+            .progress_chars("#>-"),
+    );
+    pb.finish_with_message("");
+
+    Ok(shard_paths)
+}
+
+/// Processes one compressed-byte shard for the segments BAM rescan.
+fn process_backward_bam_shard(
+    shard_idx: usize,
+    mmap: &Mmap,
+    start: usize,
+    end: usize,
+    header: &sam::Header,
+    ctx: &SegmentScanContext<'_>,
+    pb: &ProgressBar,
+    paths: &SegmentScanShardPaths,
+) -> Result<()> {
+    let block_start = if start == 0 {
+        0
+    } else {
+        find_next_bgzf_block(mmap, start).unwrap_or(mmap.len())
+    };
+    let pos = if start == 0 {
+        0
+    } else {
+        find_previous_bgzf_block(mmap, block_start).unwrap_or(0)
+    };
+    if pos >= mmap.len() {
+        let mut writer = SegmentScanShardWriter::new(paths)?;
+        writer.flush()?;
+        return Ok(());
+    }
+
+    let mut reader = bam::io::Reader::new(&mmap[pos..]);
+    if start == 0 {
+        let _ = reader.read_header()?;
+    }
+    let mut record = bam::Record::default();
+    let mut current_id: Vec<u8> = Vec::new();
+    let mut group = Vec::with_capacity(8);
+    let mut crossed_start = start == 0;
+    let mut leading_partial_id: Option<Vec<u8>> = None;
+    let mut last_progress_pos = block_start.saturating_sub(pos);
+    let mut last_evicted_pos = pos;
+    let eviction_threshold = 64 * 1024 * 1024;
+    let mut cigar_buf = String::with_capacity(64);
+    let mut seq_buf = String::with_capacity(256);
+    let mut writer = SegmentScanShardWriter::new(paths)?;
+
+    while reader.read_record(&mut record)? != 0 {
+        let curr_c_pos = reader.get_ref().virtual_position().compressed() as usize;
+        if curr_c_pos > last_progress_pos {
+            pb.inc((curr_c_pos - last_progress_pos) as u64);
+            last_progress_pos = curr_c_pos;
+        }
+        if curr_c_pos > last_evicted_pos.saturating_sub(pos) + eviction_threshold {
+            let evicted_rel = last_evicted_pos - pos;
+            advise_segment_mmap_dontneed(mmap, last_evicted_pos, curr_c_pos - evicted_rel);
+            last_evicted_pos = pos + curr_c_pos;
+        }
+
+        let read_id = record
+            .name()
+            .ok_or_else(|| anyhow!("Missing read name in segments BAM shard {shard_idx}"))?;
+        let abs_c_pos = pos + curr_c_pos;
+        if !crossed_start {
+            if abs_c_pos < block_start {
+                leading_partial_id = Some(read_id.to_vec());
+                continue;
+            }
+            crossed_start = true;
+        }
+        if let Some(partial_id) = &leading_partial_id {
+            if read_id == partial_id.as_slice() {
+                continue;
+            }
+            leading_partial_id = None;
+        }
+        if read_id != current_id.as_slice() {
+            if !current_id.is_empty() {
+                let id = String::from_utf8_lossy(&current_id);
+                process_backward_group_to_writer(&id, &group, ctx, &mut writer)?;
+                if pos + curr_c_pos > end {
+                    current_id.clear();
+                    break;
+                }
+                group.clear();
+            }
+            current_id.clear();
+            current_id.extend_from_slice(read_id);
+        }
+        group.push(bam_record_to_as_alignment(
+            &record,
+            header,
+            &mut cigar_buf,
+            &mut seq_buf,
+        )?);
+    }
+    if !current_id.is_empty() {
+        let id = String::from_utf8_lossy(&current_id);
+        process_backward_group_to_writer(&id, &group, ctx, &mut writer)?;
+    }
+    writer.flush()?;
+    let processed_end = (pos + last_progress_pos).min(mmap.len());
+    advise_segment_mmap_dontneed(
+        mmap,
+        last_evicted_pos,
+        processed_end.saturating_sub(last_evicted_pos),
+    );
+    Ok(())
+}
+
+/// Returns the first BGZF block header at or after `start`.
+fn find_next_bgzf_block(mmap: &Mmap, start: usize) -> Option<usize> {
+    (start..mmap.len().saturating_sub(3)).find(|&i| &mmap[i..i + 4] == b"\x1f\x8b\x08\x04")
+}
+
+/// Returns the nearest BGZF block header at or before `start`.
+fn find_previous_bgzf_block(mmap: &Mmap, start: usize) -> Option<usize> {
+    let mut i = start.saturating_sub(1).min(mmap.len().saturating_sub(4));
+    loop {
+        if i + 3 < mmap.len() && &mmap[i..i + 4] == b"\x1f\x8b\x08\x04" {
+            return Some(i);
+        }
+        if i == 0 {
+            return None;
+        }
+        i -= 1;
+    }
+}
+
+/// Advises the kernel that an already-processed segments shard range is cold.
+fn advise_segment_mmap_dontneed(mmap: &Mmap, offset: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let page_size = 4096usize;
+    let aligned_offset = (offset / page_size) * page_size;
+    let aligned_len = ((offset + len + page_size - 1) / page_size) * page_size - aligned_offset;
+    unsafe {
+        let ptr = mmap.as_ptr().add(aligned_offset);
+        libc::madvise(ptr as *mut libc::c_void, aligned_len, libc::MADV_DONTNEED);
+    }
+}
+
+/// Converts one BAM record into the lightweight segments alignment form.
+fn bam_record_to_as_alignment(
+    record: &bam::Record,
+    header: &sam::Header,
+    cigar_buf: &mut String,
+    seq_buf: &mut String,
+) -> Result<AsAlignment> {
+    use noodles::sam::alignment::Record as _;
+
+    let chr = match record.reference_sequence(header) {
+        Some(Ok((name, _))) => String::from_utf8_lossy(name).to_string(),
+        _ => "*".to_string(),
+    };
+    let flag = i32::from(u16::from(record.flags()));
+    let pos = record
+        .alignment_start()
+        .transpose()?
+        .map(|p| p.get() as i32)
+        .unwrap_or(0);
+    let mapq = record.mapping_quality().map(u8::from).unwrap_or(0) as i32;
+    cigar_buf.clear();
+    for result in record.cigar().iter() {
+        let op = result?;
+        use noodles::sam::alignment::record::cigar::op::Kind;
+        let op_char = match op.kind() {
+            Kind::Match => 'M',
+            Kind::Insertion => 'I',
+            Kind::Deletion => 'D',
+            Kind::Skip => 'N',
+            Kind::SoftClip => 'S',
+            Kind::HardClip => 'H',
+            Kind::Pad => 'P',
+            Kind::SequenceMatch => '=',
+            Kind::SequenceMismatch => 'X',
+        };
+        let _ = write!(cigar_buf, "{}{}", op.len(), op_char);
+    }
+    seq_buf.clear();
+    for b in record.sequence().iter() {
+        seq_buf.push(char::from(b));
+    }
+    Ok(AsAlignment {
+        flag,
+        chr,
+        pos,
+        mapq,
+        cigar: cigar_buf.clone(),
+        seq: seq_buf.clone(),
+        from_local_clip: false,
+        xa_alternatives: parse_xa_from_bam_record(record)?,
+    })
+}
+
 /// Parses `XA:Z` alternatives from raw SAM optional columns.
 ///
 /// The parser intentionally accepts only BWA's four-field entries
@@ -1322,33 +2119,209 @@ fn process_group(read_id: &str, records: &[AsAlignment], state: &mut ScanState) 
 fn process_backward_group(
     read_id: &str,
     records: &[AsAlignment],
-    state: &mut ScanState,
+    ctx: &SegmentScanContext<'_>,
+    accum: &mut SegmentScanAccum,
 ) -> Result<()> {
-    if records.is_empty() || state.junction_read_to_circ.contains_key(read_id) {
+    if records.is_empty() || ctx.junction_read_to_circ.contains_key(read_id) {
         return Ok(());
     }
-    let is_outward = is_outward_pair_group(records, state);
-    let overlaps_cluster = records.len() > 2 && overlaps_any_circ_cluster(records, state);
+    let is_outward = is_outward_pair_group_ctx(records, ctx);
+    let overlaps_cluster = records.len() > 2 && overlaps_any_circ_cluster_ctx(records, ctx);
     if !is_outward && !overlaps_cluster {
         return Ok(());
     }
 
+    let candidates = if overlaps_cluster {
+        mapping_check1_backward_candidates(read_id, records, ctx)
+    } else {
+        Vec::new()
+    };
+    let mut candidates = validate_splice_candidates(candidates, ctx.reference, ctx.annotation);
+    let segment_records =
+        prebuild_non_bsj_segment_records(read_id, records, is_outward, &candidates, ctx);
     if is_outward {
-        let enriched_records = add_non_bsj_local_clip_alignments(records, state);
-        state
+        let enriched_records = add_non_bsj_local_clip_alignments_ctx(records, ctx);
+        accum
             .segment_groups
             .entry(read_id.to_string())
             .or_insert_with(|| enriched_records.clone());
-        state.outward_read_ids.insert(read_id.to_string());
+        accum.outward_read_ids.insert(read_id.to_string());
     }
-    if overlaps_cluster {
-        state
+    if !candidates.is_empty() {
+        accum
             .segment_groups
             .entry(read_id.to_string())
             .or_insert_with(|| records.to_vec());
-        mapping_check1(read_id, records, false, state)?;
+        accum.add_candidates += candidates.len();
+        accum.candidates.append(&mut candidates);
+    }
+    accum.prebuilt_segment_records.extend(segment_records);
+    Ok(())
+}
+
+/// Streams one non-BSJ read group into shard-local spill files.
+fn process_backward_group_to_writer(
+    read_id: &str,
+    records: &[AsAlignment],
+    ctx: &SegmentScanContext<'_>,
+    writer: &mut SegmentScanShardWriter,
+) -> Result<()> {
+    if records.is_empty() || ctx.junction_read_to_circ.contains_key(read_id) {
+        return Ok(());
+    }
+    let is_outward = is_outward_pair_group_ctx(records, ctx);
+    let overlaps_cluster = records.len() > 2 && overlaps_any_circ_cluster_ctx(records, ctx);
+    if !is_outward && !overlaps_cluster {
+        return Ok(());
+    }
+
+    let candidates = if overlaps_cluster {
+        mapping_check1_backward_candidates(read_id, records, ctx)
+    } else {
+        Vec::new()
+    };
+    let candidates = validate_splice_candidates(candidates, ctx.reference, ctx.annotation);
+    let segment_records =
+        prebuild_non_bsj_segment_records(read_id, records, is_outward, &candidates, ctx);
+    if is_outward {
+        let enriched_records = add_non_bsj_local_clip_alignments_ctx(records, ctx);
+        writer.write_read_result(
+            read_id,
+            &enriched_records,
+            true,
+            &candidates,
+            &segment_records,
+        )?;
+    } else if !candidates.is_empty() {
+        writer.write_read_result(read_id, records, false, &candidates, &segment_records)?;
     }
     Ok(())
+}
+
+/// Validates one read group's splice candidates before shard-local materialization.
+fn validate_splice_candidates(
+    candidates: Vec<PositiveCandidate>,
+    reference: &HashMap<String, String>,
+    annotation: Option<&Annotation>,
+) -> Vec<PositiveCandidate> {
+    candidates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, mut candidate)| {
+            candidate.index = idx;
+            validate_splice_candidate(candidate, reference, annotation)
+        })
+        .collect()
+}
+
+/// Builds preliminary non-BSJ segment rows inside the owning BAM shard.
+///
+/// This moves the read-local backward/outward first pass into the parallel scan
+/// while leaving global junction-support correction for the later build phase.
+fn prebuild_non_bsj_segment_records(
+    read_id: &str,
+    records: &[AsAlignment],
+    is_outward: bool,
+    candidates: &[PositiveCandidate],
+    ctx: &SegmentScanContext<'_>,
+) -> Vec<SegmentRecord> {
+    let correction = SegmentCorrectionContext {
+        reference: ctx.reference,
+        annotation: ctx.annotation,
+        junction_support: None,
+    };
+    let junction_hints = local_junction_hints(candidates);
+    let strand_hint = local_strand_hint(candidates);
+    let enriched_records;
+    let materialization_records = if is_outward {
+        enriched_records = add_non_bsj_local_clip_alignments_ctx(records, ctx);
+        enriched_records.as_slice()
+    } else {
+        records
+    };
+
+    if !candidates.is_empty() {
+        if let Some(record) = build_backward_segment_record_from_group_ctx(
+            read_id,
+            materialization_records,
+            ctx,
+            &correction,
+            strand_hint,
+            &junction_hints,
+        ) {
+            return vec![record];
+        }
+    }
+    if is_outward {
+        if let Some(record) = build_outward_segment_record(
+            read_id,
+            materialization_records,
+            Some(&correction),
+            ctx.read_len,
+        ) {
+            return vec![record];
+        }
+    }
+    Vec::new()
+}
+
+/// Builds one backward row using only shard-local read context.
+fn build_backward_segment_record_from_group_ctx(
+    read_id: &str,
+    records: &[AsAlignment],
+    ctx: &SegmentScanContext<'_>,
+    correction: &SegmentCorrectionContext<'_>,
+    strand_hint: Option<char>,
+    junction_hints: &[(i32, i32)],
+) -> Option<SegmentRecord> {
+    let base = build_backward_segment_record(
+        read_id,
+        records,
+        strand_hint,
+        junction_hints,
+        Some(correction),
+        ctx.read_len,
+    )?;
+    let enriched_records = add_non_bsj_local_clip_alignments_ctx(records, ctx);
+    if enriched_records.len() == records.len() {
+        return Some(base);
+    }
+    build_backward_segment_record(
+        read_id,
+        &enriched_records,
+        strand_hint,
+        junction_hints,
+        Some(correction),
+        ctx.read_len,
+    )
+    .or(Some(base))
+}
+
+/// Returns a unique RNA-strand hint from one read's validated candidates.
+fn local_strand_hint(candidates: &[PositiveCandidate]) -> Option<char> {
+    let mut hint = 0;
+    for candidate in candidates {
+        if candidate.strand_hint == 0 {
+            continue;
+        }
+        if hint != 0 && hint != candidate.strand_hint {
+            return None;
+        }
+        hint = candidate.strand_hint;
+    }
+    match hint {
+        -1 => Some('+'),
+        1 => Some('-'),
+        _ => None,
+    }
+}
+
+/// Returns corrected internal junction hints for one read.
+fn local_junction_hints(candidates: &[PositiveCandidate]) -> Vec<(i32, i32)> {
+    candidates
+        .iter()
+        .map(|candidate| (candidate.site2, candidate.site1))
+        .collect()
 }
 
 /// Adds local soft-clip pseudo-alignments for non-BSJ read groups.
@@ -1363,6 +2336,14 @@ fn add_non_bsj_local_clip_alignments(
     records: &[AsAlignment],
     state: &ScanState,
 ) -> Vec<AsAlignment> {
+    add_non_bsj_local_clip_alignments_ctx(records, &SegmentScanContext::from_state(state))
+}
+
+/// Adds local soft-clip pseudo-alignments using the shared scan context.
+fn add_non_bsj_local_clip_alignments_ctx(
+    records: &[AsAlignment],
+    ctx: &SegmentScanContext<'_>,
+) -> Vec<AsAlignment> {
     if !records.iter().any(|record| {
         !record.from_local_clip
             && record.cigar.contains('S')
@@ -1371,12 +2352,12 @@ fn add_non_bsj_local_clip_alignments(
     }) {
         return records.to_vec();
     }
-    let windows = non_bsj_local_clip_windows(records, state);
+    let windows = non_bsj_local_clip_windows_ctx(records, ctx);
     if windows.is_empty() {
         return records.to_vec();
     }
     let mut out = records.to_vec();
-    let mut local = non_bsj_local_clip_alignments(records, &windows, state);
+    let mut local = non_bsj_local_clip_alignments(records, &windows, ctx);
     local.sort_by(|a, b| {
         mate_bucket(a.flag)
             .cmp(&mate_bucket(b.flag))
@@ -1396,15 +2377,19 @@ fn add_non_bsj_local_clip_alignments(
 /// junction anchors rather than whole loci, which keeps this read-local rescue
 /// bounded while still allowing clips to place just outside a particular circ
 /// span when that is the most coherent chain explanation.
-fn non_bsj_local_clip_windows(records: &[AsAlignment], state: &ScanState) -> Vec<LocalClipWindow> {
+/// Builds bounded local reference windows from the shared scan context.
+fn non_bsj_local_clip_windows_ctx(
+    records: &[AsAlignment],
+    ctx: &SegmentScanContext<'_>,
+) -> Vec<LocalClipWindow> {
     let mut by_chr: HashMap<&str, (i32, i32)> = HashMap::new();
     let mut anchors_by_chr: HashMap<&str, Vec<i32>> = HashMap::new();
-    let anchor_flank = state.read_len * NON_BSJ_LOCAL_CLIP_ANCHOR_FLANK_MULTIPLIER;
+    let anchor_flank = ctx.read_len * NON_BSJ_LOCAL_CLIP_ANCHOR_FLANK_MULTIPLIER;
     for record in records {
         if record.chr == "*" {
             continue;
         }
-        let Some((start, end)) = alignment_ref_span(record, state.read_len) else {
+        let Some((start, end)) = alignment_ref_span(record, ctx.read_len) else {
             continue;
         };
         by_chr
@@ -1423,14 +2408,14 @@ fn non_bsj_local_clip_windows(records: &[AsAlignment], state: &ScanState) -> Vec
     let mut windows = Vec::new();
     let mut seen = HashSet::new();
     for (chr, (group_start, group_end)) in by_chr {
-        if let Some(spans) = state.circ_spans_by_chr.get(chr) {
+        if let Some(spans) = ctx.circ_spans_by_chr.get(chr) {
             for span in
                 overlapping_circ_spans(spans, group_start - MIN_INTRON, group_end + MIN_INTRON)
             {
                 push_local_clip_anchor_window(
                     &mut windows,
                     &mut seen,
-                    state.reference,
+                    ctx.reference,
                     chr,
                     span.start,
                     anchor_flank,
@@ -1438,14 +2423,14 @@ fn non_bsj_local_clip_windows(records: &[AsAlignment], state: &ScanState) -> Vec
                 push_local_clip_anchor_window(
                     &mut windows,
                     &mut seen,
-                    state.reference,
+                    ctx.reference,
                     chr,
                     span.end,
                     anchor_flank,
                 );
             }
         }
-        if let Some(clusters) = state.clusters_by_chr.get(chr) {
+        if let Some(clusters) = ctx.clusters_by_chr.get(chr) {
             for cluster in overlapping_circ_clusters(
                 clusters,
                 group_start - MIN_INTRON,
@@ -1454,7 +2439,7 @@ fn non_bsj_local_clip_windows(records: &[AsAlignment], state: &ScanState) -> Vec
                 push_local_clip_anchor_window(
                     &mut windows,
                     &mut seen,
-                    state.reference,
+                    ctx.reference,
                     chr,
                     cluster.start,
                     anchor_flank,
@@ -1462,7 +2447,7 @@ fn non_bsj_local_clip_windows(records: &[AsAlignment], state: &ScanState) -> Vec
                 push_local_clip_anchor_window(
                     &mut windows,
                     &mut seen,
-                    state.reference,
+                    ctx.reference,
                     chr,
                     cluster.end,
                     anchor_flank,
@@ -1472,7 +2457,7 @@ fn non_bsj_local_clip_windows(records: &[AsAlignment], state: &ScanState) -> Vec
         push_local_clip_anchor_window(
             &mut windows,
             &mut seen,
-            state.reference,
+            ctx.reference,
             chr,
             group_start,
             anchor_flank,
@@ -1480,7 +2465,7 @@ fn non_bsj_local_clip_windows(records: &[AsAlignment], state: &ScanState) -> Vec
         push_local_clip_anchor_window(
             &mut windows,
             &mut seen,
-            state.reference,
+            ctx.reference,
             chr,
             group_end,
             anchor_flank,
@@ -1490,7 +2475,7 @@ fn non_bsj_local_clip_windows(records: &[AsAlignment], state: &ScanState) -> Vec
                 push_local_clip_anchor_window(
                     &mut windows,
                     &mut seen,
-                    state.reference,
+                    ctx.reference,
                     chr,
                     *anchor,
                     anchor_flank,
@@ -1565,7 +2550,7 @@ fn push_local_clip_anchor_window(
 fn non_bsj_local_clip_alignments(
     records: &[AsAlignment],
     windows: &[LocalClipWindow],
-    state: &ScanState,
+    ctx: &SegmentScanContext<'_>,
 ) -> Vec<AsAlignment> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -1593,7 +2578,7 @@ fn non_bsj_local_clip_alignments(
             }
             let mut candidates: Vec<(i32, AsAlignment)> = Vec::new();
             for window in windows.iter().filter(|window| window.chr == record.chr) {
-                let Some(chr_seq) = state.reference.get(&window.chr) else {
+                let Some(chr_seq) = ctx.reference.get(&window.chr) else {
                     continue;
                 };
                 let Some(local_seq) = chr_seq.get((window.start - 1) as usize..window.end as usize)
@@ -1616,7 +2601,7 @@ fn non_bsj_local_clip_alignments(
                         continue;
                     }
                     let distance =
-                        local_clip_distance_to_group(records, &window.chr, pos, state.read_len);
+                        local_clip_distance_to_group(records, &window.chr, pos, ctx.read_len);
                     candidates.push((
                         -((clip_seq.len() as i32) * 1000) + distance,
                         AsAlignment {
@@ -1746,24 +2731,30 @@ fn record_mapping_detail(read_id: &str, records: &[AsAlignment], state: &mut Sca
 
 /// True if any alignment start/end falls inside a clustered circRNA locus.
 fn overlaps_any_circ_cluster(records: &[AsAlignment], state: &ScanState) -> bool {
+    overlaps_any_circ_cluster_ctx(records, &SegmentScanContext::from_state(state))
+}
+
+/// True if any alignment start/end falls inside a clustered circRNA locus.
+fn overlaps_any_circ_cluster_ctx(records: &[AsAlignment], ctx: &SegmentScanContext<'_>) -> bool {
     for record in records {
         if record.mapq < MAPQ_THRES {
             continue;
         }
-        let msid = msid(&record.cigar, state.read_len);
+        let msid = msid(&record.cigar, ctx.read_len);
         if msid.ref_len < 0 {
             continue;
         }
         let map_end = record.pos + msid.ref_len - 1;
-        if let Some(clusters) = state.clusters_by_chr.get(&record.chr) {
-            for cluster in clusters {
-                let lo = cluster.start - MIN_INTRON;
-                let hi = cluster.end + MIN_INTRON;
-                if (record.pos >= lo && record.pos <= hi) || (map_end >= lo && map_end <= hi) {
+        if let Some(clusters) = ctx.clusters_by_chr.get(&record.chr) {
+            for cluster in overlapping_circ_clusters(
+                clusters,
+                record.pos.min(map_end) - MIN_INTRON,
+                record.pos.max(map_end) + MIN_INTRON,
+            ) {
+                if point_in_cluster_range(record.pos, cluster)
+                    || point_in_cluster_range(map_end, cluster)
+                {
                     return true;
-                }
-                if cluster.start > map_end + MIN_INTRON {
-                    break;
                 }
             }
         }
@@ -1779,17 +2770,23 @@ fn overlaps_any_circ_cluster(records: &[AsAlignment], state: &ScanState) -> bool
 /// outward. The row remains `circ_id=NA`; later graph construction may project
 /// it onto every compatible circRNA instead of forcing a read-level unique
 /// assignment.
+#[cfg(test)]
 fn is_outward_pair_group(records: &[AsAlignment], state: &ScanState) -> bool {
+    is_outward_pair_group_ctx(records, &SegmentScanContext::from_state(state))
+}
+
+/// Shared-context form of outward pair detection for parallel segments shards.
+fn is_outward_pair_group_ctx(records: &[AsAlignment], ctx: &SegmentScanContext<'_>) -> bool {
     let Some((r1, r2)) = primary_mate_pair(records) else {
         return false;
     };
     if r1.chr != r2.chr || r1.chr == "*" || r1.mapq < MAPQ_THRES || r2.mapq < MAPQ_THRES {
         return false;
     }
-    let Some((r1_start, r1_end)) = alignment_ref_span(r1, state.read_len) else {
+    let Some((r1_start, r1_end)) = alignment_ref_span(r1, ctx.read_len) else {
         return false;
     };
-    let Some((r2_start, r2_end)) = alignment_ref_span(r2, state.read_len) else {
+    let Some((r2_start, r2_end)) = alignment_ref_span(r2, ctx.read_len) else {
         return false;
     };
     if !has_5p_overlap_with_3p_outward(r1, (r1_start, r1_end), r2, (r2_start, r2_end)) {
@@ -1797,7 +2794,7 @@ fn is_outward_pair_group(records: &[AsAlignment], state: &ScanState) -> bool {
     }
     let span_start = r1_start.min(r2_start);
     let span_end = r1_end.max(r2_end);
-    span_contained_in_any_circ(&r1.chr, span_start, span_end, state)
+    span_contained_in_any_circ_ctx(&r1.chr, span_start, span_end, ctx)
 }
 
 /// Tests the 5' RO-like geometry for a primary R1/R2 pair.
@@ -1856,9 +2853,14 @@ fn alignment_ref_span(record: &AsAlignment, read_len: i32) -> Option<(i32, i32)>
     Some((start, end))
 }
 
-/// Tests whether one read-pair span is contained by any detected circRNA span.
-fn span_contained_in_any_circ(chrom: &str, start: i32, end: i32, state: &ScanState) -> bool {
-    let Some(spans) = state.circ_spans_by_chr.get(chrom) else {
+/// Tests pair containment using the shared scan context.
+fn span_contained_in_any_circ_ctx(
+    chrom: &str,
+    start: i32,
+    end: i32,
+    ctx: &SegmentScanContext<'_>,
+) -> bool {
+    let Some(spans) = ctx.circ_spans_by_chr.get(chrom) else {
         return false;
     };
     let idx = spans.partition_point(|span| span.start <= start);
@@ -1884,6 +2886,81 @@ fn mapping_check1(
     mapping_check2(read_id, &by_reverse[1], from_bsj, state)?;
     mapping_check2(read_id, &by_reverse[0], from_bsj, state)?;
     Ok(())
+}
+
+/// Runs the non-BSJ mapping check against shard-local segments state.
+///
+/// In sidecar mode BSJ reads already came from Scan1/Scan2 segment evidence, so
+/// the parallel rescan only needs the `from_bsj=false` branch. Keeping this
+/// accumulator-specific copy avoids cloning the full `ScanState` per BAM shard.
+fn mapping_check1_backward_candidates(
+    read_id: &str,
+    records: &[AsAlignment],
+    ctx: &SegmentScanContext<'_>,
+) -> Vec<PositiveCandidate> {
+    let mut by_reverse: [Vec<&AsAlignment>; 2] = [Vec::new(), Vec::new()];
+    for record in records {
+        let idx = if record.flag & 0x10 != 0 { 1 } else { 0 };
+        by_reverse[idx].push(record);
+    }
+    let mut candidates = Vec::new();
+    mapping_check2_backward(read_id, &by_reverse[1], ctx, &mut candidates);
+    mapping_check2_backward(read_id, &by_reverse[0], ctx, &mut candidates);
+    candidates
+}
+
+/// Accumulator-backed form of CIRI-AS `mapping_check2_add`.
+fn mapping_check2_backward(
+    read_id: &str,
+    records: &[&AsAlignment],
+    ctx: &SegmentScanContext<'_>,
+    candidates: &mut Vec<PositiveCandidate>,
+) {
+    if records.len() < 2 {
+        return;
+    }
+
+    let mut matches = Vec::with_capacity(records.len());
+    for record in records {
+        matches.push(msid(&record.cigar, ctx.read_len));
+    }
+
+    let initial_len = candidates.len();
+    let mut candidate_chr: Option<String> = None;
+    let mut na_tag = false;
+    'read: for i in 0..records.len() - 1 {
+        for j in i + 1..records.len() {
+            let ri = records[i];
+            let rj = records[j];
+            if ri.chr != rj.chr || reverse_bit(ri.flag) != reverse_bit(rj.flag) {
+                continue;
+            }
+            if let Some(existing_chr) = &candidate_chr {
+                if existing_chr != &ri.chr {
+                    na_tag = true;
+                    break 'read;
+                }
+            }
+            if let Some(candidate) = candidate_from_pair(
+                read_id,
+                ri,
+                rj,
+                matches[i],
+                matches[j],
+                i,
+                j,
+                None,
+                ctx.read_len,
+            ) {
+                candidate_chr.get_or_insert_with(|| candidate.chr.clone());
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    if na_tag {
+        candidates.truncate(initial_len);
+    }
 }
 
 /// Mirrors CIRI-AS `mapping_check2` and `mapping_check2_add`.
@@ -2415,59 +3492,81 @@ fn validate_splice_motifs(
     reference: &HashMap<String, String>,
     annotation: Option<&Annotation>,
 ) -> Result<()> {
-    let mut validated = Vec::with_capacity(candidates.len());
-    for mut candidate in candidates.drain(..) {
-        let Some(chr_seq) = reference.get(&candidate.chr) else {
-            continue;
-        };
-        let total_adjustment = candidate.adjust1 + candidate.adjust2;
-        let (end_string1, end_string2) = if candidate.adjust2 >= 0 {
-            (
-                perl_substr(
-                    chr_seq,
-                    candidate.site1 - candidate.adjust1 - 4,
-                    4 + total_adjustment,
-                ),
-                perl_substr(
-                    chr_seq,
-                    candidate.site2 - candidate.adjust1 - 1,
-                    4 + total_adjustment,
-                ),
-            )
-        } else {
-            (
-                perl_substr(
-                    chr_seq,
-                    candidate.site1 + candidate.adjust2 - 4,
-                    4 - total_adjustment,
-                ),
-                perl_substr(
-                    chr_seq,
-                    candidate.site2 + candidate.adjust2 - 1,
-                    4 - total_adjustment,
-                ),
-            )
-        };
-        let (hint, index) = index_compare(&end_string1, &end_string2, &candidate, annotation);
-        if hint != 0 {
-            let diff_adjt = if candidate.adjust2 >= 0 {
-                index - 1 - candidate.adjust1
-            } else {
-                index - 1 + candidate.adjust2
-            };
-            candidate.strand_hint = hint;
-            candidate.adjust1 += diff_adjt;
-            candidate.adjust2 = total_adjustment - candidate.adjust1;
-            candidate.site1 += diff_adjt;
-            candidate.site2 += diff_adjt;
-            validated.push(candidate);
-        }
-    }
+    // Motif validation is read-local and reference/annotation are immutable, so
+    // this can run on Rayon workers without changing the final CIRI-AS ordering.
+    let mut validated: Vec<(usize, PositiveCandidate)> = std::mem::take(candidates)
+        .into_par_iter()
+        .enumerate()
+        .filter_map(|(idx, candidate)| {
+            validate_splice_candidate(candidate, reference, annotation)
+                .map(|candidate| (idx, candidate))
+        })
+        .collect();
+    validated.sort_by_key(|(idx, _)| *idx);
+    let mut validated: Vec<PositiveCandidate> = validated
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect();
     for (idx, candidate) in validated.iter_mut().enumerate() {
         candidate.index = idx;
     }
     *candidates = validated;
     Ok(())
+}
+
+/// Validates and motif-adjusts one splice candidate independently.
+///
+/// This helper keeps the per-candidate work separate from collection ordering so
+/// callers can run it in parallel while retaining the serial output contract.
+fn validate_splice_candidate(
+    mut candidate: PositiveCandidate,
+    reference: &HashMap<String, String>,
+    annotation: Option<&Annotation>,
+) -> Option<PositiveCandidate> {
+    let chr_seq = reference.get(&candidate.chr)?;
+    let total_adjustment = candidate.adjust1 + candidate.adjust2;
+    let (end_string1, end_string2) = if candidate.adjust2 >= 0 {
+        (
+            perl_substr(
+                chr_seq,
+                candidate.site1 - candidate.adjust1 - 4,
+                4 + total_adjustment,
+            ),
+            perl_substr(
+                chr_seq,
+                candidate.site2 - candidate.adjust1 - 1,
+                4 + total_adjustment,
+            ),
+        )
+    } else {
+        (
+            perl_substr(
+                chr_seq,
+                candidate.site1 + candidate.adjust2 - 4,
+                4 - total_adjustment,
+            ),
+            perl_substr(
+                chr_seq,
+                candidate.site2 + candidate.adjust2 - 1,
+                4 - total_adjustment,
+            ),
+        )
+    };
+    let (hint, index) = index_compare(&end_string1, &end_string2, &candidate, annotation);
+    if hint == 0 {
+        return None;
+    }
+    let diff_adjt = if candidate.adjust2 >= 0 {
+        index - 1 - candidate.adjust1
+    } else {
+        index - 1 + candidate.adjust2
+    };
+    candidate.strand_hint = hint;
+    candidate.adjust1 += diff_adjt;
+    candidate.adjust2 = total_adjustment - candidate.adjust1;
+    candidate.site1 += diff_adjt;
+    candidate.site2 += diff_adjt;
+    Some(candidate)
 }
 
 /// Perl-compatible positive-offset substring on ASCII FASTA sequences.
@@ -3727,6 +4826,7 @@ fn write_as_log(path: &str, state: &ScanState) -> Result<()> {
 /// helper is only responsible for selecting the best alignment chain and
 /// materializing it as simulator-compatible segments.
 fn build_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
+    let profile = segments_profile_enabled();
     let backward_ids: HashSet<&str> = state
         .candidates
         .iter()
@@ -3787,7 +4887,9 @@ fn build_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
             }
         }
     }
+    let phase_started = profile.then(Instant::now);
     sort_segment_records(&mut out);
+    log_segments_profile(profile, "sort_segment_records", phase_started);
     Ok(out)
 }
 
@@ -3799,7 +4901,10 @@ fn build_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
 /// carry no circRNA assignment. All three evidence classes share the same
 /// internal-junction support pass; only the confirmed BSJ gap itself remains
 /// type-specific.
-fn build_sidecar_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>> {
+fn build_sidecar_segment_records(
+    state: &mut ScanState,
+    rescan_group_indexes: Option<Vec<SegmentScanShardIndex>>,
+) -> Result<Vec<SegmentRecord>> {
     let profile = segments_profile_enabled();
     let read_strand_hints = build_read_strand_hints(state);
     let read_junction_hints = build_read_junction_hints(state);
@@ -3818,26 +4923,9 @@ fn build_sidecar_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>
     log_segments_profile(profile, "unified_bsj_first_pass", phase_started);
 
     let phase_started = profile.then(Instant::now);
-    let backward_records = build_backward_segment_records_with_correction(
-        state,
-        &first_pass_correction,
-        &read_strand_hints,
-        &read_junction_hints,
-    );
-    log_segments_profile(profile, "unified_backward_first_pass", phase_started);
-    let backward_read_ids: HashSet<String> = backward_records
-        .iter()
-        .map(|record| record.read_id.clone())
-        .collect();
-    out.extend(backward_records);
-
-    let phase_started = profile.then(Instant::now);
-    out.extend(build_outward_segment_records_with_correction(
-        state,
-        &backward_read_ids,
-        &first_pass_correction,
-    ));
-    log_segments_profile(profile, "unified_outward_first_pass", phase_started);
+    let non_bsj_records = state.prebuilt_segment_records.clone();
+    log_segments_profile(profile, "unified_non_bsj_first_pass", phase_started);
+    out.extend(non_bsj_records);
 
     let phase_started = profile.then(Instant::now);
     let junction_support = collect_junction_support(&out);
@@ -3849,31 +4937,46 @@ fn build_sidecar_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>
         "unified_build_junction_support_index",
         phase_started,
     );
+    let phase_started = profile.then(Instant::now);
+    let ambiguous_indices: Vec<usize> = out
+        .par_iter()
+        .enumerate()
+        .filter_map(|(idx, record)| {
+            segment_record_has_supported_alternative(record, &junction_support_index).then_some(idx)
+        })
+        .collect();
+    if let Some(shard_indexes) = rescan_group_indexes {
+        let phase_started = profile.then(Instant::now);
+        let required_groups: HashSet<String> = ambiguous_indices
+            .iter()
+            .filter_map(|idx| {
+                let record = &out[*idx];
+                (!state.junction_read_to_circ.contains_key(&record.read_id))
+                    .then(|| record.read_id.clone())
+            })
+            .collect();
+        merge_segment_scan_group_shards_for_reads(state, shard_indexes, &required_groups)?;
+        log_segments_profile(profile, "merge_segment_scan_groups", phase_started);
+    }
     let correction = SegmentCorrectionContext {
         reference: state.reference,
         annotation: state.annotation,
         junction_support: Some(&junction_support),
     };
-
-    let phase_started = profile.then(Instant::now);
-    let replacements: Vec<(usize, SegmentRecord)> = out
+    let replacements: Vec<(usize, SegmentRecord)> = ambiguous_indices
         .par_iter()
-        .enumerate()
-        .filter_map(|(idx, record)| {
-            if !segment_record_has_supported_alternative(record, &junction_support_index) {
-                return None;
-            }
+        .filter_map(|idx| {
             rebuild_segment_record_with_correction(
-                record,
+                &out[*idx],
                 state,
                 &correction,
                 &read_strand_hints,
                 &read_junction_hints,
             )
-            .map(|record| (idx, record))
+            .map(|record| (*idx, record))
         })
         .collect();
-    let ambiguous_records = replacements.len();
+    let ambiguous_records = ambiguous_indices.len();
     for (idx, record) in replacements {
         out[idx] = record;
     }
@@ -3884,7 +4987,9 @@ fn build_sidecar_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord>
             out.len()
         );
     }
+    let phase_started = profile.then(Instant::now);
     sort_segment_records(&mut out);
+    log_segments_profile(profile, "sort_segment_records", phase_started);
     Ok(out)
 }
 
@@ -3934,41 +5039,6 @@ fn build_confirmed_bsj_segment_records_with_correction(
     Ok(records.into_iter().flatten().collect::<Vec<_>>())
 }
 
-/// Converts supplemental non-BSJ candidates into `type=backward` segment rows.
-///
-/// These reads do not have a reliable circRNA ID at this stage. The row-level
-/// topology and mate chains are still useful for downstream circRNA-level
-/// assembly, but assignment to a specific circRNA remains deferred.
-fn build_backward_segment_records_with_correction(
-    state: &ScanState,
-    correction: &SegmentCorrectionContext<'_>,
-    read_strand_hints: &HashMap<String, Option<char>>,
-    read_junction_hints: &HashMap<String, Vec<(i32, i32)>>,
-) -> Vec<SegmentRecord> {
-    let backward_ids: HashSet<&str> = state
-        .candidates
-        .iter()
-        .map(|candidate| candidate.read_id.as_str())
-        .filter(|read_id| !state.junction_read_to_circ.contains_key(*read_id))
-        .collect();
-    let mut read_ids: Vec<&str> = backward_ids.into_iter().collect();
-    read_ids.sort_unstable();
-    read_ids
-        .par_iter()
-        .filter_map(|read_id| {
-            let records = state.segment_groups.get(*read_id)?;
-            build_backward_segment_record_from_group(
-                *read_id,
-                records,
-                state,
-                correction,
-                read_strand_hints,
-                read_junction_hints,
-            )
-        })
-        .collect()
-}
-
 /// Builds one backward row with clip enrichment gated by original evidence.
 ///
 /// Local clip rows may improve the internal path materialization, but they are
@@ -4010,34 +5080,6 @@ fn build_backward_segment_record_from_group(
         state.read_len,
     )
     .or(Some(base))
-}
-
-/// Converts pair-level outward evidence into `type=outward` segment rows.
-///
-/// Backward rows win when the same read also has a mate-internal circular chain:
-/// that evidence is stronger because it materializes a read-chain wrap. Outward
-/// rows deliberately keep `circ_id=NA` and contain no `B` operator so later
-/// circRNA-level graph construction can project one read onto every compatible
-/// circRNA without confusing pair orientation with a junction.
-fn build_outward_segment_records_with_correction(
-    state: &ScanState,
-    backward_read_ids: &HashSet<String>,
-    correction: &SegmentCorrectionContext<'_>,
-) -> Vec<SegmentRecord> {
-    let mut read_ids: Vec<&str> = state
-        .outward_read_ids
-        .iter()
-        .map(String::as_str)
-        .filter(|read_id| !backward_read_ids.contains(*read_id))
-        .collect();
-    read_ids.sort_unstable();
-    read_ids
-        .par_iter()
-        .filter_map(|read_id| {
-            let records = state.segment_groups.get(*read_id)?;
-            build_outward_segment_record(*read_id, records, Some(correction), state.read_len)
-        })
-        .collect()
 }
 
 /// Rebuilds one preliminary row with the unified internal-junction correction.
@@ -4911,14 +5953,15 @@ fn alignment_from_xa(record: &AsAlignment, alternative: &XaAlternative) -> AsAli
 /// construction stream mostly contiguous BSJ/backward evidence instead of
 /// holding every read in a read-ID keyed map.
 fn sort_segment_records(records: &mut [SegmentRecord]) {
-    records.sort_by(|a, b| {
-        a.chrom
-            .cmp(&b.chrom)
-            .then_with(|| sort_position(&a.start).cmp(&sort_position(&b.start)))
-            .then_with(|| sort_position(&a.end).cmp(&sort_position(&b.end)))
-            .then_with(|| type_sort_rank(a.type_name).cmp(&type_sort_rank(b.type_name)))
-            .then_with(|| a.circ_id.cmp(&b.circ_id))
-            .then_with(|| a.read_id.cmp(&b.read_id))
+    records.sort_by_cached_key(|record| {
+        (
+            record.chrom.clone(),
+            sort_position(&record.start),
+            sort_position(&record.end),
+            type_sort_rank(record.type_name),
+            record.circ_id.clone(),
+            record.read_id.clone(),
+        )
     });
 }
 
@@ -6278,6 +7321,7 @@ mod tests {
             read_mappings: HashMap::new(),
             seen_junction_reads: HashSet::new(),
             outward_read_ids: HashSet::new(),
+            prebuilt_segment_records: Vec::new(),
             segment_groups: HashMap::new(),
             stats: AsStats::default(),
         };
@@ -6455,6 +7499,7 @@ mod tests {
             read_mappings: HashMap::new(),
             seen_junction_reads: HashSet::new(),
             outward_read_ids: HashSet::new(),
+            prebuilt_segment_records: Vec::new(),
             segment_groups: HashMap::new(),
             stats: AsStats::default(),
         };
@@ -6531,6 +7576,7 @@ mod tests {
             read_mappings: HashMap::new(),
             seen_junction_reads: HashSet::new(),
             outward_read_ids: HashSet::new(),
+            prebuilt_segment_records: Vec::new(),
             segment_groups: HashMap::new(),
             stats: AsStats::default(),
         };
@@ -6666,6 +7712,7 @@ mod tests {
             read_mappings: HashMap::new(),
             seen_junction_reads: HashSet::new(),
             outward_read_ids: HashSet::new(),
+            prebuilt_segment_records: Vec::new(),
             segment_groups: HashMap::new(),
             stats: AsStats::default(),
         };
@@ -6726,6 +7773,7 @@ mod tests {
             read_mappings: HashMap::new(),
             seen_junction_reads: HashSet::new(),
             outward_read_ids: HashSet::new(),
+            prebuilt_segment_records: Vec::new(),
             segment_groups: HashMap::new(),
             stats: AsStats::default(),
         };

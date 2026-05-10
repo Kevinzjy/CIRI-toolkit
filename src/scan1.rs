@@ -541,7 +541,7 @@ impl Scan1 {
             let read_id = record
                 .name()
                 .ok_or_else(|| anyhow::anyhow!("Missing read name"))?;
-            if read_id.to_vec() != current_id {
+            if read_id != current_id.as_slice() {
                 if !current_id.is_empty() {
                     self.push_sam_owned_group(
                         &mut batch,
@@ -557,7 +557,8 @@ impl Scan1 {
                         batch = Vec::with_capacity(batch_size);
                     }
                 }
-                current_id = read_id.to_vec();
+                current_id.clear();
+                current_id.extend_from_slice(read_id);
                 align_num = 0;
             }
 
@@ -1275,7 +1276,7 @@ impl Scan1 {
                 crossed_start = true;
             }
             if let Some(partial_id) = &leading_partial_id {
-                if read_id.to_vec() == *partial_id {
+                if read_id == partial_id.as_slice() {
                     // Non-zero shards start decoding from the previous BGZF block,
                     // so the first logical read group may already have records in
                     // the prior shard. Skip that entire group here and let the
@@ -1302,7 +1303,7 @@ impl Scan1 {
                 );
                 leading_partial_id = None;
             }
-            if read_id.to_vec() != current_id {
+            if read_id != current_id.as_slice() {
                 trace_bam_shard_event(
                     shard_idx,
                     &trace_read_id,
@@ -1414,7 +1415,8 @@ impl Scan1 {
                         break;
                     }
                 }
-                current_id = read_id.to_vec();
+                current_id.clear();
+                current_id.extend_from_slice(read_id);
                 group[0].clear();
                 group[1].clear();
                 stand_map.clear();

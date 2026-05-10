@@ -114,12 +114,66 @@ pub(crate) struct Scan2Profile {
     shard_total_ns: AtomicU64,
     group_process_ns: AtomicU64,
     validator_call_ns: AtomicU64,
+    display_ns: AtomicU64,
+    segment_sidecar_ns: AtomicU64,
     write_ns: AtomicU64,
     merge_ns: AtomicU64,
     records: AtomicU64,
     groups: AtomicU64,
     candidate_checks: AtomicU64,
     candidate_hits: AtomicU64,
+}
+
+/// Mate-level Scan1 claims used to gate Scan2 display-only rescue rows.
+///
+/// The display path is intentionally outside Summary counting, but it runs for
+/// every Scan2 read group. Storing claims as a compact per-read bitmask avoids
+/// allocating `read_id\tmate` strings in that hot path and lets fully claimed
+/// groups skip display reconstruction before any per-mate alignment indexing.
+struct Scan2DisplayClaims {
+    by_read: HashMap<String, u8>,
+}
+
+impl Scan2DisplayClaims {
+    /// Creates an empty display claim index.
+    fn new() -> Self {
+        Self {
+            by_read: HashMap::new(),
+        }
+    }
+
+    /// Records that Scan1 already owns one displayed mate for `read_id`.
+    fn insert(&mut self, read_id: &str, mate_label: &str) {
+        let bit = match mate_label {
+            "R1" => 0b01,
+            "R2" => 0b10,
+            _ => 0,
+        };
+        if bit != 0 {
+            *self.by_read.entry(read_id.to_string()).or_insert(0) |= bit;
+        }
+    }
+
+    /// Tests whether the display path should skip this mate.
+    fn contains_mate(&self, read_id: &str, mate_label: &str) -> bool {
+        let bit = match mate_label {
+            "R1" => 0b01,
+            "R2" => 0b10,
+            _ => 0,
+        };
+        bit != 0
+            && self
+                .by_read
+                .get(read_id)
+                .is_some_and(|mask| mask & bit != 0)
+    }
+
+    /// Tests whether both mates are already represented by Scan1 display rows.
+    fn contains_both_mates(&self, read_id: &str) -> bool {
+        self.by_read
+            .get(read_id)
+            .is_some_and(|mask| mask & 0b11 == 0b11)
+    }
 }
 
 impl Scan2Profile {
@@ -134,14 +188,19 @@ impl Scan2Profile {
         let shard_total_ns = self.shard_total_ns.load(Ordering::Relaxed);
         let group_process_ns = self.group_process_ns.load(Ordering::Relaxed);
         let validator_call_ns = self.validator_call_ns.load(Ordering::Relaxed);
+        let display_ns = self.display_ns.load(Ordering::Relaxed);
+        let segment_sidecar_ns = self.segment_sidecar_ns.load(Ordering::Relaxed);
         let write_ns = self.write_ns.load(Ordering::Relaxed);
         let merge_ns = self.merge_ns.load(Ordering::Relaxed);
         let records = self.records.load(Ordering::Relaxed);
         let groups = self.groups.load(Ordering::Relaxed);
         let candidate_checks = self.candidate_checks.load(Ordering::Relaxed);
         let candidate_hits = self.candidate_hits.load(Ordering::Relaxed);
-        let other_shard_ns =
-            shard_total_ns.saturating_sub(group_process_ns.saturating_add(write_ns));
+        let accounted_ns = group_process_ns
+            .saturating_add(display_ns)
+            .saturating_add(segment_sidecar_ns)
+            .saturating_add(write_ns);
+        let other_shard_ns = shard_total_ns.saturating_sub(accounted_ns);
         let pct = |part: u64, whole: u64| -> f64 {
             if whole == 0 {
                 0.0
@@ -160,11 +219,15 @@ impl Scan2Profile {
             candidate_hits,
         ));
         emit_perf_line(&format!(
-            "[PROFILE_SCAN2] shard_breakdown_ms group_process={:.3} ({:.1}%) validator={:.3} ({:.1}% of group) write={:.3} ({:.1}%) other={:.3} ({:.1}%)",
+            "[PROFILE_SCAN2] shard_breakdown_ms group_process={:.3} ({:.1}%) validator={:.3} ({:.1}% of group) display={:.3} ({:.1}%) segment_sidecar={:.3} ({:.1}%) write={:.3} ({:.1}%) other={:.3} ({:.1}%)",
             group_process_ns as f64 / 1_000_000.0,
             pct(group_process_ns, shard_total_ns),
             validator_call_ns as f64 / 1_000_000.0,
             pct(validator_call_ns, group_process_ns),
+            display_ns as f64 / 1_000_000.0,
+            pct(display_ns, shard_total_ns),
+            segment_sidecar_ns as f64 / 1_000_000.0,
+            pct(segment_sidecar_ns, shard_total_ns),
             write_ns as f64 / 1_000_000.0,
             pct(write_ns, shard_total_ns),
             other_shard_ns as f64 / 1_000_000.0,
@@ -406,14 +469,14 @@ impl Scan2 {
     /// This path is intentionally isolated from the parity index above. It keeps
     /// the user-facing `.bsj` display self-consistent without feeding any of the
     /// extra mate-level rows back into `.out`.
-    pub fn build_display_index(&mut self, bsj1_display_file: &str) -> Result<HashSet<String>> {
+    fn build_display_index(&mut self, bsj1_display_file: &str) -> Result<Scan2DisplayClaims> {
         self.index1.clear();
         self.index2.clear();
         self.site_array1.clear();
         self.site_array2.clear();
         let file = File::open(bsj1_display_file)?;
         let reader = BufReader::new(file);
-        let mut claims = HashSet::new();
+        let mut claims = Scan2DisplayClaims::new();
         let mut chr_circ_site_seen: HashMap<String, HashSet<String>> = HashMap::new();
         let mut chr_circ_site_insertion: HashMap<String, Vec<String>> = HashMap::new();
         for line_res in reader.lines() {
@@ -427,7 +490,7 @@ impl Scan2 {
             if p.len() <= payload_start + 8 {
                 continue;
             }
-            claims.insert(format!("{}\t{}", p[0], mate_label));
+            claims.insert(p[0], mate_label);
             let chr = p[payload_start + 2].to_string();
             let site_infor = p[payload_start + 3..].join("\t");
             let seen = chr_circ_site_seen
@@ -672,7 +735,7 @@ impl Scan2 {
         output_fsj: &str,
         display_output_path: Option<&str>,
         segments_output_path: Option<&str>,
-        display_scan2: Option<&(Scan2, HashSet<String>)>,
+        display_scan2: Option<&(Scan2, Scan2DisplayClaims)>,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
         let run_started = Instant::now();
@@ -813,7 +876,7 @@ impl Scan2 {
         output_fsj: &str,
         display_output_path: Option<&str>,
         segments_output_path: Option<&str>,
-        display_scan2: Option<&(Scan2, HashSet<String>)>,
+        display_scan2: Option<&(Scan2, Scan2DisplayClaims)>,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
         use noodles::bam;
@@ -1042,7 +1105,7 @@ impl Scan2 {
         pb: &ProgressBar,
         out_path: &str,
         fsj_path: &str,
-        display_scan2: Option<&(Scan2, HashSet<String>)>,
+        display_scan2: Option<&(Scan2, Scan2DisplayClaims)>,
         display_out_path: Option<&str>,
         segments_out_path: Option<&str>,
         profile: Option<&Scan2Profile>,
@@ -1128,7 +1191,7 @@ impl Scan2 {
             if let Some(profile) = profile {
                 profile.records.fetch_add(1, Ordering::Relaxed);
             }
-            if read_id.to_vec() != current_id {
+            if read_id != current_id.as_slice() {
                 if !current_id.is_empty() {
                     self.push_sam_owned_group_for_scan2(
                         &mut batch,
@@ -1142,7 +1205,8 @@ impl Scan2 {
                         batch = Vec::with_capacity(batch_size);
                     }
                 }
-                current_id = read_id.to_vec();
+                current_id.clear();
+                current_id.extend_from_slice(read_id);
                 one_read_key = -1;
             }
 
@@ -1261,7 +1325,7 @@ impl Scan2 {
         batch: &mut Vec<SamOwnedScan2Group>,
         merged_fsj: &mut HashMap<String, i32>,
         chr_tcga_map: &HashMap<String, String>,
-        display_scan2: Option<&(Scan2, HashSet<String>)>,
+        display_scan2: Option<&(Scan2, Scan2DisplayClaims)>,
         profile: Option<&Scan2Profile>,
     ) -> Result<()> {
         let groups = std::mem::take(batch);
@@ -1366,7 +1430,7 @@ impl Scan2 {
         pb: &ProgressBar,
         out_path: &str,
         fsj_path: &str,
-        display_scan2: Option<&(Scan2, HashSet<String>)>,
+        display_scan2: Option<&(Scan2, Scan2DisplayClaims)>,
         display_out_path: Option<&str>,
         segments_out_path: Option<&str>,
         profile: Option<&Scan2Profile>,
@@ -1477,7 +1541,7 @@ impl Scan2 {
                 crossed_start = true;
             }
             if let Some(partial_id) = &leading_partial_id {
-                if read_id.to_vec() == *partial_id {
+                if read_id == partial_id.as_slice() {
                     // Let the earlier shard own the cross-boundary read group
                     // completely; otherwise Scan2 can silently drop the first
                     // full read group visible in this shard.
@@ -1486,11 +1550,10 @@ impl Scan2 {
                 leading_partial_id = None;
             }
 
-            if read_id.to_vec() != current_id {
+            if read_id != current_id.as_slice() {
                 if !current_id.is_empty() {
                     let id_str = String::from_utf8_lossy(&current_id);
                     res_batch.clear();
-                    let write_started = profile.map(|_| Instant::now());
                     self.process_group_view(
                         &id_str,
                         &alignments,
@@ -1501,6 +1564,7 @@ impl Scan2 {
                         &mut validator,
                         profile,
                     )?;
+                    let write_started = profile.map(|_| Instant::now());
                     let main_keys: HashSet<String> = res_batch
                         .iter()
                         .filter_map(|line| Self::scan2_priority_key(line))
@@ -1508,6 +1572,13 @@ impl Scan2 {
                     for line in &res_batch {
                         writeln!(writer, "{}", line)?;
                     }
+                    if let (Some(profile), Some(write_started)) = (profile, write_started) {
+                        profile.write_ns.fetch_add(
+                            write_started.elapsed().as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
+                    }
+                    let display_started = profile.map(|_| Instant::now());
                     let display_lines =
                         if let (Some((display_helper, scan1_claims)), Some(display_validator)) =
                             (display_scan2, display_validator.as_mut())
@@ -1523,7 +1594,14 @@ impl Scan2 {
                         } else {
                             Vec::new()
                         };
+                    if let (Some(profile), Some(display_started)) = (profile, display_started) {
+                        profile.display_ns.fetch_add(
+                            display_started.elapsed().as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
+                    }
                     if !display_lines.is_empty() {
+                        let write_started = profile.map(|_| Instant::now());
                         if let Some(display_writer) = display_writer.as_mut() {
                             for line in &display_lines {
                                 writeln!(display_writer, "{}", line)?;
@@ -1539,8 +1617,15 @@ impl Scan2 {
                                 }
                             }
                         }
+                        if let (Some(profile), Some(write_started)) = (profile, write_started) {
+                            profile.write_ns.fetch_add(
+                                write_started.elapsed().as_nanos() as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
                     }
                     if let Some(segments_writer) = segments_writer.as_mut() {
+                        let segment_started = profile.map(|_| Instant::now());
                         let has_bsj = !res_batch.is_empty() || !display_lines.is_empty();
                         if has_bsj {
                             let mut bsj_lines = res_batch.clone();
@@ -1556,19 +1641,20 @@ impl Scan2 {
                                 writeln!(segments_writer, "{}", line)?;
                             }
                         }
-                    }
-                    if let (Some(profile), Some(write_started)) = (profile, write_started) {
-                        profile.write_ns.fetch_add(
-                            write_started.elapsed().as_nanos() as u64,
-                            Ordering::Relaxed,
-                        );
+                        if let (Some(profile), Some(segment_started)) = (profile, segment_started) {
+                            profile.segment_sidecar_ns.fetch_add(
+                                segment_started.elapsed().as_nanos() as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
                     }
                     if abs_c_pos > end {
                         current_id.clear();
                         break;
                     }
                 }
-                current_id = read_id.to_vec();
+                current_id.clear();
+                current_id.extend_from_slice(read_id);
                 alignments.clear();
                 stand_map.clear();
                 one_read_key = -1;
@@ -1645,7 +1731,6 @@ impl Scan2 {
         if !current_id.is_empty() {
             let id_str = String::from_utf8_lossy(&current_id);
             res_batch.clear();
-            let write_started = profile.map(|_| Instant::now());
             self.process_group_view(
                 &id_str,
                 &alignments,
@@ -1656,6 +1741,7 @@ impl Scan2 {
                 &mut validator,
                 profile,
             )?;
+            let write_started = profile.map(|_| Instant::now());
             let main_keys: HashSet<String> = res_batch
                 .iter()
                 .filter_map(|line| Self::scan2_priority_key(line))
@@ -1663,6 +1749,12 @@ impl Scan2 {
             for line in &res_batch {
                 writeln!(writer, "{}", line)?;
             }
+            if let (Some(profile), Some(write_started)) = (profile, write_started) {
+                profile
+                    .write_ns
+                    .fetch_add(write_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            let display_started = profile.map(|_| Instant::now());
             let display_lines =
                 if let (Some((display_helper, scan1_claims)), Some(display_validator)) =
                     (display_scan2, display_validator.as_mut())
@@ -1678,7 +1770,14 @@ impl Scan2 {
                 } else {
                     Vec::new()
                 };
+            if let (Some(profile), Some(display_started)) = (profile, display_started) {
+                profile.display_ns.fetch_add(
+                    display_started.elapsed().as_nanos() as u64,
+                    Ordering::Relaxed,
+                );
+            }
             if !display_lines.is_empty() {
+                let write_started = profile.map(|_| Instant::now());
                 if let Some(display_writer) = display_writer.as_mut() {
                     for line in &display_lines {
                         writeln!(display_writer, "{}", line)?;
@@ -1694,8 +1793,14 @@ impl Scan2 {
                         }
                     }
                 }
+                if let (Some(profile), Some(write_started)) = (profile, write_started) {
+                    profile
+                        .write_ns
+                        .fetch_add(write_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
             }
             if let Some(segments_writer) = segments_writer.as_mut() {
+                let segment_started = profile.map(|_| Instant::now());
                 let has_bsj = !res_batch.is_empty() || !display_lines.is_empty();
                 if has_bsj {
                     let mut bsj_lines = res_batch.clone();
@@ -1711,11 +1816,12 @@ impl Scan2 {
                         writeln!(segments_writer, "{}", line)?;
                     }
                 }
-            }
-            if let (Some(profile), Some(write_started)) = (profile, write_started) {
-                profile
-                    .write_ns
-                    .fetch_add(write_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                if let (Some(profile), Some(segment_started)) = (profile, segment_started) {
+                    profile.segment_sidecar_ns.fetch_add(
+                        segment_started.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                }
             }
         }
         let evicted_rel = last_evicted_pos.saturating_sub(pos);
@@ -1767,7 +1873,7 @@ impl Scan2 {
         for aln in alignments {
             segments
                 .entry(if aln.flag & 0x40 != 0 { 1 } else { 0 })
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(aln);
         }
         // Java counts FSJ support per read group, not per alignment record. The
@@ -2208,25 +2314,28 @@ impl Scan2 {
         id: &str,
         alignments: &[AlignmentRecord<'a>],
         stand_map: &HashMap<i32, (char, Cow<'a, str>)>,
-        scan1_claims: &HashSet<String>,
+        scan1_claims: &Scan2DisplayClaims,
         chr_tcga_map: &HashMap<String, String>,
         is_bsj_hg2: &mut IsBSJHg2,
     ) -> Result<Vec<String>> {
         let trace_read = should_trace_read(id);
         let trace_all_candidates =
             trace_read && std::env::var("CIRI_TRACE_ALL_CANDS").ok().as_deref() == Some("1");
+        if scan1_claims.contains_both_mates(id) {
+            return Ok(Vec::new());
+        }
         let mut results = Vec::new();
         let mut segments: HashMap<i32, Vec<&AlignmentRecord<'a>>> = HashMap::new();
         for aln in alignments {
             segments
                 .entry(if aln.flag & 0x40 != 0 { 1 } else { 0 })
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(aln);
         }
 
         'mate: for seg_idx in [1_i32, 0_i32] {
             let mate_label = if seg_idx == 1 { "R1" } else { "R2" };
-            if scan1_claims.contains(&format!("{id}\t{mate_label}")) {
+            if scan1_claims.contains_mate(id, mate_label) {
                 continue;
             }
             let Some(seg_alns) = segments.get(&seg_idx) else {

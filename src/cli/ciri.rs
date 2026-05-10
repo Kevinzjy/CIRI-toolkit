@@ -324,6 +324,8 @@ pub fn main() -> Result<()> {
         "Running segments",
         "Reconstructing circRNA read-level segments...",
     )?;
+    let mut segment_progress_log =
+        |label: &str, message: &str| log_info(&mut log_writer, label, message);
     let segment_summary = run_ciri_as(AsConfig {
         input_path: &args.in_sam,
         circ_path: &result_output,
@@ -332,6 +334,7 @@ pub fn main() -> Result<()> {
         out_prefix: &args.out_prefix,
         reference: &fasta.chr_tcga_map,
         annotation: args.gtf.as_ref().map(|_| &annotation),
+        progress_log: Some(&mut segment_progress_log),
     })?;
     log_info(
         &mut log_writer,

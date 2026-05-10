@@ -515,6 +515,9 @@ pub fn fsj_path_for_output(output_arg: &str) -> String {
 ///
 /// Stable zero-padded numbering keeps shard files easy to scan by eye and
 /// avoids mixing two historical naming schemes (`.shard_N` vs `fsj_shard_N`).
+/// The input must be the logical merged artifact name or stem without a
+/// pre-existing `.tmp` suffix; shard files are always named
+/// `<merged>.part_XXXX.tmp` so every parallel stage uses the same convention.
 pub fn part_path(final_path: &str, part_idx: usize) -> String {
     format!("{}.part_{:04}.tmp", final_path, part_idx + 1)
 }
@@ -663,6 +666,10 @@ mod tests {
         assert_eq!(
             part_path("sample.ciri.bsj", 0),
             "sample.ciri.bsj.part_0001.tmp"
+        );
+        assert_eq!(
+            part_path("sample.ciri.segments", 15),
+            "sample.ciri.segments.part_0016.tmp"
         );
     }
 }
