@@ -257,6 +257,7 @@ r1_segments
 r1_is_bsj
 r2_segments
 r2_is_bsj
+type
 ```
 
 字段说明：
@@ -270,6 +271,11 @@ r2_is_bsj
 - `is_bsj=0` 表示两个 mate 都不跨 BSJ 位点。
 - `r1_is_bsj` / `r2_is_bsj` 分别表示 R1 / R2 是否为 BSJ read。
 - `r1_segments` / `r2_segments` 是该 mate 的真实模拟来源 read-chain 坐标片段。
+- `type` 是 read-pair 的主 truth 类型，当前取值为 `bsj` / `backward` / `outward` / `forward`：
+  - `bsj` 表示至少一个 mate 真实跨 BSJ；
+  - `outward` 表示两个 mate 都不跨 BSJ，且满足 5'RO-like pair geometry：5' 端 overlap、3' 端 outward；
+  - `backward` 表示两个 mate 都不跨 BSJ，insert/read pair 跨 circular boundary，但不满足当前 `outward` 的 5'RO-like 几何；
+  - `forward` 表示 read pair 可按线性片段解释。
 
 ### 5.1 segment protocol
 
@@ -302,7 +308,7 @@ BSJ read 必须使用第二种显式格式，即在跨 BSJ 位置加入 `<bsj>`�
 - 对负链 isoform，`strand=-`，但每个 token 内部的 `start <= end` 仍使用 genomic coordinate 的自然顺序。
 - 如果 read 横跨多个 exon，需要拆成多个 genomic segments。
 - 如果 read 在 circular boundary 回绕，必须保留回绕前后的 read-chain 顺序，并在 BSJ 分区之间插入 `<bsj>`。
-- 对不跨 BSJ 的 circular read，如果它来源于一个线性上连续可解释的 exon 片段，则 `is_circular=0`；如果来源结构表现为 backward 或其他非线性顺序，则 `is_circular=1`。
+- 对不跨 BSJ 的 circular read，如果它来源于一个线性上连续可解释的 exon 片段，则 `is_circular=0` 且 `type=forward`；如果 mate 自身不跨 BSJ 但 insert/read pair 跨 circular boundary，则 `is_circular=1`，并按 5'RO-like geometry 细分为 `type=outward` 或 `type=backward`。
 
 ### 5.2 设计动机
 
@@ -364,6 +370,7 @@ RO debug 输出如果恢复，应继续遵守三层口径：
 - `<prefix>.isoforms.tsv` 中每个 `isoform_bsj_read_cnt` 的和等于该 circRNA 的 `bsj_read_cnt`。
 - `<prefix>.reads.tsv` 中每行的 `is_bsj` 必须等于 `r1_is_bsj OR r2_is_bsj`。
 - `<prefix>.reads.tsv` 中 `is_circular` 必须按 topology rule 标注；来自 circRNA 但可完美线性解释的 read pair 应为 `is_circular=0`。
+- `<prefix>.reads.tsv` 中 `type=outward` 必须满足 `is_circular=1` 且 `is_bsj=0`，并具有 5' overlap + 3' outward geometry；其余 non-BSJ circular pairs 写作 `type=backward`。
 - `<prefix>.reads.tsv` 中 `r1_is_bsj=1` 的行必须在 `r1_segments` 中包含 `<bsj>` token；`r2_is_bsj=1` 同理。
 - 对每个 circRNA，按 `.reads.tsv` 汇总 `isoform_id` 的 `circ_id != NA` 行数必须等于 `.isoforms.tsv` 中对应 `isoform_read_cnt`。
 - 对每个 circRNA，按 `.reads.tsv` 汇总 `isoform_id` 的 `is_bsj=1` 行数必须等于 `.isoforms.tsv` 中对应 `isoform_bsj_read_cnt`。

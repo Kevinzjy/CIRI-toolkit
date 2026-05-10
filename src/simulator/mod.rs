@@ -700,6 +700,81 @@ fn format_segments(
     MateSegments { text, is_bsj }
 }
 
+/// Returns the genomic span of the first read-chain block for one mate.
+///
+/// This mirrors the 5' end used by the RO-style outward truth rule. The first
+/// block is enough here because `type=outward` is a pair-level 5' overlap class;
+/// downstream exon-junction support is still carried by the full segment chain.
+fn first_read_chain_segment_span(
+    source_map: &[SourceBase],
+    start: usize,
+    len: usize,
+    circular: bool,
+) -> Option<(usize, usize)> {
+    let seq_len = source_map.len();
+    let mut iter = (0..len).map(|offset| {
+        if circular {
+            (start + offset) % seq_len
+        } else {
+            start + offset
+        }
+    });
+    let first_pos = iter.next()?;
+    let first = &source_map[first_pos];
+    let mut min_coord = first.coord;
+    let mut max_coord = first.coord;
+    let exon_idx = first.exon_idx;
+    let mut prev_pos = first_pos;
+
+    for pos in iter {
+        if circular
+            && ((prev_pos == seq_len - 1 && pos == 0) || (prev_pos == 0 && pos == seq_len - 1))
+        {
+            break;
+        }
+        let base = &source_map[pos];
+        if base.exon_idx != exon_idx
+            || (base.coord.abs_diff(min_coord) != 1 && base.coord.abs_diff(max_coord) != 1)
+        {
+            break;
+        }
+        min_coord = min_coord.min(base.coord);
+        max_coord = max_coord.max(base.coord);
+        prev_pos = pos;
+    }
+
+    Some((min_coord, max_coord))
+}
+
+/// Tests the simulator-side 5'RO-like outward truth geometry.
+///
+/// R1 maps in the transcript strand direction, while R2 maps in the opposite
+/// direction because its emitted sequence is reverse-complemented. A true
+/// outward pair has overlapping 5' blocks and outward-facing 3' ends:
+/// `reverse.start < forward.start <= reverse.end < forward.end`.
+fn is_5p_ro_like_outward_truth(
+    source_map: &[SourceBase],
+    strand: char,
+    r1_start: usize,
+    r2_start: usize,
+    read_len: usize,
+) -> bool {
+    let Some(r1_span) = first_read_chain_segment_span(source_map, r1_start, read_len, true) else {
+        return false;
+    };
+    let Some(r2_span) = first_read_chain_segment_span(source_map, r2_start, read_len, true) else {
+        return false;
+    };
+    let (reverse_span, forward_span) = if strand == '-' {
+        (r1_span, r2_span)
+    } else {
+        (r2_span, r1_span)
+    };
+    reverse_span.0 < forward_span.0
+        && forward_span.0 <= reverse_span.1
+        && reverse_span.1 < forward_span.1
+}
+
 /// Samples a non-negative coverage value from the configured Gaussian model.
 fn sample_coverage(mean: f64, scale: f64, rng: &mut Lcg64) -> f64 {
     if mean <= 0.0 {
@@ -1050,7 +1125,29 @@ fn write_circular_reads(
             let r2_segments =
                 format_segments(&source_map, circ.strand, r2_start, args.read_len, true);
             let is_bsj = r1_segments.is_bsj || r2_segments.is_bsj;
-            let is_circular = crosses_boundary(r1_start, insert_len, seq_len) || is_bsj;
+            let pair_crosses_boundary = crosses_boundary(r1_start, insert_len, seq_len);
+            let is_circular = pair_crosses_boundary || is_bsj;
+            // `outward` is the 5'RO-like subset of non-BSJ circular pairs. The
+            // remaining non-BSJ circular pairs stay separate as `backward`, so
+            // outward precision is not penalized by a broader circular-origin
+            // truth class.
+            let truth_type = if is_bsj {
+                "bsj"
+            } else if pair_crosses_boundary
+                && is_5p_ro_like_outward_truth(
+                    &source_map,
+                    circ.strand,
+                    r1_start,
+                    r2_start,
+                    args.read_len,
+                )
+            {
+                "outward"
+            } else if pair_crosses_boundary {
+                "backward"
+            } else {
+                "forward"
+            };
             let read_id = format!("sim:{}", *next_read_index);
             let metadata = format!(
                 "read_kind=circ circ_id={} isoform_id={} insert_len={}",
@@ -1072,7 +1169,7 @@ fn write_circular_reads(
             )?;
             writeln!(
                 read_truth,
-                "{read_id}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{read_id}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{truth_type}",
                 circ.circ_id,
                 circ.chrom,
                 circ.start,
@@ -1167,7 +1264,7 @@ fn write_linear_reads(
         )?;
         writeln!(
             read_truth,
-            "{read_id}\tNA\t{}\tNA\tNA\t{}\tNA\t0\t0\t{}\t0\t{}\t0",
+            "{read_id}\tNA\t{}\tNA\tNA\t{}\tNA\t0\t0\t{}\t0\t{}\t0\tforward",
             tx.chrom, tx.strand, r1_segments.text, r2_segments.text
         )?;
         *next_read_index += 1;
@@ -1328,7 +1425,7 @@ pub fn run(args: SimulateArgs) -> Result<SimulationSummary> {
         BufWriter::new(File::create(prefixed_path(&args.out_prefix, ".reads.tsv"))?);
     writeln!(
         read_truth,
-        "read_id\tcirc_id\tchrom\tstart\tend\tstrand\tisoform_id\tis_circular\tis_bsj\tr1_segments\tr1_is_bsj\tr2_segments\tr2_is_bsj"
+        "read_id\tcirc_id\tchrom\tstart\tend\tstrand\tisoform_id\tis_circular\tis_bsj\tr1_segments\tr1_is_bsj\tr2_segments\tr2_is_bsj\ttype"
     )?;
 
     let mut next_read_index = 1usize;

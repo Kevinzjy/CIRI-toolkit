@@ -391,11 +391,11 @@ approximate local junction rescue 暂不进入当前 `<prefix>.segments` strong 
 
 - Summary 后额外扫描到的非 BSJ read pair；
 - R1/R2 各自都能形成 linear-compatible primary chain；
-- 两个 mate 的 genomic order / strand orientation 呈 outward circular-compatible pattern，例如 plus-strand coordinate order 下的 `<-R1 R2->`。
+- 两个 mate 的 primary alignment 呈 5' RO-like outward geometry：一个 mate 为 reverse、另一个为 forward，reverse mate 的 5' 端与 forward mate 的 5' 端存在 overlap，同时两个 3' 端向外展开；普通 proper pair 的 contained overlap 不属于 `outward`。
 
 要求：
 
-- 不强行分配 `circ_id / strand`，统一写 `NA`；同一 read 可以在后续 circRNA-level graph 阶段投到所有兼容 circ span；
+- 不强行分配 `circ_id`，统一写 `NA`；`strand` 默认写 `NA`，但如果 mate 内部已有普通 `N` junction 且 annotation / splice signal 给出唯一不冲突的 RNA strand，则写入该 strand，并用同一 strand 重新 materialize `r1_segments / r2_segments`；
 - `chrom` 必须能由 selected R1/R2 primary chains 唯一确定；跨染色体或无法确定单一 chromosome 的 read 不进入最终 `<prefix>.segments`；
 - `start / end` 表示该 read pair 所有 retained alignment segments 覆盖到的最小 / 最大 genomic position；
 - `is_circular=1`，因为它是 pair-level circular-compatible topology support；

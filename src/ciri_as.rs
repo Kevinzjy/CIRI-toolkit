@@ -22,7 +22,10 @@ use std::time::Instant;
 
 use crate::annotation::Annotation;
 use crate::sam_bam::{detect_format, InputFormat};
-use crate::utils::{bsj_payload_start, is_bsj_mate_label, reverse_complement};
+use crate::utils::{
+    bsj_payload_start, clip_placement_cigar, clip_sequence_payload, exact_clip_match_positions,
+    is_bsj_mate_label, parse_clip_payload, reverse_complement,
+};
 
 const MIN_INTRON: i32 = 70;
 const MIN_EXON_LENGTH: i32 = 20;
@@ -36,6 +39,12 @@ const MAPQ_THRES: i32 = 5;
 const MAPQ_UNI: i32 = 0;
 const MAPQ_BOTH: i32 = 0;
 const STRINGENCY: usize = 1;
+/// Half-window around local anchors searched for non-BSJ clip placement.
+const NON_BSJ_LOCAL_CLIP_ANCHOR_FLANK_MULTIPLIER: i32 = 2;
+/// Maximum local clip pseudo-alignments retained per read group.
+const NON_BSJ_LOCAL_CLIP_MAX_ROWS_PER_READ: usize = 16;
+/// Maximum local clip placements retained for one clipped side before chain ranking.
+const NON_BSJ_LOCAL_CLIP_MAX_PLACEMENTS_PER_SIDE: usize = 4;
 /// Minimum selected XA anchor length accepted by the backward negative filter.
 const XA_REJECT_MIN_ANCHOR_LEN: i32 = MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH;
 /// Minimum span reduction required before XA can reject a backward sidecar row.
@@ -360,6 +369,19 @@ struct CircSpan {
     start: i32,
     end: i32,
     max_end_through: i32,
+}
+
+/// Local reference window used to place non-BSJ soft clips.
+///
+/// Backward/outward reads are not assigned to one circRNA at read level, so clip
+/// placement cannot be limited to a unique circ span. These windows stay local
+/// to detected circ loci and the read's own mapped blocks, then the normal
+/// chain ranking chooses whether any pseudo-alignment is biologically coherent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LocalClipWindow {
+    chr: String,
+    start: i32,
+    end: i32,
 }
 
 /// Parsed result of the CIRI-AS `MSID` CIGAR classifier.
@@ -1171,14 +1193,21 @@ fn process_backward_group(
     if records.is_empty() || state.junction_read_to_circ.contains_key(read_id) {
         return Ok(());
     }
-    if is_outward_pair_group(records, state) {
+    let is_outward = is_outward_pair_group(records, state);
+    let overlaps_cluster = records.len() > 2 && overlaps_any_circ_cluster(records, state);
+    if !is_outward && !overlaps_cluster {
+        return Ok(());
+    }
+
+    if is_outward {
+        let enriched_records = add_non_bsj_local_clip_alignments(records, state);
         state
             .segment_groups
             .entry(read_id.to_string())
-            .or_insert_with(|| records.to_vec());
+            .or_insert_with(|| enriched_records.clone());
         state.outward_read_ids.insert(read_id.to_string());
     }
-    if records.len() > 2 && overlaps_any_circ_cluster(records, state) {
+    if overlaps_cluster {
         state
             .segment_groups
             .entry(read_id.to_string())
@@ -1186,6 +1215,315 @@ fn process_backward_group(
         mapping_check1(read_id, records, false, state)?;
     }
     Ok(())
+}
+
+/// Adds local soft-clip pseudo-alignments for non-BSJ read groups.
+///
+/// This mirrors the BSJ sidecar idea without assuming a read-level circRNA
+/// assignment. Candidate placements are searched in local windows around
+/// detected circ loci and the read's mapped blocks; the final backward/outward
+/// chain builder still decides whether a placement improves the selected
+/// topology. The original mapper rows are always retained first so these local
+/// rows cannot erase the primary evidence.
+fn add_non_bsj_local_clip_alignments(
+    records: &[AsAlignment],
+    state: &ScanState,
+) -> Vec<AsAlignment> {
+    if !records.iter().any(|record| {
+        !record.from_local_clip
+            && record.cigar.contains('S')
+            && !record.seq.is_empty()
+            && record.seq != "*"
+    }) {
+        return records.to_vec();
+    }
+    let windows = non_bsj_local_clip_windows(records, state);
+    if windows.is_empty() {
+        return records.to_vec();
+    }
+    let mut out = records.to_vec();
+    let mut local = non_bsj_local_clip_alignments(records, &windows, state);
+    local.sort_by(|a, b| {
+        mate_bucket(a.flag)
+            .cmp(&mate_bucket(b.flag))
+            .then_with(|| a.chr.cmp(&b.chr))
+            .then_with(|| a.pos.cmp(&b.pos))
+            .then_with(|| a.cigar.cmp(&b.cigar))
+    });
+    local.truncate(NON_BSJ_LOCAL_CLIP_MAX_ROWS_PER_READ);
+    out.extend(local);
+    out
+}
+
+/// Builds bounded local reference windows for non-BSJ clip placement.
+///
+/// The search space deliberately includes circ-cluster and read-neighborhood
+/// anchors, not only exact Summary circ spans. Windows are centered on likely
+/// junction anchors rather than whole loci, which keeps this read-local rescue
+/// bounded while still allowing clips to place just outside a particular circ
+/// span when that is the most coherent chain explanation.
+fn non_bsj_local_clip_windows(records: &[AsAlignment], state: &ScanState) -> Vec<LocalClipWindow> {
+    let mut by_chr: HashMap<&str, (i32, i32)> = HashMap::new();
+    let mut anchors_by_chr: HashMap<&str, Vec<i32>> = HashMap::new();
+    let anchor_flank = state.read_len * NON_BSJ_LOCAL_CLIP_ANCHOR_FLANK_MULTIPLIER;
+    for record in records {
+        if record.chr == "*" {
+            continue;
+        }
+        let Some((start, end)) = alignment_ref_span(record, state.read_len) else {
+            continue;
+        };
+        by_chr
+            .entry(record.chr.as_str())
+            .and_modify(|span| {
+                span.0 = span.0.min(start);
+                span.1 = span.1.max(end);
+            })
+            .or_insert((start, end));
+        anchors_by_chr
+            .entry(record.chr.as_str())
+            .or_default()
+            .extend([start, end]);
+    }
+
+    let mut windows = Vec::new();
+    let mut seen = HashSet::new();
+    for (chr, (group_start, group_end)) in by_chr {
+        if let Some(spans) = state.circ_spans_by_chr.get(chr) {
+            for span in
+                overlapping_circ_spans(spans, group_start - MIN_INTRON, group_end + MIN_INTRON)
+            {
+                push_local_clip_anchor_window(
+                    &mut windows,
+                    &mut seen,
+                    state.reference,
+                    chr,
+                    span.start,
+                    anchor_flank,
+                );
+                push_local_clip_anchor_window(
+                    &mut windows,
+                    &mut seen,
+                    state.reference,
+                    chr,
+                    span.end,
+                    anchor_flank,
+                );
+            }
+        }
+        if let Some(clusters) = state.clusters_by_chr.get(chr) {
+            for cluster in overlapping_circ_clusters(
+                clusters,
+                group_start - MIN_INTRON,
+                group_end + MIN_INTRON,
+            ) {
+                push_local_clip_anchor_window(
+                    &mut windows,
+                    &mut seen,
+                    state.reference,
+                    chr,
+                    cluster.start,
+                    anchor_flank,
+                );
+                push_local_clip_anchor_window(
+                    &mut windows,
+                    &mut seen,
+                    state.reference,
+                    chr,
+                    cluster.end,
+                    anchor_flank,
+                );
+            }
+        }
+        push_local_clip_anchor_window(
+            &mut windows,
+            &mut seen,
+            state.reference,
+            chr,
+            group_start,
+            anchor_flank,
+        );
+        push_local_clip_anchor_window(
+            &mut windows,
+            &mut seen,
+            state.reference,
+            chr,
+            group_end,
+            anchor_flank,
+        );
+        if let Some(anchors) = anchors_by_chr.get(chr) {
+            for anchor in anchors {
+                push_local_clip_anchor_window(
+                    &mut windows,
+                    &mut seen,
+                    state.reference,
+                    chr,
+                    *anchor,
+                    anchor_flank,
+                );
+            }
+        }
+    }
+    windows
+}
+
+/// Returns circ spans overlapping a query interval using the sorted span index.
+fn overlapping_circ_spans(
+    spans: &[CircSpan],
+    query_start: i32,
+    query_end: i32,
+) -> impl Iterator<Item = &CircSpan> {
+    let right = spans.partition_point(|span| span.start <= query_end);
+    spans[..right]
+        .iter()
+        .rev()
+        .take_while(move |span| span.max_end_through >= query_start)
+        .filter(move |span| span.end >= query_start)
+}
+
+/// Returns circ clusters overlapping a query interval using sorted disjoint clusters.
+fn overlapping_circ_clusters(
+    clusters: &[CircCluster],
+    query_start: i32,
+    query_end: i32,
+) -> impl Iterator<Item = &CircCluster> {
+    let right = clusters.partition_point(|cluster| cluster.start <= query_end);
+    clusters[..right]
+        .iter()
+        .rev()
+        .take_while(move |cluster| cluster.end >= query_start)
+}
+
+/// Appends one clamped anchor-centered local clip window if it is non-duplicate.
+fn push_local_clip_anchor_window(
+    windows: &mut Vec<LocalClipWindow>,
+    seen: &mut HashSet<(String, i32, i32)>,
+    reference: &HashMap<String, String>,
+    chr: &str,
+    anchor: i32,
+    flank: i32,
+) {
+    let Some(chr_seq) = reference.get(chr) else {
+        return;
+    };
+    let chr_len = chr_seq.len() as i32;
+    let start = (anchor - flank).max(1);
+    let end = (anchor + flank).min(chr_len);
+    if start > end {
+        return;
+    }
+    let key = (chr.to_string(), start, end);
+    if seen.insert(key.clone()) {
+        windows.push(LocalClipWindow {
+            chr: key.0,
+            start,
+            end,
+        });
+    }
+}
+
+/// Generates pseudo-alignment rows by full-exact soft-clip placement.
+///
+/// BSJ sidecars can afford longest-partial local search because they run only
+/// after a BSJ validator accepts one read group. Backward/outward candidates are
+/// more numerous, so this stage keeps only full-clip exact placements and leaves
+/// partial/approximate clip rescue for a later indexed or circRNA-level pass.
+fn non_bsj_local_clip_alignments(
+    records: &[AsAlignment],
+    windows: &[LocalClipWindow],
+    state: &ScanState,
+) -> Vec<AsAlignment> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let min_clip_len = MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH as usize;
+    for record in records {
+        if record.from_local_clip
+            || !record.cigar.contains('S')
+            || record.seq.is_empty()
+            || record.seq == "*"
+            || record.chr == "*"
+        {
+            continue;
+        }
+        let payload = clip_sequence_payload(&record.cigar, &record.seq);
+        if payload == "*" {
+            continue;
+        }
+        for (side, clip_seq) in parse_clip_payload(&payload) {
+            if clip_seq.len() < min_clip_len || clip_seq.contains('N') {
+                continue;
+            }
+            let query = clip_seq.to_ascii_uppercase();
+            if query.contains('N') {
+                continue;
+            }
+            let mut candidates: Vec<(i32, AsAlignment)> = Vec::new();
+            for window in windows.iter().filter(|window| window.chr == record.chr) {
+                let Some(chr_seq) = state.reference.get(&window.chr) else {
+                    continue;
+                };
+                let Some(local_seq) = chr_seq.get((window.start - 1) as usize..window.end as usize)
+                else {
+                    continue;
+                };
+                let mut positions =
+                    exact_clip_match_positions(local_seq, &query, window.start, window.end);
+                positions.truncate(NON_BSJ_LOCAL_CLIP_MAX_PLACEMENTS_PER_SIDE);
+                for pos in positions {
+                    let read_len = record.seq.len() as i32;
+                    let Some(cigar) =
+                        clip_placement_cigar(side, clip_seq.len(), 0, clip_seq.len(), read_len)
+                    else {
+                        continue;
+                    };
+                    let flag = record.flag | 0x800;
+                    let key = (flag, window.chr.clone(), pos, cigar.clone(), side);
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    let distance =
+                        local_clip_distance_to_group(records, &window.chr, pos, state.read_len);
+                    candidates.push((
+                        -((clip_seq.len() as i32) * 1000) + distance,
+                        AsAlignment {
+                            flag,
+                            chr: window.chr.clone(),
+                            pos,
+                            mapq: record.mapq.saturating_sub(1),
+                            cigar,
+                            seq: String::new(),
+                            from_local_clip: true,
+                            xa_alternatives: Vec::new(),
+                        },
+                    ));
+                }
+            }
+            candidates.sort_by(|a, b| a.0.cmp(&b.0));
+            out.extend(
+                candidates
+                    .into_iter()
+                    .take(NON_BSJ_LOCAL_CLIP_MAX_PLACEMENTS_PER_SIDE)
+                    .map(|(_, alignment)| alignment),
+            );
+        }
+    }
+    out
+}
+
+/// Scores how close a local clip placement is to the read group's mapped blocks.
+fn local_clip_distance_to_group(
+    records: &[AsAlignment],
+    chr: &str,
+    pos: i32,
+    read_len: i32,
+) -> i32 {
+    records
+        .iter()
+        .filter(|record| record.chr == chr)
+        .filter_map(|record| alignment_ref_span(record, read_len))
+        .map(|(start, end)| (pos - start).abs().min((pos - end).abs()))
+        .min()
+        .unwrap_or(i32::MAX / 4)
 }
 
 /// Adds all alignment coverage that overlaps CIRI-AS circRNA locus clusters.
@@ -1302,10 +1640,11 @@ fn overlaps_any_circ_cluster(records: &[AsAlignment], state: &ScanState) -> bool
 /// Returns whether one non-BSJ read group is pair-level outward circ evidence.
 ///
 /// Unlike `type=backward`, this detector does not require a mate-internal read
-/// chain wrap. It keeps the common RO-like case where both mates align linearly
-/// but the pair faces outward inside at least one detected circRNA span. The row
-/// remains `circ_id=NA`; later graph construction may project it onto every
-/// compatible circRNA instead of forcing a read-level unique assignment.
+/// chain wrap. It keeps the 5' RO-like primary-pair geometry: the reverse mate's
+/// 5' side overlaps the forward mate's 5' side, while their 3' ends point
+/// outward. The row remains `circ_id=NA`; later graph construction may project
+/// it onto every compatible circRNA instead of forcing a read-level unique
+/// assignment.
 fn is_outward_pair_group(records: &[AsAlignment], state: &ScanState) -> bool {
     let Some((r1, r2)) = primary_mate_pair(records) else {
         return false;
@@ -1319,17 +1658,41 @@ fn is_outward_pair_group(records: &[AsAlignment], state: &ScanState) -> bool {
     let Some((r2_start, r2_end)) = alignment_ref_span(r2, state.read_len) else {
         return false;
     };
-    let (left, right) = if r1_start <= r2_start {
-        (r1, r2)
-    } else {
-        (r2, r1)
-    };
-    if !is_reverse_strand(left.flag) || is_reverse_strand(right.flag) {
+    if !has_5p_overlap_with_3p_outward(r1, (r1_start, r1_end), r2, (r2_start, r2_end)) {
         return false;
     }
     let span_start = r1_start.min(r2_start);
     let span_end = r1_end.max(r2_end);
     span_contained_in_any_circ(&r1.chr, span_start, span_end, state)
+}
+
+/// Tests the 5' RO-like geometry for a primary R1/R2 pair.
+///
+/// A valid pair has one reverse and one forward primary alignment. The reverse
+/// mate's 5' side is its high genomic end; the forward mate's 5' side is its low
+/// genomic start. Requiring `reverse.start < forward.start <= reverse.end <
+/// forward.end` accepts only a 5' overlap with the two 3' ends facing outward,
+/// and rejects ordinary contained/overlapping proper pairs on negative-strand
+/// transcripts.
+fn has_5p_overlap_with_3p_outward(
+    r1: &AsAlignment,
+    r1_span: (i32, i32),
+    r2: &AsAlignment,
+    r2_span: (i32, i32),
+) -> bool {
+    let r1_reverse = is_reverse_strand(r1.flag);
+    let r2_reverse = is_reverse_strand(r2.flag);
+    if r1_reverse == r2_reverse {
+        return false;
+    }
+    let (reverse_span, forward_span) = if r1_reverse {
+        (r1_span, r2_span)
+    } else {
+        (r2_span, r1_span)
+    };
+    reverse_span.0 < forward_span.0
+        && forward_span.0 <= reverse_span.1
+        && reverse_span.1 < forward_span.1
 }
 
 /// Selects the single primary R1/R2 pair used for outward orientation checks.
@@ -3453,7 +3816,7 @@ fn build_backward_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord
         .par_iter()
         .filter_map(|read_id| {
             let records = state.segment_groups.get(*read_id)?;
-            build_backward_segment_record(
+            let base = build_backward_segment_record(
                 *read_id,
                 records,
                 read_strand_hints.get(*read_id).copied().flatten(),
@@ -3463,7 +3826,23 @@ fn build_backward_segment_records(state: &ScanState) -> Result<Vec<SegmentRecord
                     .unwrap_or(&[]),
                 Some(&correction),
                 state.read_len,
+            )?;
+            let enriched_records = add_non_bsj_local_clip_alignments(records, state);
+            if enriched_records.len() == records.len() {
+                return Some(base);
+            }
+            build_backward_segment_record(
+                *read_id,
+                &enriched_records,
+                read_strand_hints.get(*read_id).copied().flatten(),
+                read_junction_hints
+                    .get(*read_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                Some(&correction),
+                state.read_len,
             )
+            .or(Some(base))
         })
         .collect();
     Ok(records)
@@ -3480,6 +3859,11 @@ fn build_outward_segment_records(
     state: &ScanState,
     backward_read_ids: &HashSet<String>,
 ) -> Result<Vec<SegmentRecord>> {
+    let correction = SegmentCorrectionContext {
+        reference: state.reference,
+        annotation: state.annotation,
+        junction_support: None,
+    };
     let mut read_ids: Vec<&str> = state
         .outward_read_ids
         .iter()
@@ -3491,7 +3875,7 @@ fn build_outward_segment_records(
         .par_iter()
         .filter_map(|read_id| {
             let records = state.segment_groups.get(*read_id)?;
-            build_outward_segment_record(*read_id, records, state.read_len)
+            build_outward_segment_record(*read_id, records, Some(&correction), state.read_len)
         })
         .collect();
     Ok(records)
@@ -3818,16 +4202,44 @@ fn build_backward_segment_record(
 fn build_outward_segment_record(
     read_id: &str,
     records: &[AsAlignment],
+    correction: Option<&SegmentCorrectionContext<'_>>,
     read_len: i32,
 ) -> Option<SegmentRecord> {
     let (r1, r2) = primary_mate_pair(records)?;
-    let mut chains = build_pair_chains(records, read_len, None, "outward", '?', &[], None);
+    let mut chains = build_pair_chains(records, read_len, None, "outward", '?', &[], correction);
     if chains.iter().flatten().any(|chain| chain.is_circular) {
         let selected = [r1.clone(), r2.clone()];
-        chains = build_pair_chains(&selected, read_len, None, "outward", '?', &[], None);
+        chains = build_pair_chains(&selected, read_len, None, "outward", '?', &[], correction);
     }
     if chains.iter().flatten().any(|chain| chain.is_circular) {
         return None;
+    }
+    let token_strand = infer_outward_token_strand(&chains, correction).unwrap_or('?');
+    if token_strand != '?' {
+        chains = build_pair_chains(
+            records,
+            read_len,
+            None,
+            "outward",
+            token_strand,
+            &[],
+            correction,
+        );
+        if chains.iter().flatten().any(|chain| chain.is_circular) {
+            let selected = [r1.clone(), r2.clone()];
+            chains = build_pair_chains(
+                &selected,
+                read_len,
+                None,
+                "outward",
+                token_strand,
+                &[],
+                correction,
+            );
+        }
+        if chains.iter().flatten().any(|chain| chain.is_circular) {
+            return None;
+        }
     }
     let chrom = selected_chain_chrom(&chains)?;
     let (span_start, span_end) = selected_chain_span(&chains)?;
@@ -3843,7 +4255,7 @@ fn build_outward_segment_record(
         chrom,
         start: span_start.to_string(),
         end: span_end.to_string(),
-        strand: "NA".to_string(),
+        strand: token_strand.to_string().replace('?', "NA"),
         is_circular: 1,
         is_r1_bsj: 0,
         is_r2_bsj: 0,
@@ -3852,6 +4264,71 @@ fn build_outward_segment_record(
         r2_cigar,
         r2_segments,
     })
+}
+
+/// Infers an outward row's RNA strand from mate-internal splice junctions.
+///
+/// Outward evidence itself is pair-orientation based and therefore does not
+/// imply a transcript strand. When one mate already contains ordinary `N`
+/// junctions, however, annotation or splice motifs can provide the same strand
+/// evidence used by internal-boundary correction. The helper accepts only a
+/// unique non-conflicting strand so alignment orientation is never reported as
+/// biological strand by fallback.
+fn infer_outward_token_strand(
+    chains: &[Option<MateChain>; 2],
+    correction: Option<&SegmentCorrectionContext<'_>>,
+) -> Option<char> {
+    let correction = correction?;
+    let mut inferred: Option<char> = None;
+    for chain in chains.iter().flatten() {
+        for pair in chain.blocks.windows(2) {
+            let (left, right) = if pair[0].ref_start <= pair[1].ref_start {
+                (&pair[0], &pair[1])
+            } else {
+                (&pair[1], &pair[0])
+            };
+            let end = left.ref_end;
+            let start = right.ref_start;
+            if end >= start {
+                continue;
+            }
+            let plus = splice_strand_evidence_score(correction, &chain.chrom, end, start, '+');
+            let minus = splice_strand_evidence_score(correction, &chain.chrom, end, start, '-');
+            let strand = match plus.cmp(&minus) {
+                std::cmp::Ordering::Greater if plus > 0 => '+',
+                std::cmp::Ordering::Less if minus > 0 => '-',
+                _ => continue,
+            };
+            match inferred {
+                Some(existing) if existing != strand => return None,
+                Some(_) => {}
+                None => inferred = Some(strand),
+            }
+        }
+    }
+    inferred
+}
+
+/// Scores one exact internal junction as strand evidence.
+///
+/// Transcript-consistent annotation is strongest, boundary-level annotation is
+/// next, and de novo splice motifs are used only when annotation is absent.
+/// Scores are comparable only between `+` and `-` for the same junction.
+fn splice_strand_evidence_score(
+    ctx: &SegmentCorrectionContext<'_>,
+    chrom: &str,
+    end: i32,
+    start: i32,
+    strand: char,
+) -> i32 {
+    let (transcript_score, annotation_score) =
+        annotation_splice_pair_score(ctx.annotation, chrom, end, start, strand).unwrap_or((0, 0));
+    let motif_score = ctx
+        .reference
+        .get(chrom)
+        .and_then(|seq| splice_motif_score(seq, end, start, strand))
+        .unwrap_or(0);
+    transcript_score * 10_000 + annotation_score * 100 + motif_score
 }
 
 /// Result of topology-neutral XA selection for a candidate backward read.
@@ -5807,7 +6284,7 @@ mod tests {
                 chr: "chr1".to_string(),
                 pos: 100,
                 mapq: 60,
-                cigar: "50M".to_string(),
+                cigar: "150M".to_string(),
                 seq: "A".repeat(100),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
@@ -5854,7 +6331,7 @@ mod tests {
         };
 
         assert!(is_outward_pair_group(&records, &state));
-        let record = build_outward_segment_record("read1", &records, 100).unwrap();
+        let record = build_outward_segment_record("read1", &records, None, 100).unwrap();
 
         assert_eq!(record.type_name, "outward");
         assert_eq!(record.circ_id, "NA");
@@ -5864,12 +6341,195 @@ mod tests {
         assert_eq!(record.is_circular, 1);
         assert_eq!(record.is_r1_bsj, 0);
         assert_eq!(record.is_r2_bsj, 0);
+        assert_eq!(record.r1_cigar, "150M");
+        assert_eq!(record.r1_segments, "100-249:?");
         assert_eq!(record.r2_cigar, "50M100N50M");
         assert_eq!(record.r2_segments, "350-399:?|200-249:?");
         assert!(!record.r1_segments.contains("<bsj>"));
         assert!(!record.r2_segments.contains("<bsj>"));
         assert!(!record.r1_cigar.contains('B'));
         assert!(!record.r2_cigar.contains('B'));
+    }
+
+    #[test]
+    fn outward_segments_infer_strand_from_internal_annotation() {
+        let records = vec![
+            AsAlignment {
+                flag: 0x40 | 0x10,
+                chr: "chr1".to_string(),
+                pos: 100,
+                mapq: 60,
+                cigar: "150M".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 0x80,
+                chr: "chr1".to_string(),
+                pos: 200,
+                mapq: 60,
+                cigar: "50M100N50M".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+        ];
+        let reference = HashMap::new();
+        let mut annotation = Annotation::new();
+        annotation
+            .chr_exon_end_index
+            .entry("chr1".to_string())
+            .or_default()
+            .insert(249, ("GENE1".to_string(), '+'));
+        annotation
+            .chr_exon_start_index
+            .entry("chr1".to_string())
+            .or_default()
+            .insert(350, ("GENE1".to_string(), '+'));
+        annotation
+            .transcript_splice_index
+            .entry("chr1".to_string())
+            .or_default()
+            .entry('+')
+            .or_default()
+            .insert((249, 350));
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: Some(&annotation),
+            junction_support: None,
+        };
+
+        let record = build_outward_segment_record("read1", &records, Some(&correction), 100)
+            .expect("annotation-supported outward row");
+
+        assert_eq!(record.type_name, "outward");
+        assert_eq!(record.strand, "+");
+        assert_eq!(record.r1_segments, "100-249:+");
+        assert_eq!(record.r2_segments, "350-399:+|200-249:+");
+        assert!(!record.r2_segments.contains("<bsj>"));
+        assert!(!record.r2_cigar.contains('B'));
+    }
+
+    #[test]
+    fn outward_pair_groups_reject_contained_primary_overlap() {
+        let records = vec![
+            AsAlignment {
+                flag: 0x40 | 0x10,
+                chr: "chr1".to_string(),
+                pos: 100,
+                mapq: 60,
+                cigar: "150M".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 0x80,
+                chr: "chr1".to_string(),
+                pos: 100,
+                mapq: 60,
+                cigar: "100M".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+        ];
+        let reference = HashMap::new();
+        let state = ScanState {
+            circ_by_id: HashMap::new(),
+            junction_read_to_circ: HashMap::new(),
+            mate_bsj_evidence: HashMap::new(),
+            reference: &reference,
+            annotation: None,
+            circ_spans_by_chr: {
+                let mut map = HashMap::new();
+                map.insert(
+                    "chr1".to_string(),
+                    vec![CircSpan {
+                        start: 90,
+                        end: 260,
+                        max_end_through: 260,
+                    }],
+                );
+                map
+            },
+            clusters_by_chr: HashMap::new(),
+            read_len: 100,
+            candidates: Vec::new(),
+            coverage: HashMap::new(),
+            read_mappings: HashMap::new(),
+            seen_junction_reads: HashSet::new(),
+            outward_read_ids: HashSet::new(),
+            segment_groups: HashMap::new(),
+            stats: AsStats::default(),
+        };
+
+        assert!(!is_outward_pair_group(&records, &state));
+    }
+
+    #[test]
+    fn non_bsj_local_clip_alignment_uses_cluster_window_beyond_circ_span() {
+        let clip = "ACGTACGTACGTACGTACGT";
+        let mut chr_seq = "T".repeat(500);
+        chr_seq.replace_range(299..319, clip);
+        let mut reference = HashMap::new();
+        reference.insert("chr1".to_string(), chr_seq);
+        let records = vec![AsAlignment {
+            flag: 0x40,
+            chr: "chr1".to_string(),
+            pos: 100,
+            mapq: 60,
+            cigar: "130M20S".to_string(),
+            seq: format!("{}{}", "G".repeat(130), clip),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        }];
+        let state = ScanState {
+            circ_by_id: HashMap::new(),
+            junction_read_to_circ: HashMap::new(),
+            mate_bsj_evidence: HashMap::new(),
+            reference: &reference,
+            annotation: None,
+            circ_spans_by_chr: {
+                let mut map = HashMap::new();
+                map.insert(
+                    "chr1".to_string(),
+                    vec![CircSpan {
+                        start: 90,
+                        end: 220,
+                        max_end_through: 220,
+                    }],
+                );
+                map
+            },
+            clusters_by_chr: {
+                let mut map = HashMap::new();
+                map.insert(
+                    "chr1".to_string(),
+                    vec![CircCluster {
+                        chr: "chr1".to_string(),
+                        start: 80,
+                        end: 350,
+                    }],
+                );
+                map
+            },
+            read_len: 150,
+            candidates: Vec::new(),
+            coverage: HashMap::new(),
+            read_mappings: HashMap::new(),
+            seen_junction_reads: HashSet::new(),
+            outward_read_ids: HashSet::new(),
+            segment_groups: HashMap::new(),
+            stats: AsStats::default(),
+        };
+
+        let enriched = add_non_bsj_local_clip_alignments(&records, &state);
+
+        assert!(enriched.iter().any(|record| {
+            record.from_local_clip && record.pos == 300 && record.cigar == "130S20M"
+        }));
     }
 
     #[test]

@@ -7,10 +7,10 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ClipPlacement {
-    pos: i32,
-    clip_offset: usize,
-    len: usize,
+pub(crate) struct ClipPlacement {
+    pub(crate) pos: i32,
+    pub(crate) clip_offset: usize,
+    pub(crate) len: usize,
 }
 
 /// Smallest compressed BAM shard size worth parallelizing.
@@ -224,7 +224,7 @@ pub fn local_clip_evidence_lines<'a>(
 /// read positions starting at one; right clips occupy the terminal read suffix.
 /// Preserving both surrounding soft clips lets the post-Summary chain builder
 /// know where a partial local block sits within the mate read.
-fn clip_placement_cigar(
+pub(crate) fn clip_placement_cigar(
     side: char,
     clip_len: usize,
     clip_offset: usize,
@@ -290,7 +290,7 @@ fn parse_bsj_line_span(line: &str) -> Option<(String, i32, i32)> {
 }
 
 /// Parses compact sidecar clip payload fields.
-fn parse_clip_payload(payload: &str) -> Vec<(char, &str)> {
+pub(crate) fn parse_clip_payload(payload: &str) -> Vec<(char, &str)> {
     payload
         .split(',')
         .filter_map(|field| {
@@ -302,7 +302,7 @@ fn parse_clip_payload(payload: &str) -> Vec<(char, &str)> {
 }
 
 /// Finds full or longest prefix/suffix partial clip placements.
-fn clip_match_placements(
+pub(crate) fn clip_match_placements(
     circ_seq: &str,
     genomic_query: &str,
     circ_start: i32,
@@ -362,7 +362,7 @@ fn clip_match_placements(
 }
 
 /// Finds exact local-clip placements and ranks boundary-near hits first.
-fn exact_clip_match_positions(
+pub(crate) fn exact_clip_match_positions(
     circ_seq: &str,
     genomic_query: &str,
     circ_start: i32,

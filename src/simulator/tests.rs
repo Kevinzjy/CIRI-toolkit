@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{
-    format_segments, run, sample_circular_insert_len, sample_insert_len,
-    select_fastq_compressor_from_availability, FastqCompressor, Lcg64, SimulateArgs, SourceBase,
+    format_segments, is_5p_ro_like_outward_truth, run, sample_circular_insert_len,
+    sample_insert_len, select_fastq_compressor_from_availability, FastqCompressor, Lcg64,
+    SimulateArgs, SourceBase,
 };
 
 const ISOFORM_HEADER: &str = "circ_id\tchrom\tstart\tend\tstrand\tgene_id\ttranscript_id\tcoverage\tread_cnt\tbsj_read_cnt\tisoform_cnt\tisoform_exons\tisoform_len\tisoform_read_cnt\tisoform_bsj_read_cnt";
-const READS_HEADER: &str = "read_id\tcirc_id\tchrom\tstart\tend\tstrand\tisoform_id\tis_circular\tis_bsj\tr1_segments\tr1_is_bsj\tr2_segments\tr2_is_bsj";
+const READS_HEADER: &str = "read_id\tcirc_id\tchrom\tstart\tend\tstrand\tisoform_id\tis_circular\tis_bsj\tr1_segments\tr1_is_bsj\tr2_segments\tr2_is_bsj\ttype";
 
 fn base_args() -> SimulateArgs {
     SimulateArgs {
@@ -123,6 +124,17 @@ fn simulator_segments_keep_read_chain_bsj_order() {
 }
 
 #[test]
+fn simulator_outward_truth_requires_5p_overlap_and_3p_outward() {
+    let source_map: Vec<SourceBase> = (100..300)
+        .map(|coord| SourceBase { coord, exon_idx: 0 })
+        .collect();
+
+    assert!(is_5p_ro_like_outward_truth(&source_map, '-', 40, 70, 100));
+    assert!(!is_5p_ro_like_outward_truth(&source_map, '-', 40, 40, 100));
+    assert!(!is_5p_ro_like_outward_truth(&source_map, '+', 140, 0, 100));
+}
+
+#[test]
 fn long_circ_sampling_matches_generic_insert_distribution() {
     let args = base_args();
     let mut circ_rng = Lcg64::new(11);
@@ -188,6 +200,7 @@ fn simulator_output_contract_is_stable() {
     let circ_read_pairs = reads.iter().filter(|row| row[1] != "NA").count();
     let linear_read_pairs = reads.iter().filter(|row| row[1] == "NA").count();
     let bsj_read_pairs = reads.iter().filter(|row| row[8] == "1").count();
+    let outward_read_pairs = reads.iter().filter(|row| row[13] == "outward").count();
     let bsj_reads = reads
         .iter()
         .map(|row| parse_usize(row, 10) + parse_usize(row, 12))
@@ -201,12 +214,29 @@ fn simulator_output_contract_is_stable() {
             parse_usize(row, 8),
             parse_usize(row, 10) | parse_usize(row, 12)
         );
+        if row[13] == "bsj" {
+            assert_eq!(row[8], "1");
+        }
+        if row[13] == "outward" {
+            assert_eq!(row[7], "1");
+            assert_eq!(row[8], "0");
+            assert_eq!(row[10], "0");
+            assert_eq!(row[12], "0");
+        }
+        if row[13] == "backward" {
+            assert_eq!(row[7], "1");
+            assert_eq!(row[8], "0");
+        }
+        if row[13] == "forward" {
+            assert_eq!(row[8], "0");
+        }
         if row[1] == "NA" {
             assert_eq!(row[3], "NA");
             assert_eq!(row[4], "NA");
             assert_eq!(row[6], "NA");
             assert_eq!(row[7], "0");
             assert_eq!(row[8], "0");
+            assert_eq!(row[13], "forward");
         }
         if row[10] == "1" {
             assert!(row[9].contains("<bsj>"));
@@ -234,6 +264,10 @@ fn simulator_output_contract_is_stable() {
     assert_eq!(summary.linear_read_pairs, linear_read_pairs);
     assert_eq!(summary.bsj_reads, bsj_reads);
     assert_eq!(summary.bsj_read_pairs, bsj_read_pairs);
+    assert!(
+        outward_read_pairs > 0,
+        "fixed simulator contract should contain pair-level outward truth"
+    );
 
     let expected_summary = format!(
         "Simulated {} circRNAs, {isoform_count} circular isoforms\n\

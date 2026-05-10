@@ -51,6 +51,7 @@ PAIR_KEYS_BY_TYPE = {
     ],
 }
 PRED_TYPES = ("bsj", "backward", "outward")
+TRUTH_TYPES = ("bsj", "backward", "outward", "forward")
 
 MATE_NAMES = ("r1", "r2")
 SEGMENT_ERROR_CLASSES = (
@@ -110,11 +111,46 @@ def segment_len(segment: tuple[int, int, str]) -> int:
     return segment[1] - segment[0] + 1
 
 
+def first_truth_segment_span(text: str) -> tuple[int, int] | None:
+    """Return the first read-chain segment span from simulator truth text."""
+    if text == "NA":
+        return None
+    for token in text.split("|"):
+        if not token or token == "<bsj>":
+            continue
+        segment = parse_segment_token(token)
+        if segment is None:
+            continue
+        return segment[0], segment[1]
+    return None
+
+
+def truth_has_5p_ro_outward_geometry(row: dict[str, str]) -> bool:
+    """Infer the 5'RO-like outward truth class for legacy truth files."""
+    r1_span = first_truth_segment_span(row["r1_segments"])
+    r2_span = first_truth_segment_span(row["r2_segments"])
+    if r1_span is None or r2_span is None:
+        return False
+    if row["strand"] == "-":
+        reverse_span, forward_span = r1_span, r2_span
+    else:
+        reverse_span, forward_span = r2_span, r1_span
+    return (
+        reverse_span[0] < forward_span[0]
+        <= reverse_span[1]
+        < forward_span[1]
+    )
+
+
 def infer_truth_type(row: dict[str, str]) -> str:
     """Map simulator truth labels to the current segments `type` contract."""
+    if row.get("type"):
+        return row["type"]
     if row["is_bsj"] == "1":
         return "bsj"
     if row["is_circular"] == "1":
+        if truth_has_5p_ro_outward_geometry(row):
+            return "outward"
         return "backward"
     return "forward"
 
@@ -432,27 +468,30 @@ def main() -> None:
 
     recall_counts: Counter[str] = Counter()
     for read_id, truth_row in truth.items():
-        if truth_row["type"] in ("bsj", "backward") and read_id in seen_pred:
+        if truth_row["type"] in ("bsj", "backward", "outward") and read_id in seen_pred:
             recall_counts[truth_row["type"]] += 1
 
     backward_total = pred_counts["backward"]
     backward_truth_bsj = confusion[("backward", "bsj")]
     backward_truth_backward = confusion[("backward", "backward")]
+    backward_truth_outward = confusion[("backward", "outward")]
     backward_truth_forward = confusion[("backward", "forward")]
     outward_total = pred_counts["outward"]
     outward_truth_bsj = confusion[("outward", "bsj")]
     outward_truth_backward = confusion[("outward", "backward")]
+    outward_truth_outward = confusion[("outward", "outward")]
     outward_truth_forward = confusion[("outward", "forward")]
 
     if args.format == "tsv":
         emit_summary("GLOBAL", "truth_bsj", truth_counts["bsj"])
         emit_summary("GLOBAL", "truth_backward", truth_counts["backward"])
+        emit_summary("GLOBAL", "truth_outward", truth_counts["outward"])
         emit_summary("GLOBAL", "truth_forward", truth_counts["forward"])
         emit_summary("GLOBAL", "pred_bsj", pred_counts["bsj"])
         emit_summary("GLOBAL", "pred_backward", pred_counts["backward"])
         emit_summary("GLOBAL", "pred_outward", pred_counts["outward"])
         for pred_type in PRED_TYPES:
-            for truth_type in ("bsj", "backward", "forward"):
+            for truth_type in TRUTH_TYPES:
                 emit_summary(
                     "CONFUSION",
                     f"{pred_type}_vs_{truth_type}",
@@ -460,12 +499,19 @@ def main() -> None:
                 )
         emit_summary("GLOBAL", "bsj_recall", recall_counts["bsj"], truth_counts["bsj"])
         emit_summary("GLOBAL", "backward_recall", recall_counts["backward"], truth_counts["backward"])
+        emit_summary("GLOBAL", "outward_recall", recall_counts["outward"], truth_counts["outward"])
         emit_summary("GLOBAL", "bsj_precision", confusion[("bsj", "bsj")], pred_counts["bsj"])
         emit_summary(
             "GLOBAL",
             "backward_precision",
             confusion[("backward", "backward")],
             pred_counts["backward"],
+        )
+        emit_summary(
+            "GLOBAL",
+            "outward_precision",
+            confusion[("outward", "outward")],
+            pred_counts["outward"],
         )
         for key in PAIR_KEYS_BY_TYPE["bsj"]:
             emit_summary("BSJ_ONLY", f"bsj_{key}_exact", exact[("bsj", key)], pred_counts["bsj"])
@@ -576,6 +622,12 @@ def main() -> None:
         )
         emit_summary(
             "BACKWARD_TRUTH_COMPOSITION",
+            "backward_truth_is_outward",
+            backward_truth_outward,
+            backward_total,
+        )
+        emit_summary(
+            "BACKWARD_TRUTH_COMPOSITION",
             "backward_truth_is_forward",
             backward_truth_forward,
             backward_total,
@@ -583,7 +635,7 @@ def main() -> None:
         emit_summary(
             "BACKWARD_TRUTH_COMPOSITION",
             "backward_truth_is_circular",
-            backward_truth_bsj + backward_truth_backward,
+            backward_truth_bsj + backward_truth_backward + backward_truth_outward,
             backward_total,
         )
         emit_summary("OUTWARD_TRUTH_COMPOSITION", "outward_truth_is_bsj", outward_truth_bsj, outward_total)
@@ -595,6 +647,12 @@ def main() -> None:
         )
         emit_summary(
             "OUTWARD_TRUTH_COMPOSITION",
+            "outward_truth_is_outward",
+            outward_truth_outward,
+            outward_total,
+        )
+        emit_summary(
+            "OUTWARD_TRUTH_COMPOSITION",
             "outward_truth_is_forward",
             outward_truth_forward,
             outward_total,
@@ -602,7 +660,7 @@ def main() -> None:
         emit_summary(
             "OUTWARD_TRUTH_COMPOSITION",
             "outward_truth_is_circular",
-            outward_truth_bsj + outward_truth_backward,
+            outward_truth_bsj + outward_truth_backward + outward_truth_outward,
             outward_total,
         )
         for pred_type in PRED_TYPES:
@@ -618,13 +676,13 @@ def main() -> None:
         "GLOBAL",
         ["source", "bsj", "backward", "outward", "forward"],
         [
-            ["truth", str(truth_counts["bsj"]), str(truth_counts["backward"]), "NA", str(truth_counts["forward"])],
+            ["truth", str(truth_counts["bsj"]), str(truth_counts["backward"]), str(truth_counts["outward"]), str(truth_counts["forward"])],
             ["pred", str(pred_counts["bsj"]), str(pred_counts["backward"]), str(pred_counts["outward"]), "NA"],
             [
                 "recall/precision",
                 f"{format_rate(recall_counts['bsj'], truth_counts['bsj'])} / {format_rate(confusion[('bsj', 'bsj')], pred_counts['bsj'])}",
                 f"{format_rate(recall_counts['backward'], truth_counts['backward'])} / {format_rate(confusion[('backward', 'backward')], pred_counts['backward'])}",
-                f"NA / {format_rate(confusion[('outward', 'forward')], pred_counts['outward'])}",
+                f"{format_rate(recall_counts['outward'], truth_counts['outward'])} / {format_rate(confusion[('outward', 'outward')], pred_counts['outward'])}",
                 "NA",
             ],
         ],
@@ -632,19 +690,21 @@ def main() -> None:
 
     print_table(
         "CONFUSION",
-        ["pred\\truth", "bsj", "backward", "forward"],
+        ["pred\\truth", "bsj", "backward", "outward", "forward"],
         [
-            ["bsj", str(confusion[("bsj", "bsj")]), str(confusion[("bsj", "backward")]), str(confusion[("bsj", "forward")])],
+            ["bsj", str(confusion[("bsj", "bsj")]), str(confusion[("bsj", "backward")]), str(confusion[("bsj", "outward")]), str(confusion[("bsj", "forward")])],
             [
                 "backward",
                 str(confusion[("backward", "bsj")]),
                 str(confusion[("backward", "backward")]),
+                str(confusion[("backward", "outward")]),
                 str(confusion[("backward", "forward")]),
             ],
             [
                 "outward",
                 str(confusion[("outward", "bsj")]),
                 str(confusion[("outward", "backward")]),
+                str(confusion[("outward", "outward")]),
                 str(confusion[("outward", "forward")]),
             ],
         ],
@@ -755,12 +815,13 @@ def main() -> None:
         [
             ["truth_is_bsj", str(backward_truth_bsj), str(backward_total), format_rate(backward_truth_bsj, backward_total)],
             ["truth_is_backward", str(backward_truth_backward), str(backward_total), format_rate(backward_truth_backward, backward_total)],
+            ["truth_is_outward", str(backward_truth_outward), str(backward_total), format_rate(backward_truth_outward, backward_total)],
             ["truth_is_forward", str(backward_truth_forward), str(backward_total), format_rate(backward_truth_forward, backward_total)],
             [
                 "truth_is_circular",
-                str(backward_truth_bsj + backward_truth_backward),
+                str(backward_truth_bsj + backward_truth_backward + backward_truth_outward),
                 str(backward_total),
-                format_rate(backward_truth_bsj + backward_truth_backward, backward_total),
+                format_rate(backward_truth_bsj + backward_truth_backward + backward_truth_outward, backward_total),
             ],
         ],
     )
@@ -771,12 +832,13 @@ def main() -> None:
         [
             ["truth_is_bsj", str(outward_truth_bsj), str(outward_total), format_rate(outward_truth_bsj, outward_total)],
             ["truth_is_backward", str(outward_truth_backward), str(outward_total), format_rate(outward_truth_backward, outward_total)],
+            ["truth_is_outward", str(outward_truth_outward), str(outward_total), format_rate(outward_truth_outward, outward_total)],
             ["truth_is_forward", str(outward_truth_forward), str(outward_total), format_rate(outward_truth_forward, outward_total)],
             [
                 "truth_is_circular",
-                str(outward_truth_bsj + outward_truth_backward),
+                str(outward_truth_bsj + outward_truth_backward + outward_truth_outward),
                 str(outward_total),
-                format_rate(outward_truth_bsj + outward_truth_backward, outward_total),
+                format_rate(outward_truth_bsj + outward_truth_backward + outward_truth_outward, outward_total),
             ],
         ],
     )
