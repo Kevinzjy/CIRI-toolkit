@@ -32,6 +32,9 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+const NON_BSJ_SEGMENT_MAPQ_THRES: i32 = 5;
+const NON_BSJ_SEGMENT_MAX_SPAN: i32 = 200000;
+
 /// Core logic for the second scan pass.
 pub struct Scan2 {
     /// Minimum mapping quality for a read.
@@ -82,7 +85,27 @@ type OwnedStandMap = HashMap<i32, (char, Cow<'static, str>)>;
 struct SamOwnedScan2Group {
     read_id: String,
     alignments: Vec<OwnedAlignmentRecord>,
+    all_alignments: Vec<OwnedAlignmentRecord>,
     stand_map: OwnedStandMap,
+}
+
+#[derive(Clone, Copy)]
+struct NonBsjMsid {
+    kind: i32,
+    clip1: i32,
+    clip2: i32,
+    ref_len: i32,
+}
+
+impl NonBsjMsid {
+    fn invalid(ref_len: i32) -> Self {
+        Self {
+            kind: 0,
+            clip1: 0,
+            clip2: 0,
+            ref_len,
+        }
+    }
 }
 
 /// Advises the kernel that a processed `mmap` slice can be evicted from cache.
@@ -653,6 +676,7 @@ impl Scan2 {
             scan1_display_path,
             display_output_path,
             None,
+            None,
             chr_tcga_map,
         )
     }
@@ -671,6 +695,7 @@ impl Scan2 {
         scan1_display_path: Option<&str>,
         display_output_path: Option<&str>,
         segments_output_path: Option<&str>,
+        non_bsj_segments_output_path: Option<&str>,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
         use crate::sam_bam::{detect_format, InputFormat};
@@ -690,6 +715,7 @@ impl Scan2 {
                 output_fsj,
                 display_output_path,
                 segments_output_path,
+                non_bsj_segments_output_path,
                 display_scan2.as_ref(),
                 chr_tcga_map,
             ),
@@ -699,6 +725,7 @@ impl Scan2 {
                 output_fsj,
                 display_output_path,
                 segments_output_path,
+                non_bsj_segments_output_path,
                 display_scan2.as_ref(),
                 chr_tcga_map,
             ),
@@ -724,6 +751,7 @@ impl Scan2 {
             None,
             None,
             None,
+            None,
             chr_tcga_map,
         )
     }
@@ -735,6 +763,7 @@ impl Scan2 {
         output_fsj: &str,
         display_output_path: Option<&str>,
         segments_output_path: Option<&str>,
+        non_bsj_segments_output_path: Option<&str>,
         display_scan2: Option<&(Scan2, Scan2DisplayClaims)>,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
@@ -753,6 +782,8 @@ impl Scan2 {
         let shard_out = part_path(output_bsj2, 0);
         let display_shard_out = display_output_path.map(|path| part_path(path, 0));
         let segments_shard_out = segments_output_path.map(|path| part_path(path, 0));
+        let non_bsj_segments_shard_out =
+            non_bsj_segments_output_path.map(|path| part_path(path, 0));
         let fsj_out = Self::shard_fsj_path(output_fsj, 0);
         self.process_sam_file_to_file(
             sam_file,
@@ -763,6 +794,7 @@ impl Scan2 {
             display_scan2,
             display_shard_out.as_deref(),
             segments_shard_out.as_deref(),
+            non_bsj_segments_shard_out.as_deref(),
             profile_ref,
         )?;
 
@@ -784,6 +816,9 @@ impl Scan2 {
             self.merge_display_shards(path, 1)?;
         }
         if let Some(path) = segments_output_path {
+            self.merge_segment_shards(path, 1)?;
+        }
+        if let Some(path) = non_bsj_segments_output_path {
             self.merge_segment_shards(path, 1)?;
         }
         result
@@ -865,6 +900,7 @@ impl Scan2 {
             None,
             None,
             None,
+            None,
             chr_tcga_map,
         )
     }
@@ -876,6 +912,7 @@ impl Scan2 {
         output_fsj: &str,
         display_output_path: Option<&str>,
         segments_output_path: Option<&str>,
+        non_bsj_segments_output_path: Option<&str>,
         display_scan2: Option<&(Scan2, Scan2DisplayClaims)>,
         chr_tcga_map: &HashMap<String, String>,
     ) -> Result<()> {
@@ -923,6 +960,8 @@ impl Scan2 {
             let shard_out = part_path(output_bsj2, i);
             let display_shard_out = display_output_path.map(|path| part_path(path, i));
             let segments_shard_out = segments_output_path.map(|path| part_path(path, i));
+            let non_bsj_segments_shard_out =
+                non_bsj_segments_output_path.map(|path| part_path(path, i));
             let fsj_out = Self::shard_fsj_path(output_fsj, i);
             self.process_bam_shard_to_file(
                 &mmap,
@@ -936,6 +975,7 @@ impl Scan2 {
                 display_scan2,
                 display_shard_out.as_deref(),
                 segments_shard_out.as_deref(),
+                non_bsj_segments_shard_out.as_deref(),
                 profile_ref,
             )
         })?;
@@ -963,6 +1003,9 @@ impl Scan2 {
             self.merge_display_shards(path, num_threads)?;
         }
         if let Some(path) = segments_output_path {
+            self.merge_segment_shards(path, num_threads)?;
+        }
+        if let Some(path) = non_bsj_segments_output_path {
             self.merge_segment_shards(path, num_threads)?;
         }
         result
@@ -1048,6 +1091,343 @@ impl Scan2 {
         rows
     }
 
+    /// Formats Scan2 read-level non-BSJ topology candidates.
+    ///
+    /// This sidecar is deliberately independent of the BSJ candidate index and
+    /// Summary circRNA spans. It only uses read-level split/outward geometry to
+    /// decide whether a group is worth re-evaluating after Summary. Soft clips
+    /// are stored as compact `L:/R:` payloads so local clip placement remains
+    /// available without repeating full read sequences across every alignment.
+    fn non_bsj_segment_evidence_lines<'a>(
+        read_id: &str,
+        alignments: &[AlignmentRecord<'a>],
+    ) -> Vec<String> {
+        if !Self::may_support_non_bsj_segments(alignments) {
+            return Vec::new();
+        }
+        let mut records = Vec::new();
+        for aln in alignments {
+            if aln.chrom.as_ref() == "*" || aln.cigar.as_ref() == "*" {
+                continue;
+            }
+            let mate = if aln.flag & 0x40 != 0 { "R1" } else { "R2" };
+            let clips = clip_sequence_payload(aln.cigar.as_ref(), aln.seq.as_ref());
+            records.push(format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}",
+                mate,
+                aln.flag,
+                aln.chrom,
+                aln.pos,
+                aln.mapq,
+                aln.cigar,
+                aln.seq.len(),
+                clips
+            ));
+        }
+        if records.is_empty() {
+            Vec::new()
+        } else {
+            vec![format!(
+                "{}\t{}\t{}",
+                read_id,
+                "scan2_non_bsj_group",
+                records.join(";")
+            )]
+        }
+    }
+
+    /// Cheap read-level filter for supplemental backward/outward candidates.
+    fn may_support_non_bsj_segments<'a>(alignments: &[AlignmentRecord<'a>]) -> bool {
+        Self::may_support_outward_segments(alignments)
+            || Self::may_support_backward_segments(alignments)
+    }
+
+    /// Tests the 5' overlap plus 3' outward pair geometry without circ gating.
+    fn may_support_outward_segments<'a>(alignments: &[AlignmentRecord<'a>]) -> bool {
+        let mut r1: Option<&AlignmentRecord<'_>> = None;
+        let mut r2: Option<&AlignmentRecord<'_>> = None;
+        for aln in alignments {
+            if aln.flag & 0x4 != 0 || aln.flag & 0x100 != 0 || aln.flag & 0x800 != 0 {
+                continue;
+            }
+            match aln.flag & 0x40 != 0 {
+                true if r1.is_none() => r1 = Some(aln),
+                true => return false,
+                false if r2.is_none() => r2 = Some(aln),
+                false => return false,
+            }
+        }
+        let (Some(r1), Some(r2)) = (r1, r2) else {
+            return false;
+        };
+        if r1.chrom != r2.chrom
+            || r1.chrom.as_ref() == "*"
+            || r1.mapq < NON_BSJ_SEGMENT_MAPQ_THRES
+            || r2.mapq < NON_BSJ_SEGMENT_MAPQ_THRES
+        {
+            return false;
+        }
+        let Some(r1_span) = Self::alignment_ref_span(r1) else {
+            return false;
+        };
+        let Some(r2_span) = Self::alignment_ref_span(r2) else {
+            return false;
+        };
+        let r1_reverse = r1.flag & 0x10 != 0;
+        let r2_reverse = r2.flag & 0x10 != 0;
+        if r1_reverse == r2_reverse {
+            return false;
+        }
+        let (reverse_span, forward_span) = if r1_reverse {
+            (r1_span, r2_span)
+        } else {
+            (r2_span, r1_span)
+        };
+        reverse_span.0 < forward_span.0
+            && forward_span.0 <= reverse_span.1
+            && reverse_span.1 < forward_span.1
+            && forward_span.1 - reverse_span.0 + 1 <= NON_BSJ_SEGMENT_MAX_SPAN
+    }
+
+    /// Tests whether split alignments can form a CIRI-AS-style backward candidate.
+    ///
+    /// The filter intentionally mirrors the cheap, circ-independent part of
+    /// `mapping_check2`: same chromosome and strand are necessary but not enough;
+    /// the paired CIGAR classifiers must also satisfy a backward junction
+    /// geometry. This keeps Scan2 from writing ordinary supplementary-heavy
+    /// groups into the non-BSJ sidecar while still allowing reads with no known
+    /// BSJ or circRNA assignment.
+    fn may_support_backward_segments<'a>(alignments: &[AlignmentRecord<'a>]) -> bool {
+        for i in 0..alignments.len().saturating_sub(1) {
+            let left = &alignments[i];
+            if left.chrom.as_ref() == "*" || left.cigar.as_ref() == "*" {
+                continue;
+            }
+            for right in &alignments[i + 1..] {
+                if left.chrom != right.chrom
+                    || right.cigar.as_ref() == "*"
+                    || (left.flag & 0x10 != 0) != (right.flag & 0x10 != 0)
+                {
+                    continue;
+                }
+                let read_len = left.seq.len().max(right.seq.len()) as i32;
+                if read_len <= 0 {
+                    continue;
+                }
+                let left_msid = Self::non_bsj_msid(left.cigar.as_ref(), read_len);
+                let right_msid = Self::non_bsj_msid(right.cigar.as_ref(), read_len);
+                if Self::non_bsj_backward_pair_possible(
+                    left, right, left_msid, right_msid, read_len,
+                ) || Self::non_bsj_backward_pair_possible(
+                    right, left, right_msid, left_msid, read_len,
+                ) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Tests the CIRI-AS backward candidate geometry without circ-boundary checks.
+    fn non_bsj_backward_pair_possible<'a>(
+        left: &AlignmentRecord<'a>,
+        right: &AlignmentRecord<'a>,
+        left_msid: NonBsjMsid,
+        right_msid: NonBsjMsid,
+        read_len: i32,
+    ) -> bool {
+        let product = left_msid.kind * right_msid.kind;
+        if product == -1 {
+            let cir_scale = left_msid.kind * (left.pos + left_msid.clip2)
+                + right_msid.kind * (right.pos + right_msid.clip2);
+            return (left_msid.clip1 - right_msid.clip1).abs() <= 6 && cir_scale < 0;
+        }
+        if product.abs() != 10 {
+            return false;
+        }
+        let (mx, my, rx, ry) = if left_msid.kind <= right_msid.kind {
+            (left_msid, right_msid, left, right)
+        } else {
+            (right_msid, left_msid, right, left)
+        };
+        if mx.kind == -1 {
+            let cir_scale = ry.pos + my.ref_len - 1 - rx.pos;
+            (read_len - my.clip2 - mx.clip1).abs() <= 6 && cir_scale < 0
+        } else {
+            let cir_scale = rx.pos + mx.ref_len - 1 - ry.pos;
+            (mx.clip1 - my.clip1).abs() <= 6 && cir_scale < 0
+        }
+    }
+
+    /// Classifies CIGARs using the subset of CIRI-AS `MSID` needed for prefiltering.
+    fn non_bsj_msid(cigar: &str, read_len: i32) -> NonBsjMsid {
+        if cigar == "*" || cigar.is_empty() {
+            return NonBsjMsid::invalid(-1);
+        }
+        let mut counts = Vec::new();
+        let mut styles = Vec::new();
+        let mut count = 0i32;
+        let mut has_count = false;
+        for ch in cigar.chars() {
+            if ch.is_ascii_digit() {
+                let Some(next) = count
+                    .checked_mul(10)
+                    .and_then(|value| value.checked_add(ch.to_digit(10).unwrap_or(0) as i32))
+                else {
+                    return NonBsjMsid::invalid(-2);
+                };
+                count = next;
+                has_count = true;
+            } else {
+                if !has_count {
+                    return NonBsjMsid::invalid(-2);
+                }
+                counts.push(count);
+                styles.push(if ch == 'H' { 'S' } else { ch });
+                count = 0;
+                has_count = false;
+            }
+        }
+        if has_count || styles.is_empty() {
+            return NonBsjMsid::invalid(-2);
+        }
+
+        if counts.len() == 1 {
+            return if styles[0] == 'M' && counts[0] == read_len {
+                NonBsjMsid {
+                    kind: 0,
+                    clip1: 0,
+                    clip2: 0,
+                    ref_len: read_len,
+                }
+            } else {
+                NonBsjMsid::invalid(-1)
+            };
+        }
+
+        match counts.len() {
+            2 => match (styles[0], styles[1]) {
+                ('M', 'S') => NonBsjMsid {
+                    kind: 1,
+                    clip1: counts[0],
+                    clip2: counts[0] - 1,
+                    ref_len: counts[0],
+                },
+                ('S', 'M') => NonBsjMsid {
+                    kind: -1,
+                    clip1: counts[0],
+                    clip2: 0,
+                    ref_len: counts[1],
+                },
+                _ => NonBsjMsid::invalid(-2),
+            },
+            3 => match (styles[0], styles[1], styles[2]) {
+                ('S', _, 'S') => NonBsjMsid {
+                    kind: 10,
+                    clip1: counts[0],
+                    clip2: counts[2],
+                    ref_len: counts[1],
+                },
+                ('M', 'D', 'M') => NonBsjMsid {
+                    kind: 0,
+                    clip1: 0,
+                    clip2: 0,
+                    ref_len: read_len + counts[1],
+                },
+                ('M', 'I', 'M') => NonBsjMsid {
+                    kind: 0,
+                    clip1: 0,
+                    clip2: 0,
+                    ref_len: read_len - counts[1],
+                },
+                _ => NonBsjMsid::invalid(-2),
+            },
+            _ if styles[0] == 'M' && *styles.last().unwrap() == 'S' => {
+                let (m_sum, d_sum) =
+                    Self::non_bsj_sum_md(&styles[..styles.len() - 1], &counts[..counts.len() - 1]);
+                NonBsjMsid {
+                    kind: 1,
+                    clip1: read_len - counts[counts.len() - 1],
+                    clip2: m_sum + d_sum - 1,
+                    ref_len: m_sum + d_sum,
+                }
+            }
+            _ if styles[0] == 'S' && *styles.last().unwrap() == 'M' => {
+                let (m_sum, d_sum) = Self::non_bsj_sum_md(&styles[1..], &counts[1..]);
+                NonBsjMsid {
+                    kind: -1,
+                    clip1: counts[0],
+                    clip2: 0,
+                    ref_len: m_sum + d_sum,
+                }
+            }
+            _ if styles[0] == 'M' && *styles.last().unwrap() == 'M' => {
+                let (m_sum, d_sum) = Self::non_bsj_sum_md(&styles, &counts);
+                NonBsjMsid {
+                    kind: 0,
+                    clip1: 0,
+                    clip2: 0,
+                    ref_len: m_sum + d_sum,
+                }
+            }
+            _ if styles[0] == 'S' && *styles.last().unwrap() == 'S' => {
+                let (m_sum, d_sum) = Self::non_bsj_sum_md(
+                    &styles[1..styles.len() - 1],
+                    &counts[1..counts.len() - 1],
+                );
+                NonBsjMsid {
+                    kind: 10,
+                    clip1: counts[0],
+                    clip2: counts[counts.len() - 1],
+                    ref_len: m_sum + d_sum,
+                }
+            }
+            _ => NonBsjMsid::invalid(-2),
+        }
+    }
+
+    /// Sums reference match and deletion lengths for the local MSID classifier.
+    fn non_bsj_sum_md(styles: &[char], counts: &[i32]) -> (i32, i32) {
+        let mut match_sum = 0;
+        let mut deletion_sum = 0;
+        for (style, count) in styles.iter().zip(counts.iter()) {
+            match style {
+                'M' | '=' | 'X' => match_sum += count,
+                'D' => deletion_sum += count,
+                _ => {}
+            }
+        }
+        (match_sum, deletion_sum)
+    }
+
+    /// Returns the genomic span covered by reference-consuming CIGAR operators.
+    fn alignment_ref_span(aln: &AlignmentRecord<'_>) -> Option<(i32, i32)> {
+        let mut ref_len = 0i32;
+        let mut count = 0i32;
+        let mut has_count = false;
+        for op in aln.cigar.as_ref().chars() {
+            if op.is_ascii_digit() {
+                count = count
+                    .checked_mul(10)?
+                    .checked_add(op.to_digit(10)? as i32)?;
+                has_count = true;
+                continue;
+            }
+            if !has_count {
+                return None;
+            }
+            if matches!(op, 'M' | 'D' | 'N' | '=' | 'X') {
+                ref_len = ref_len.checked_add(count)?;
+            }
+            count = 0;
+            has_count = false;
+        }
+        if has_count || ref_len <= 0 {
+            return None;
+        }
+        Some((aln.pos, aln.pos + ref_len - 1))
+    }
+
     /// Formats mapper rows plus validator-accepted local clip pseudo rows.
     fn segment_evidence_lines_with_local<'a>(
         read_id: &str,
@@ -1108,6 +1488,7 @@ impl Scan2 {
         display_scan2: Option<&(Scan2, Scan2DisplayClaims)>,
         display_out_path: Option<&str>,
         segments_out_path: Option<&str>,
+        non_bsj_segments_out_path: Option<&str>,
         profile: Option<&Scan2Profile>,
     ) -> Result<()> {
         let mut writer = BufWriter::with_capacity(256 * 1024, File::create(out_path)?);
@@ -1117,6 +1498,11 @@ impl Scan2 {
             None
         };
         let mut segments_writer = if let Some(path) = segments_out_path {
+            Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
+        } else {
+            None
+        };
+        let mut non_bsj_segments_writer = if let Some(path) = non_bsj_segments_out_path {
             Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
         } else {
             None
@@ -1138,6 +1524,7 @@ impl Scan2 {
                     &mut writer,
                     display_writer.as_mut(),
                     segments_writer.as_mut(),
+                    non_bsj_segments_writer.as_mut(),
                     &mut batch,
                     &mut merged_fsj,
                     chr_tcga_map,
@@ -1158,6 +1545,9 @@ impl Scan2 {
         if let Some(writer) = segments_writer.as_mut() {
             writer.flush()?;
         }
+        if let Some(writer) = non_bsj_segments_writer.as_mut() {
+            writer.flush()?;
+        }
         Self::write_fsj_shard(fsj_path, &local_fsj)
     }
 
@@ -1176,6 +1566,7 @@ impl Scan2 {
         let mut record = sam::Record::default();
         let mut current_id: Vec<u8> = Vec::new();
         let mut alignments: Vec<OwnedAlignmentRecord> = Vec::with_capacity(16);
+        let mut all_alignments: Vec<OwnedAlignmentRecord> = Vec::with_capacity(16);
         let mut stand_map: OwnedStandMap = HashMap::with_capacity(4);
         let mut one_read_key: i32 = -1;
         let mut batch = Vec::with_capacity(batch_size);
@@ -1197,6 +1588,7 @@ impl Scan2 {
                         &mut batch,
                         &current_id,
                         &mut alignments,
+                        &mut all_alignments,
                         &mut stand_map,
                     );
                     if batch.len() >= batch_size {
@@ -1259,14 +1651,16 @@ impl Scan2 {
                     stand_map.insert(s_idx, (st_c, Cow::Owned(seq.clone())));
                 }
             }
-            alignments.push(AlignmentRecord {
+            let alignment = AlignmentRecord {
                 flag,
                 chrom: Cow::Owned(chrom),
                 pos: start_pos,
                 mapq,
                 cigar: Cow::Owned(cigar_buf.clone()),
                 seq: Cow::Owned(seq),
-            });
+            };
+            all_alignments.push(alignment.clone());
+            alignments.push(alignment);
 
             records_since_progress += 1;
             if records_since_progress >= 4096 {
@@ -1284,6 +1678,7 @@ impl Scan2 {
                 &mut batch,
                 &current_id,
                 &mut alignments,
+                &mut all_alignments,
                 &mut stand_map,
             );
         }
@@ -1305,14 +1700,17 @@ impl Scan2 {
         batch: &mut Vec<SamOwnedScan2Group>,
         current_id: &[u8],
         alignments: &mut Vec<OwnedAlignmentRecord>,
+        all_alignments: &mut Vec<OwnedAlignmentRecord>,
         stand_map: &mut OwnedStandMap,
     ) {
         batch.push(SamOwnedScan2Group {
             read_id: String::from_utf8_lossy(current_id).into_owned(),
             alignments: std::mem::take(alignments),
+            all_alignments: std::mem::take(all_alignments),
             stand_map: std::mem::take(stand_map),
         });
         *alignments = Vec::with_capacity(16);
+        *all_alignments = Vec::with_capacity(16);
         *stand_map = HashMap::with_capacity(4);
     }
 
@@ -1322,6 +1720,7 @@ impl Scan2 {
         writer: &mut BufWriter<File>,
         mut display_writer: Option<&mut BufWriter<File>>,
         mut segments_writer: Option<&mut BufWriter<File>>,
+        mut non_bsj_segments_writer: Option<&mut BufWriter<File>>,
         batch: &mut Vec<SamOwnedScan2Group>,
         merged_fsj: &mut HashMap<String, i32>,
         chr_tcga_map: &HashMap<String, String>,
@@ -1329,7 +1728,13 @@ impl Scan2 {
         profile: Option<&Scan2Profile>,
     ) -> Result<()> {
         let groups = std::mem::take(batch);
-        let results: Vec<(Vec<String>, HashMap<String, i32>, Vec<String>, Vec<String>)> = groups
+        let results: Vec<(
+            Vec<String>,
+            HashMap<String, i32>,
+            Vec<String>,
+            Vec<String>,
+            Vec<String>,
+        )> = groups
             .into_par_iter()
             .map(|owned| {
                 let mut local_lines = Vec::new();
@@ -1376,11 +1781,26 @@ impl Scan2 {
                 } else {
                     Vec::new()
                 };
-                (local_lines, local_fsj, display_lines, evidence)
+                let scan1_claimed = display_scan2.as_ref().is_some_and(|(_, scan1_claims)| {
+                    scan1_claims.by_read.contains_key(owned.read_id.as_str())
+                });
+                let non_bsj_evidence =
+                    if local_lines.is_empty() && display_lines.is_empty() && !scan1_claimed {
+                        Self::non_bsj_segment_evidence_lines(&owned.read_id, &owned.all_alignments)
+                    } else {
+                        Vec::new()
+                    };
+                (
+                    local_lines,
+                    local_fsj,
+                    display_lines,
+                    evidence,
+                    non_bsj_evidence,
+                )
             })
             .collect();
 
-        for (lines, fsj_map, display_lines, evidence) in results {
+        for (lines, fsj_map, display_lines, evidence, non_bsj_evidence) in results {
             let main_keys: HashSet<String> = lines
                 .iter()
                 .filter_map(|line| Self::scan2_priority_key(line))
@@ -1411,6 +1831,11 @@ impl Scan2 {
                     writeln!(segments_writer, "{}", line)?;
                 }
             }
+            if let Some(non_bsj_segments_writer) = non_bsj_segments_writer.as_deref_mut() {
+                for line in non_bsj_evidence {
+                    writeln!(non_bsj_segments_writer, "{}", line)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1433,6 +1858,7 @@ impl Scan2 {
         display_scan2: Option<&(Scan2, Scan2DisplayClaims)>,
         display_out_path: Option<&str>,
         segments_out_path: Option<&str>,
+        non_bsj_segments_out_path: Option<&str>,
         profile: Option<&Scan2Profile>,
     ) -> Result<()> {
         use noodles::bam;
@@ -1444,6 +1870,11 @@ impl Scan2 {
             None
         };
         let mut segments_writer = if let Some(path) = segments_out_path {
+            Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
+        } else {
+            None
+        };
+        let mut non_bsj_segments_writer = if let Some(path) = non_bsj_segments_out_path {
             Some(BufWriter::with_capacity(256 * 1024, File::create(path)?))
         } else {
             None
@@ -1487,6 +1918,16 @@ impl Scan2 {
             found.unwrap_or(0)
         };
         if pos >= mmap.len() {
+            writer.flush()?;
+            if let Some(display_writer) = display_writer.as_mut() {
+                display_writer.flush()?;
+            }
+            if let Some(segments_writer) = segments_writer.as_mut() {
+                segments_writer.flush()?;
+            }
+            if let Some(non_bsj_segments_writer) = non_bsj_segments_writer.as_mut() {
+                non_bsj_segments_writer.flush()?;
+            }
             return Self::write_fsj_shard(fsj_path, &local_fsj);
         }
 
@@ -1497,6 +1938,7 @@ impl Scan2 {
         let mut record = bam::Record::default();
         let mut current_id: Vec<u8> = Vec::new();
         let mut alignments: Vec<AlignmentRecord> = Vec::with_capacity(16);
+        let mut all_alignments: Vec<AlignmentRecord> = Vec::with_capacity(16);
         let mut stand_map: HashMap<i32, (char, Cow<str>)> = HashMap::with_capacity(4);
         let mut one_read_key: i32 = -1;
         let mut crossed_start = start == 0;
@@ -1624,9 +2066,13 @@ impl Scan2 {
                             );
                         }
                     }
+                    let scan1_claimed = display_scan2.as_ref().is_some_and(|(_, scan1_claims)| {
+                        scan1_claims.by_read.contains_key(id_str.as_ref())
+                    });
+                    let has_bsj =
+                        !res_batch.is_empty() || !display_lines.is_empty() || scan1_claimed;
                     if let Some(segments_writer) = segments_writer.as_mut() {
                         let segment_started = profile.map(|_| Instant::now());
-                        let has_bsj = !res_batch.is_empty() || !display_lines.is_empty();
                         if has_bsj {
                             let mut bsj_lines = res_batch.clone();
                             bsj_lines.extend(display_lines.iter().cloned());
@@ -1648,6 +2094,15 @@ impl Scan2 {
                             );
                         }
                     }
+                    if !has_bsj {
+                        if let Some(non_bsj_segments_writer) = non_bsj_segments_writer.as_mut() {
+                            for line in
+                                Self::non_bsj_segment_evidence_lines(&id_str, &all_alignments)
+                            {
+                                writeln!(non_bsj_segments_writer, "{}", line)?;
+                            }
+                        }
+                    }
                     if abs_c_pos > end {
                         current_id.clear();
                         break;
@@ -1656,6 +2111,7 @@ impl Scan2 {
                 current_id.clear();
                 current_id.extend_from_slice(read_id);
                 alignments.clear();
+                all_alignments.clear();
                 stand_map.clear();
                 one_read_key = -1;
             }
@@ -1719,14 +2175,16 @@ impl Scan2 {
                     stand_map.insert(s_idx, (st_c, Cow::Owned(seq.clone())));
                 }
             }
-            alignments.push(AlignmentRecord {
+            let alignment = AlignmentRecord {
                 flag,
                 chrom: Cow::Owned(chrom),
                 pos: start_pos,
                 mapq,
                 cigar: Cow::Owned(cigar_buf.clone()),
                 seq: Cow::Owned(seq),
-            });
+            };
+            all_alignments.push(alignment.clone());
+            alignments.push(alignment);
         }
         if !current_id.is_empty() {
             let id_str = String::from_utf8_lossy(&current_id);
@@ -1799,9 +2257,12 @@ impl Scan2 {
                         .fetch_add(write_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }
             }
+            let scan1_claimed = display_scan2.as_ref().is_some_and(|(_, scan1_claims)| {
+                scan1_claims.by_read.contains_key(id_str.as_ref())
+            });
+            let has_bsj = !res_batch.is_empty() || !display_lines.is_empty() || scan1_claimed;
             if let Some(segments_writer) = segments_writer.as_mut() {
                 let segment_started = profile.map(|_| Instant::now());
-                let has_bsj = !res_batch.is_empty() || !display_lines.is_empty();
                 if has_bsj {
                     let mut bsj_lines = res_batch.clone();
                     bsj_lines.extend(display_lines.iter().cloned());
@@ -1823,6 +2284,13 @@ impl Scan2 {
                     );
                 }
             }
+            if !has_bsj {
+                if let Some(non_bsj_segments_writer) = non_bsj_segments_writer.as_mut() {
+                    for line in Self::non_bsj_segment_evidence_lines(&id_str, &all_alignments) {
+                        writeln!(non_bsj_segments_writer, "{}", line)?;
+                    }
+                }
+            }
         }
         let evicted_rel = last_evicted_pos.saturating_sub(pos);
         if last_compressed_pos > evicted_rel {
@@ -1834,6 +2302,9 @@ impl Scan2 {
         }
         if let Some(segments_writer) = segments_writer.as_mut() {
             segments_writer.flush()?;
+        }
+        if let Some(non_bsj_segments_writer) = non_bsj_segments_writer.as_mut() {
+            non_bsj_segments_writer.flush()?;
         }
         if let (Some(profile), Some(shard_started)) = (profile, shard_started) {
             profile

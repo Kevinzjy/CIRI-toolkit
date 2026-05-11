@@ -87,6 +87,13 @@ pub struct AsConfig<'a> {
     /// second BAM/SAM scan for confirmed BSJ reads while keeping the sidecar out
     /// of Summary's parity-sensitive inputs.
     pub segment_evidence_paths: Vec<&'a str>,
+    /// Scan2 non-BSJ topology sidecars produced before Summary.
+    ///
+    /// These rows are read-level candidates, not circRNA-level assignments. They
+    /// can represent backward/outward evidence with no known BSJ, so the final
+    /// segments phase skips only reads already assigned as BSJ and then rebuilds
+    /// the supplemental rows from the read chain itself.
+    pub non_bsj_segment_evidence_paths: Vec<&'a str>,
     /// Output prefix; the current phase writes `<prefix>.segments`.
     pub out_prefix: &'a str,
     /// In-memory reference sequence map loaded by the main CLI.
@@ -378,7 +385,7 @@ struct CoverageValidation {
     median: i32,
 }
 
-/// CircRNA locus cluster used to decide whether non-BSJ reads should be checked.
+/// CircRNA locus cluster used to define local splice-repair search windows.
 ///
 /// Perl CIRI-AS materializes every covered base into a hash. Rust keeps compact
 /// intervals and performs explicit containment tests, which preserves the same
@@ -390,12 +397,11 @@ struct CircCluster {
     end: i32,
 }
 
-/// Exact Summary circRNA span used for pair-level outward evidence gating.
+/// Exact Summary circRNA span used for local clip and splice-repair context.
 ///
-/// Clusters are intentionally broader because CIRI-AS uses them as a scan-time
-/// prefilter. `type=outward` rows are weaker graph evidence, so they should at
-/// least be contained by one detected circRNA span even though read-level output
-/// still keeps `circ_id=NA` for later circRNA-level assignment.
+/// Backward/outward rows are read-level topology evidence and do not require a
+/// known BSJ. When a read is close to known circ loci, these compact spans still
+/// provide bounded windows for annotation and splice-signal guided correction.
 #[derive(Debug, Clone, Copy)]
 struct CircSpan {
     start: i32,
@@ -547,6 +553,32 @@ pub fn run_ciri_as(mut config: AsConfig<'_>) -> Result<SegmentRunSummary> {
     log_segments_profile(profile, "build_scan_state", phase_started);
 
     let phase_started = profile.then(Instant::now);
+    let non_bsj_rescan_group_indexes = if config.non_bsj_segment_evidence_paths.is_empty() {
+        None
+    } else {
+        log_segments_user_progress(
+            &mut config,
+            "Segments finalize",
+            "Loading Scan2 non-BSJ read topology sidecar...",
+        )?;
+        let non_bsj_paths = config.non_bsj_segment_evidence_paths.clone();
+        let out_prefix = config.out_prefix;
+        Some(load_non_bsj_segment_evidence(
+            &non_bsj_paths,
+            out_prefix,
+            &mut state,
+            || {
+                log_segments_user_progress(
+                    &mut config,
+                    "Segments finalize",
+                    "Merging non-BSJ sidecar shard results...",
+                )
+            },
+        )?)
+    };
+    log_segments_profile(profile, "load_non_bsj_segment_evidence", phase_started);
+
+    let phase_started = profile.then(Instant::now);
     let segments = if config.segment_evidence_paths.is_empty() {
         scan_alignment_groups(config.input_path, &mut state)?;
         validate_splice_motifs(&mut state.candidates, config.reference, config.annotation)?;
@@ -554,37 +586,39 @@ pub fn run_ciri_as(mut config: AsConfig<'_>) -> Result<SegmentRunSummary> {
         state.stats.junction_reads_seen = state.seen_junction_reads.len();
         build_segment_records(&state)?
     } else {
-        let phase_started = profile.then(Instant::now);
-        let rescan_group_shards =
-            scan_backward_alignment_groups(config.input_path, config.out_prefix, &mut state)?;
-        log_segments_user_progress(
-            &mut config,
-            "Segments finalize",
-            "Merging shard read results...",
-        )?;
-        log_segments_profile(profile, "scan_backward_alignment_groups", phase_started);
-        let phase_started = profile.then(Instant::now);
-        let rescan_group_indexes = if let Some(shard_paths) = &rescan_group_shards {
-            Some(merge_segment_scan_candidate_shards(
-                &mut state,
-                shard_paths,
-            )?)
+        let rescan_group_indexes = if let Some(indexes) = non_bsj_rescan_group_indexes {
+            Some(indexes)
         } else {
-            None
+            let phase_started = profile.then(Instant::now);
+            let rescan_group_shards =
+                scan_backward_alignment_groups(config.input_path, config.out_prefix, &mut state)?;
+            log_segments_user_progress(
+                &mut config,
+                "Segments finalize",
+                "Merging shard read results...",
+            )?;
+            log_segments_profile(profile, "scan_backward_alignment_groups", phase_started);
+            let phase_started = profile.then(Instant::now);
+            let indexes = if let Some(shard_paths) = &rescan_group_shards {
+                Some(merge_segment_scan_candidate_shards(
+                    &mut state,
+                    shard_paths,
+                )?)
+            } else {
+                None
+            };
+            log_segments_profile(profile, "merge_segment_scan_candidates", phase_started);
+            if let Some(shard_paths) = &rescan_group_shards {
+                debug_assert_eq!(indexes.as_ref().map(Vec::len), Some(shard_paths.len()));
+            }
+            indexes
         };
-        log_segments_profile(profile, "merge_segment_scan_candidates", phase_started);
         log_segments_user_progress(
             &mut config,
             "Segments finalize",
             "Collecting junction support and correcting ambiguous rows...",
         )?;
         let phase_started = profile.then(Instant::now);
-        if let Some(shard_paths) = &rescan_group_shards {
-            debug_assert_eq!(
-                rescan_group_indexes.as_ref().map(Vec::len),
-                Some(shard_paths.len())
-            );
-        }
         state.stats.motif_validated = state.candidates.len();
         state.stats.junction_reads_seen = state.segment_groups.len();
         let records = build_sidecar_segment_records(&mut state, rescan_group_indexes)?;
@@ -961,6 +995,391 @@ fn load_segment_evidence(
         });
     }
     Ok((groups, read_len))
+}
+
+/// Loads Scan2 read-level non-BSJ topology candidates.
+///
+/// These rows are deliberately re-evaluated after Summary instead of trusted as
+/// final calls. Scan2 only knows read-level topology; this loader skips final
+/// BSJ reads and then runs the same backward/outward materializer used by the
+/// legacy third BAM scan. The sequence column is the compact `L:/R:` soft-clip
+/// payload, matching the BSJ sidecar strategy to keep I/O bounded.
+fn load_non_bsj_segment_evidence(
+    paths: &[&str],
+    out_prefix: &str,
+    state: &mut ScanState,
+    mut on_merge_start: impl FnMut() -> Result<()>,
+) -> Result<Vec<SegmentScanShardIndex>> {
+    let shard_paths = {
+        let ctx = SegmentScanContext::from_state(state);
+        let mut shard_paths = Vec::new();
+        for path in paths {
+            if non_bsj_sidecar_is_grouped(path)? {
+                let mut paths = spill_grouped_non_bsj_segment_evidence_mmap(
+                    path,
+                    out_prefix,
+                    shard_paths.len(),
+                    &ctx,
+                )?;
+                shard_paths.append(&mut paths);
+            } else {
+                let mut paths = spill_legacy_non_bsj_segment_evidence(
+                    path,
+                    out_prefix,
+                    shard_paths.len(),
+                    &ctx,
+                )?;
+                shard_paths.append(&mut paths);
+            }
+        }
+        shard_paths
+    };
+    on_merge_start()?;
+    merge_segment_scan_candidate_shards(state, &shard_paths)
+}
+
+/// Tests whether a non-BSJ sidecar uses the current read-group line protocol.
+fn non_bsj_sidecar_is_grouped(path: &str) -> Result<bool> {
+    let file =
+        File::open(path).with_context(|| format!("open non-BSJ segment evidence {}", path))?;
+    let reader = BufReader::new(file);
+    for line_res in reader.lines() {
+        let line = line_res?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        return Ok(line
+            .split('\t')
+            .nth(1)
+            .is_some_and(|stage| stage == "scan2_non_bsj_group"));
+    }
+    Ok(true)
+}
+
+/// Loads the current one-line-per-read non-BSJ sidecar with sharded mmap parsing.
+///
+/// Whole-genome sidecars can be tens of GiB. Mapping the file keeps memory
+/// bounded by page cache instead of copying the file into heap memory, while
+/// newline-aligned shards let read groups be parsed and materialized in parallel.
+fn spill_grouped_non_bsj_segment_evidence_mmap(
+    path: &str,
+    out_prefix: &str,
+    shard_offset: usize,
+    ctx: &SegmentScanContext<'_>,
+) -> Result<Vec<SegmentScanShardPaths>> {
+    let file =
+        File::open(path).with_context(|| format!("open non-BSJ segment evidence {}", path))?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    if mmap.is_empty() {
+        return Ok(Vec::new());
+    }
+    unsafe {
+        libc::madvise(
+            mmap.as_ptr() as *mut libc::c_void,
+            mmap.len(),
+            libc::MADV_SEQUENTIAL,
+        );
+    }
+    let pb = segment_scan_progress_bar(path)?;
+    pb.set_message("non-BSJ sidecar");
+    let ranges = line_aligned_shard_ranges(&mmap, rayon::current_num_threads().max(1));
+    let shard_paths = ranges
+        .into_par_iter()
+        .enumerate()
+        .map(|(idx, (start, end))| {
+            let paths = SegmentScanShardPaths::new(out_prefix, shard_offset + idx);
+            process_grouped_non_bsj_sidecar_shard(&mmap, start, end, ctx, &pb, &paths)?;
+            Ok(paths)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    pb.set_position(mmap.len() as u64);
+    pb.finish_with_message("");
+    Ok(shard_paths)
+}
+
+/// Splits a line-oriented mmap into non-overlapping newline-aligned ranges.
+fn line_aligned_shard_ranges(mmap: &Mmap, wanted_shards: usize) -> Vec<(usize, usize)> {
+    let shard_count = wanted_shards.max(1).min(mmap.len().max(1));
+    let mut starts = Vec::with_capacity(shard_count + 1);
+    starts.push(0);
+    for idx in 1..shard_count {
+        let raw = idx * mmap.len() / shard_count;
+        starts.push(next_line_start(mmap, raw));
+    }
+    starts.push(mmap.len());
+    starts.dedup();
+    starts
+        .windows(2)
+        .filter_map(|pair| (pair[0] < pair[1]).then_some((pair[0], pair[1])))
+        .collect()
+}
+
+/// Returns the first byte after the line containing `pos`.
+fn next_line_start(mmap: &Mmap, pos: usize) -> usize {
+    if pos == 0 || pos >= mmap.len() {
+        return pos.min(mmap.len());
+    }
+    if mmap[pos - 1] == b'\n' {
+        return pos;
+    }
+    let mut idx = pos;
+    while idx < mmap.len() {
+        if mmap[idx] == b'\n' {
+            return idx + 1;
+        }
+        idx += 1;
+    }
+    mmap.len()
+}
+
+/// Processes one mmap shard of grouped non-BSJ read evidence.
+fn process_grouped_non_bsj_sidecar_shard(
+    mmap: &Mmap,
+    start: usize,
+    end: usize,
+    ctx: &SegmentScanContext<'_>,
+    pb: &ProgressBar,
+    paths: &SegmentScanShardPaths,
+) -> Result<()> {
+    let mut writer = SegmentScanShardWriter::new(paths)?;
+    let mut pos = start;
+    let mut last_progress = start;
+    while pos < end {
+        let line_start = pos;
+        while pos < end && mmap[pos] != b'\n' {
+            pos += 1;
+        }
+        let mut line_end = pos;
+        if line_end > line_start && mmap[line_end - 1] == b'\r' {
+            line_end -= 1;
+        }
+        if pos < end {
+            pos += 1;
+        }
+        if line_end > line_start {
+            let line = std::str::from_utf8(&mmap[line_start..line_end]).with_context(|| {
+                format!("parse UTF-8 non-BSJ sidecar line at byte {line_start}")
+            })?;
+            if let Some((read_id, records)) = parse_non_bsj_group_line(line, ctx)? {
+                process_backward_group_to_writer(&read_id, &records, ctx, &mut writer)?;
+            }
+        }
+        if pos.saturating_sub(last_progress) >= 4 * 1024 * 1024 {
+            pb.inc((pos - last_progress) as u64);
+            last_progress = pos;
+        }
+    }
+    if end > last_progress {
+        pb.inc((end - last_progress) as u64);
+    }
+    writer.flush()?;
+    advise_segment_mmap_dontneed(mmap, start, end - start);
+    Ok(())
+}
+
+/// Parses one current-format grouped non-BSJ sidecar line.
+fn parse_non_bsj_group_line(
+    line: &str,
+    ctx: &SegmentScanContext<'_>,
+) -> Result<Option<(String, Vec<AsAlignment>)>> {
+    let mut parts = line.splitn(3, '\t');
+    let Some(read_id) = parts.next() else {
+        return Ok(None);
+    };
+    let Some(stage) = parts.next() else {
+        return Ok(None);
+    };
+    let Some(payload) = parts.next() else {
+        return Ok(None);
+    };
+    if stage != "scan2_non_bsj_group" || ctx.junction_read_to_circ.contains_key(read_id) {
+        return Ok(None);
+    }
+    let records = parse_non_bsj_group_records(payload, line)?;
+    Ok(Some((read_id.to_string(), records)))
+}
+
+/// Loads legacy one-alignment-per-line non-BSJ sidecars with visible progress.
+fn spill_legacy_non_bsj_segment_evidence(
+    path: &str,
+    out_prefix: &str,
+    shard_idx: usize,
+    ctx: &SegmentScanContext<'_>,
+) -> Result<Vec<SegmentScanShardPaths>> {
+    let file =
+        File::open(path).with_context(|| format!("open non-BSJ segment evidence {}", path))?;
+    let mut reader = BufReader::new(file);
+    let pb = segment_scan_progress_bar(path)?;
+    pb.set_message("legacy non-BSJ sidecar");
+    let paths = SegmentScanShardPaths::new(out_prefix, shard_idx);
+    let mut writer = SegmentScanShardWriter::new(&paths)?;
+    let mut last_progress_pos = 0_u64;
+    let mut line = String::new();
+    let mut bytes_since_progress = 0_u64;
+    {
+        let mut current_read_id = String::new();
+        let mut current_records = Vec::with_capacity(8);
+        let mut seen_in_group = HashSet::new();
+        loop {
+            line.clear();
+            let bytes = reader.read_line(&mut line)?;
+            if bytes == 0 {
+                break;
+            }
+            bytes_since_progress += bytes as u64;
+            if bytes_since_progress >= 4 * 1024 * 1024 {
+                last_progress_pos += bytes_since_progress;
+                pb.inc(bytes_since_progress);
+                bytes_since_progress = 0;
+            }
+            let line = line.trim_end_matches(['\n', '\r']);
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() >= 3 && parts[1] == "scan2_non_bsj_group" {
+                if !current_read_id.is_empty() {
+                    process_backward_group_to_writer(
+                        &current_read_id,
+                        &current_records,
+                        ctx,
+                        &mut writer,
+                    )?;
+                    current_read_id.clear();
+                    current_records.clear();
+                    seen_in_group.clear();
+                }
+                let read_id = parts[0];
+                if ctx.junction_read_to_circ.contains_key(read_id) {
+                    continue;
+                }
+                let records = parse_non_bsj_group_records(parts[2], &line)?;
+                process_backward_group_to_writer(read_id, &records, ctx, &mut writer)?;
+                continue;
+            }
+            if parts.len() < 10 {
+                continue;
+            }
+            let read_id = parts[0];
+            if ctx.junction_read_to_circ.contains_key(read_id) {
+                continue;
+            }
+            if !current_read_id.is_empty() && read_id != current_read_id {
+                process_backward_group_to_writer(
+                    &current_read_id,
+                    &current_records,
+                    ctx,
+                    &mut writer,
+                )?;
+                current_records.clear();
+                seen_in_group.clear();
+            }
+            if current_read_id != read_id {
+                current_read_id.clear();
+                current_read_id.push_str(read_id);
+            }
+
+            let flag = parts[3]
+                .parse::<i32>()
+                .with_context(|| format!("parse non-BSJ segment flag from {}", line))?;
+            let chrom = parts[4];
+            let pos = parts[5]
+                .parse::<i32>()
+                .with_context(|| format!("parse non-BSJ segment position from {}", line))?;
+            let mapq = parts[6]
+                .parse::<i32>()
+                .with_context(|| format!("parse non-BSJ segment MAPQ from {}", line))?;
+            let cigar = parts[7];
+            let seq = parts[9];
+            let key = format!("{flag}\t{chrom}\t{pos}\t{mapq}\t{cigar}\t{seq}");
+            if !seen_in_group.insert(key) {
+                continue;
+            }
+            current_records.push(AsAlignment {
+                flag,
+                chr: chrom.to_string(),
+                pos,
+                mapq,
+                cigar: cigar.to_string(),
+                seq: if seq == "*" {
+                    String::new()
+                } else {
+                    seq.to_string()
+                },
+                from_local_clip: parts[1].contains("_local"),
+                xa_alternatives: Vec::new(),
+            });
+        }
+        if !current_read_id.is_empty() {
+            process_backward_group_to_writer(&current_read_id, &current_records, ctx, &mut writer)?;
+        }
+    }
+    writer.flush()?;
+    if bytes_since_progress > 0 {
+        last_progress_pos += bytes_since_progress;
+        pb.inc(bytes_since_progress);
+    }
+    let total = std::fs::metadata(path)?.len();
+    if total > last_progress_pos {
+        pb.inc(total - last_progress_pos);
+    }
+    pb.finish_with_message("");
+    Ok(vec![paths])
+}
+
+/// Parses the compact one-line Scan2 non-BSJ read-group sidecar encoding.
+fn parse_non_bsj_group_records(payload: &str, line: &str) -> Result<Vec<AsAlignment>> {
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    for encoded in payload.split(';') {
+        if encoded.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = encoded.split('|').collect();
+        if fields.len() < 8 {
+            continue;
+        }
+        let flag = fields[1]
+            .parse::<i32>()
+            .with_context(|| format!("parse non-BSJ grouped flag from {}", line))?;
+        let chrom = fields[2];
+        let pos = fields[3]
+            .parse::<i32>()
+            .with_context(|| format!("parse non-BSJ grouped position from {}", line))?;
+        let mapq = fields[4]
+            .parse::<i32>()
+            .with_context(|| format!("parse non-BSJ grouped MAPQ from {}", line))?;
+        let cigar = fields[5];
+        let seq = fields[7];
+        let key = format!("{flag}\t{chrom}\t{pos}\t{mapq}\t{cigar}\t{seq}");
+        if !seen.insert(key) {
+            continue;
+        }
+        records.push(AsAlignment {
+            flag,
+            chr: chrom.to_string(),
+            pos,
+            mapq,
+            cigar: cigar.to_string(),
+            seq: if seq == "*" {
+                String::new()
+            } else {
+                seq.to_string()
+            },
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        });
+    }
+    Ok(records)
+}
+
+/// Returns recoverable soft-clip payload for one segments alignment.
+fn segment_clip_payload(record: &AsAlignment) -> String {
+    if record.seq == "*" || record.seq.starts_with("L:") || record.seq.starts_with("R:") {
+        record.seq.clone()
+    } else {
+        clip_sequence_payload(&record.cigar, &record.seq)
+    }
 }
 
 /// Builds CIRI-AS circRNA locus clusters.
@@ -2114,8 +2533,9 @@ fn process_group(read_id: &str, records: &[AsAlignment], state: &mut ScanState) 
 /// This is the sidecar-mode counterpart of the non-BSJ branch in
 /// `process_group`. Confirmed BSJ reads are skipped because their final chains
 /// must come from `.segments1/2`; non-BSJ groups are only retained when they
-/// overlap a confirmed circRNA cluster and produce CIRI-AS-style circular
-/// topology candidates.
+/// show read-level backward or outward topology. These supplemental rows do not
+/// require a known circRNA span or a matching BSJ; downstream graph construction
+/// can later project them onto compatible circRNA hypotheses.
 fn process_backward_group(
     read_id: &str,
     records: &[AsAlignment],
@@ -2126,12 +2546,12 @@ fn process_backward_group(
         return Ok(());
     }
     let is_outward = is_outward_pair_group_ctx(records, ctx);
-    let overlaps_cluster = records.len() > 2 && overlaps_any_circ_cluster_ctx(records, ctx);
-    if !is_outward && !overlaps_cluster {
+    let may_backward = may_have_backward_candidate_shape(records);
+    if !is_outward && !may_backward {
         return Ok(());
     }
 
-    let candidates = if overlaps_cluster {
+    let candidates = if may_backward {
         mapping_check1_backward_candidates(read_id, records, ctx)
     } else {
         Vec::new()
@@ -2170,12 +2590,12 @@ fn process_backward_group_to_writer(
         return Ok(());
     }
     let is_outward = is_outward_pair_group_ctx(records, ctx);
-    let overlaps_cluster = records.len() > 2 && overlaps_any_circ_cluster_ctx(records, ctx);
-    if !is_outward && !overlaps_cluster {
+    let may_backward = may_have_backward_candidate_shape(records);
+    if !is_outward && !may_backward {
         return Ok(());
     }
 
-    let candidates = if overlaps_cluster {
+    let candidates = if may_backward {
         mapping_check1_backward_candidates(read_id, records, ctx)
     } else {
         Vec::new()
@@ -2196,6 +2616,28 @@ fn process_backward_group_to_writer(
         writer.write_read_result(read_id, records, false, &candidates, &segment_records)?;
     }
     Ok(())
+}
+
+/// Cheap read-level prefilter for CIRI-AS-style backward split evidence.
+///
+/// This intentionally does not consult circRNA spans. It only asks whether the
+/// group has at least two same-strand same-chromosome alignments with a clipped
+/// CIGAR shape that could later produce a backward junction candidate.
+fn may_have_backward_candidate_shape(records: &[AsAlignment]) -> bool {
+    let mut buckets: HashMap<(&str, i32), (usize, bool)> = HashMap::new();
+    for record in records {
+        if record.chr == "*" || record.cigar == "*" {
+            continue;
+        }
+        let key = (record.chr.as_str(), reverse_bit(record.flag));
+        let entry = buckets.entry(key).or_insert((0, false));
+        entry.0 += 1;
+        entry.1 |= record.cigar.contains('S') || record.cigar.contains('H');
+        if entry.0 >= 2 && entry.1 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Validates one read group's splice candidates before shard-local materialization.
@@ -2564,7 +3006,7 @@ fn non_bsj_local_clip_alignments(
         {
             continue;
         }
-        let payload = clip_sequence_payload(&record.cigar, &record.seq);
+        let payload = segment_clip_payload(record);
         if payload == "*" {
             continue;
         }
@@ -2794,7 +3236,7 @@ fn is_outward_pair_group_ctx(records: &[AsAlignment], ctx: &SegmentScanContext<'
     }
     let span_start = r1_start.min(r2_start);
     let span_end = r1_end.max(r2_end);
-    span_contained_in_any_circ_ctx(&r1.chr, span_start, span_end, ctx)
+    span_end - span_start + 1 <= BACKWARD_MAX_SPAN
 }
 
 /// Tests the 5' RO-like geometry for a primary R1/R2 pair.
@@ -2851,20 +3293,6 @@ fn alignment_ref_span(record: &AsAlignment, read_len: i32) -> Option<(i32, i32)>
     let start = blocks.iter().map(|block| block.ref_start).min()?;
     let end = blocks.iter().map(|block| block.ref_end).max()?;
     Some((start, end))
-}
-
-/// Tests pair containment using the shared scan context.
-fn span_contained_in_any_circ_ctx(
-    chrom: &str,
-    start: i32,
-    end: i32,
-    ctx: &SegmentScanContext<'_>,
-) -> bool {
-    let Some(spans) = ctx.circ_spans_by_chr.get(chrom) else {
-        return false;
-    };
-    let idx = spans.partition_point(|span| span.start <= start);
-    idx > 0 && spans[idx - 1].max_end_through >= end
 }
 
 /// Splits one read group by reverse-strand flag and runs CIRI-AS pair matching.

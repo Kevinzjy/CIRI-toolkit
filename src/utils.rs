@@ -502,6 +502,16 @@ pub fn segments2_path_for_output(output_arg: &str) -> String {
     format!("{}.segments2", output_arg)
 }
 
+/// Returns the Scan2 non-BSJ segments sidecar path for one CLI prefix.
+///
+/// Unlike `.segments1/2`, this file is not restricted to confirmed BSJ reads.
+/// Scan2 writes read-level backward/outward topology candidates here so the
+/// post-Summary segments stage can avoid a third full BAM scan while still
+/// allowing candidates with no known circRNA or BSJ assignment.
+pub fn segments_non_bsj_path_for_output(output_arg: &str) -> String {
+    format!("{}.segments.non_bsj", output_arg)
+}
+
 /// Returns the basename used for FSJ shard-local spill files.
 ///
 /// The pipeline no longer keeps a final `.fsj` artifact, but the `<prefix>.fsj`
