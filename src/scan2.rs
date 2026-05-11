@@ -1098,6 +1098,8 @@ impl Scan2 {
     /// decide whether a group is worth re-evaluating after Summary. Soft clips
     /// are stored as compact `L:/R:` payloads so local clip placement remains
     /// available without repeating full read sequences across every alignment.
+    /// The short `N` stage and six-field alignment payload keep the large
+    /// whole-genome sidecar cheaper to write and parse.
     fn non_bsj_segment_evidence_lines<'a>(
         read_id: &str,
         alignments: &[AlignmentRecord<'a>],
@@ -1110,29 +1112,16 @@ impl Scan2 {
             if aln.chrom.as_ref() == "*" || aln.cigar.as_ref() == "*" {
                 continue;
             }
-            let mate = if aln.flag & 0x40 != 0 { "R1" } else { "R2" };
             let clips = clip_sequence_payload(aln.cigar.as_ref(), aln.seq.as_ref());
             records.push(format!(
-                "{}|{}|{}|{}|{}|{}|{}|{}",
-                mate,
-                aln.flag,
-                aln.chrom,
-                aln.pos,
-                aln.mapq,
-                aln.cigar,
-                aln.seq.len(),
-                clips
+                "{}|{}|{}|{}|{}|{}",
+                aln.flag, aln.chrom, aln.pos, aln.mapq, aln.cigar, clips
             ));
         }
         if records.is_empty() {
             Vec::new()
         } else {
-            vec![format!(
-                "{}\t{}\t{}",
-                read_id,
-                "scan2_non_bsj_group",
-                records.join(";")
-            )]
+            vec![format!("{}\t{}\t{}", read_id, "N", records.join(";"))]
         }
     }
 

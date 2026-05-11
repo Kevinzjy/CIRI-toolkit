@@ -1048,12 +1048,14 @@ fn non_bsj_sidecar_is_grouped(path: &str) -> Result<bool> {
         if line.trim().is_empty() {
             continue;
         }
-        return Ok(line
-            .split('\t')
-            .nth(1)
-            .is_some_and(|stage| stage == "scan2_non_bsj_group"));
+        return Ok(line.split('\t').nth(1).is_some_and(is_non_bsj_group_stage));
     }
     Ok(true)
+}
+
+/// Returns true for current compact and older verbose non-BSJ group stages.
+fn is_non_bsj_group_stage(stage: &str) -> bool {
+    stage == "N" || stage == "scan2_non_bsj_group"
 }
 
 /// Loads the current one-line-per-read non-BSJ sidecar with sharded mmap parsing.
@@ -1192,7 +1194,7 @@ fn parse_non_bsj_group_line(
     let Some(payload) = parts.next() else {
         return Ok(None);
     };
-    if stage != "scan2_non_bsj_group" || ctx.junction_read_to_circ.contains_key(read_id) {
+    if !is_non_bsj_group_stage(stage) || ctx.junction_read_to_circ.contains_key(read_id) {
         return Ok(None);
     }
     let records = parse_non_bsj_group_records(payload, line)?;
@@ -1237,7 +1239,7 @@ fn spill_legacy_non_bsj_segment_evidence(
                 continue;
             }
             let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() >= 3 && parts[1] == "scan2_non_bsj_group" {
+            if parts.len() >= 3 && is_non_bsj_group_stage(parts[1]) {
                 if !current_read_id.is_empty() {
                     process_backward_group_to_writer(
                         &current_read_id,
@@ -1336,22 +1338,27 @@ fn parse_non_bsj_group_records(payload: &str, line: &str) -> Result<Vec<AsAlignm
             continue;
         }
         let fields: Vec<&str> = encoded.split('|').collect();
-        if fields.len() < 8 {
+        let (flag_idx, chrom_idx, pos_idx, mapq_idx, cigar_idx, seq_idx) = match fields.len() {
+            0..=5 => continue,
+            6 => (0, 1, 2, 3, 4, 5),
+            _ => (1, 2, 3, 4, 5, 7),
+        };
+        if seq_idx >= fields.len() {
             continue;
         }
-        let flag = fields[1]
+        let flag = fields[flag_idx]
             .parse::<i32>()
             .with_context(|| format!("parse non-BSJ grouped flag from {}", line))?;
-        let chrom = fields[2];
-        let pos = fields[3]
+        let chrom = fields[chrom_idx];
+        let pos = fields[pos_idx]
             .parse::<i32>()
             .with_context(|| format!("parse non-BSJ grouped position from {}", line))?;
-        let mapq = fields[4]
+        let mapq = fields[mapq_idx]
             .parse::<i32>()
             .with_context(|| format!("parse non-BSJ grouped MAPQ from {}", line))?;
-        let cigar = fields[5];
-        let seq = fields[7];
-        let key = format!("{flag}\t{chrom}\t{pos}\t{mapq}\t{cigar}\t{seq}");
+        let cigar = fields[cigar_idx];
+        let seq = fields[seq_idx];
+        let key = (flag, chrom, pos, mapq, cigar, seq);
         if !seen.insert(key) {
             continue;
         }
@@ -2557,14 +2564,13 @@ fn process_backward_group(
         Vec::new()
     };
     let mut candidates = validate_splice_candidates(candidates, ctx.reference, ctx.annotation);
-    let segment_records =
+    let (segment_records, enriched_records) =
         prebuild_non_bsj_segment_records(read_id, records, is_outward, &candidates, ctx);
     if is_outward {
-        let enriched_records = add_non_bsj_local_clip_alignments_ctx(records, ctx);
         accum
             .segment_groups
             .entry(read_id.to_string())
-            .or_insert_with(|| enriched_records.clone());
+            .or_insert_with(|| enriched_records.unwrap_or_else(|| records.to_vec()));
         accum.outward_read_ids.insert(read_id.to_string());
     }
     if !candidates.is_empty() {
@@ -2601,13 +2607,13 @@ fn process_backward_group_to_writer(
         Vec::new()
     };
     let candidates = validate_splice_candidates(candidates, ctx.reference, ctx.annotation);
-    let segment_records =
+    let (segment_records, enriched_records) =
         prebuild_non_bsj_segment_records(read_id, records, is_outward, &candidates, ctx);
     if is_outward {
-        let enriched_records = add_non_bsj_local_clip_alignments_ctx(records, ctx);
+        let retained_records = enriched_records.as_deref().unwrap_or(records);
         writer.write_read_result(
             read_id,
-            &enriched_records,
+            retained_records,
             true,
             &candidates,
             &segment_records,
@@ -2666,7 +2672,7 @@ fn prebuild_non_bsj_segment_records(
     is_outward: bool,
     candidates: &[PositiveCandidate],
     ctx: &SegmentScanContext<'_>,
-) -> Vec<SegmentRecord> {
+) -> (Vec<SegmentRecord>, Option<Vec<AsAlignment>>) {
     let correction = SegmentCorrectionContext {
         reference: ctx.reference,
         annotation: ctx.annotation,
@@ -2674,13 +2680,12 @@ fn prebuild_non_bsj_segment_records(
     };
     let junction_hints = local_junction_hints(candidates);
     let strand_hint = local_strand_hint(candidates);
-    let enriched_records;
-    let materialization_records = if is_outward {
-        enriched_records = add_non_bsj_local_clip_alignments_ctx(records, ctx);
-        enriched_records.as_slice()
+    let enriched_records = if is_outward {
+        Some(add_non_bsj_local_clip_alignments_ctx(records, ctx))
     } else {
-        records
+        None
     };
+    let materialization_records = enriched_records.as_deref().unwrap_or(records);
 
     if !candidates.is_empty() {
         if let Some(record) = build_backward_segment_record_from_group_ctx(
@@ -2691,7 +2696,7 @@ fn prebuild_non_bsj_segment_records(
             strand_hint,
             &junction_hints,
         ) {
-            return vec![record];
+            return (vec![record], enriched_records);
         }
     }
     if is_outward {
@@ -2701,10 +2706,10 @@ fn prebuild_non_bsj_segment_records(
             Some(&correction),
             ctx.read_len,
         ) {
-            return vec![record];
+            return (vec![record], enriched_records);
         }
     }
-    Vec::new()
+    (Vec::new(), enriched_records)
 }
 
 /// Builds one backward row using only shard-local read context.
