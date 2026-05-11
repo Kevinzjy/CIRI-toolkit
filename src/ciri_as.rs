@@ -1017,7 +1017,12 @@ fn load_non_bsj_segment_evidence(
             .map(|path| non_bsj_sidecar_is_grouped(path))
             .collect::<Result<Vec<_>>>()?;
         if paths.len() > 1 && grouped_inputs.iter().all(|is_grouped| *is_grouped) {
-            spill_grouped_non_bsj_segment_evidence_shards_mmap(paths, out_prefix, &ctx)?
+            let accums = load_grouped_non_bsj_segment_evidence_shards_mmap(paths, &ctx)?;
+            on_merge_start()?;
+            for (_, accum) in accums {
+                merge_segment_scan_accum(state, accum);
+            }
+            return Ok(Vec::new());
         } else {
             let mut shard_paths = Vec::new();
             for (path, is_grouped) in paths.iter().zip(grouped_inputs) {
@@ -1107,17 +1112,17 @@ fn spill_grouped_non_bsj_segment_evidence_mmap(
     Ok(shard_paths)
 }
 
-/// Loads already sharded grouped non-BSJ sidecars without merging or re-splitting.
+/// Loads already sharded grouped non-BSJ sidecars directly into retained groups.
 ///
 /// Scan2 writes one sidecar per BAM shard. When those shard paths are handed
 /// directly to segments finalize, each source shard is already read-group
-/// complete, so a second newline-based sharding layer would only multiply temp
-/// files and duplicate scheduling overhead.
-fn spill_grouped_non_bsj_segment_evidence_shards_mmap(
+/// complete, so the finalize stage can keep only read groups that pass the
+/// final backward/outward topology checks instead of writing another temporary
+/// R/A/C/S shard stream and reading it back immediately.
+fn load_grouped_non_bsj_segment_evidence_shards_mmap(
     paths: &[&str],
-    out_prefix: &str,
     ctx: &SegmentScanContext<'_>,
-) -> Result<Vec<SegmentScanShardPaths>> {
+) -> Result<Vec<(usize, SegmentScanAccum)>> {
     let total_bytes = paths.iter().try_fold(0_u64, |acc, path| {
         Ok::<u64, anyhow::Error>(acc + std::fs::metadata(path)?.len())
     })?;
@@ -1130,28 +1135,67 @@ fn spill_grouped_non_bsj_segment_evidence_shards_mmap(
             .progress_chars("#>-"),
     );
     pb.set_message("non-BSJ sidecar shards");
-    let shard_paths = paths
+    let mut accums = paths
         .par_iter()
         .enumerate()
-        .map(|(idx, path)| {
-            let file = File::open(path)
-                .with_context(|| format!("open non-BSJ segment evidence {}", path))?;
-            let mmap = unsafe { Mmap::map(&file)? };
-            unsafe {
-                libc::madvise(
-                    mmap.as_ptr() as *mut libc::c_void,
-                    mmap.len(),
-                    libc::MADV_SEQUENTIAL,
-                );
-            }
-            let paths = SegmentScanShardPaths::new(out_prefix, idx);
-            process_grouped_non_bsj_sidecar_shard(&mmap, 0, mmap.len(), ctx, &pb, &paths)?;
-            Ok(paths)
-        })
+        .map(|(idx, path)| load_grouped_non_bsj_sidecar_shard_to_accum(path, idx, ctx, &pb))
         .collect::<Result<Vec<_>>>()?;
+    accums.sort_by_key(|(idx, _)| *idx);
     pb.set_position(total_bytes);
     pb.finish_with_message("");
-    Ok(shard_paths)
+    Ok(accums)
+}
+
+/// Parses one Scan2 non-BSJ sidecar shard and keeps only retained read groups.
+fn load_grouped_non_bsj_sidecar_shard_to_accum(
+    path: &str,
+    shard_idx: usize,
+    ctx: &SegmentScanContext<'_>,
+    pb: &ProgressBar,
+) -> Result<(usize, SegmentScanAccum)> {
+    let file =
+        File::open(path).with_context(|| format!("open non-BSJ segment evidence {}", path))?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    unsafe {
+        libc::madvise(
+            mmap.as_ptr() as *mut libc::c_void,
+            mmap.len(),
+            libc::MADV_SEQUENTIAL,
+        );
+    }
+    let mut accum = SegmentScanAccum::default();
+    let mut pos = 0usize;
+    let mut last_progress = 0usize;
+    while pos < mmap.len() {
+        let line_start = pos;
+        while pos < mmap.len() && mmap[pos] != b'\n' {
+            pos += 1;
+        }
+        let mut line_end = pos;
+        if line_end > line_start && mmap[line_end - 1] == b'\r' {
+            line_end -= 1;
+        }
+        if pos < mmap.len() {
+            pos += 1;
+        }
+        if line_end > line_start {
+            let line = std::str::from_utf8(&mmap[line_start..line_end]).with_context(|| {
+                format!("parse UTF-8 non-BSJ sidecar line at byte {line_start}")
+            })?;
+            if let Some((read_id, records)) = parse_non_bsj_group_line(line, ctx)? {
+                process_backward_group(read_id, &records, ctx, &mut accum)?;
+            }
+        }
+        if pos.saturating_sub(last_progress) >= 4 * 1024 * 1024 {
+            pb.inc((pos - last_progress) as u64);
+            last_progress = pos;
+        }
+    }
+    if mmap.len() > last_progress {
+        pb.inc((mmap.len() - last_progress) as u64);
+    }
+    advise_segment_mmap_dontneed(&mmap, 0, mmap.len());
+    Ok((shard_idx, accum))
 }
 
 /// Splits a line-oriented mmap into non-overlapping newline-aligned ranges.
