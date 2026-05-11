@@ -67,6 +67,18 @@ pub struct Scan2 {
     pub final_bsj_reads: usize,
 }
 
+/// Temporary sidecar paths produced while Scan2 feeds the segments stage.
+///
+/// These files are not part of the CIRI3-compatible BSJ output contract. They
+/// let the CLI hand large read-level extension evidence directly to the
+/// post-Summary segments stage without first merging it into a second huge text
+/// file that would immediately be mmap-parsed again.
+#[derive(Default)]
+pub struct Scan2SegmentArtifacts {
+    /// Shard-local non-BSJ topology sidecars retained for direct segments input.
+    pub non_bsj_segment_evidence_paths: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct CandidateBreakpoint {
     /// Genomic coordinate used for bucket/range lookup.
@@ -679,6 +691,7 @@ impl Scan2 {
             None,
             chr_tcga_map,
         )
+        .map(|_| ())
     }
 
     /// Runs Scan2 while also writing a segments-evidence sidecar for rescued BSJ reads.
@@ -697,7 +710,7 @@ impl Scan2 {
         segments_output_path: Option<&str>,
         non_bsj_segments_output_path: Option<&str>,
         chr_tcga_map: &HashMap<String, String>,
-    ) -> Result<()> {
+    ) -> Result<Scan2SegmentArtifacts> {
         use crate::sam_bam::{detect_format, InputFormat};
         let display_scan2 = if let Some(scan1_path) = scan1_display_path {
             let mut helper =
@@ -754,6 +767,7 @@ impl Scan2 {
             None,
             chr_tcga_map,
         )
+        .map(|_| ())
     }
 
     fn run_sam_with_display(
@@ -766,7 +780,7 @@ impl Scan2 {
         non_bsj_segments_output_path: Option<&str>,
         display_scan2: Option<&(Scan2, Scan2DisplayClaims)>,
         chr_tcga_map: &HashMap<String, String>,
-    ) -> Result<()> {
+    ) -> Result<Scan2SegmentArtifacts> {
         let run_started = Instant::now();
         let profile = if Scan2Profile::enabled_from_env() {
             Some(Scan2Profile::default())
@@ -801,7 +815,7 @@ impl Scan2 {
         pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")?.progress_chars("#>-"));
         pb.finish_with_message("Completed");
         let merge_started = Instant::now();
-        let result = self.merge_shards_and_fsj(output_bsj2, output_fsj, 1);
+        self.merge_shards_and_fsj(output_bsj2, output_fsj, 1)?;
         if let Some(profile) = profile_ref {
             profile
                 .merge_ns
@@ -818,10 +832,12 @@ impl Scan2 {
         if let Some(path) = segments_output_path {
             self.merge_segment_shards(path, 1)?;
         }
-        if let Some(path) = non_bsj_segments_output_path {
-            self.merge_segment_shards(path, 1)?;
-        }
-        result
+        let non_bsj_segment_evidence_paths = non_bsj_segments_output_path
+            .map(|path| vec![part_path(path, 0)])
+            .unwrap_or_default();
+        Ok(Scan2SegmentArtifacts {
+            non_bsj_segment_evidence_paths,
+        })
     }
 
     /// Merges per-shard Scan2 BSJ2 outputs and FSJ spill files.
@@ -903,6 +919,7 @@ impl Scan2 {
             None,
             chr_tcga_map,
         )
+        .map(|_| ())
     }
 
     fn run_bam_with_display(
@@ -915,7 +932,7 @@ impl Scan2 {
         non_bsj_segments_output_path: Option<&str>,
         display_scan2: Option<&(Scan2, Scan2DisplayClaims)>,
         chr_tcga_map: &HashMap<String, String>,
-    ) -> Result<()> {
+    ) -> Result<Scan2SegmentArtifacts> {
         use noodles::bam;
         let run_started = Instant::now();
         let profile = if Scan2Profile::enabled_from_env() {
@@ -988,7 +1005,7 @@ impl Scan2 {
         );
         pb.finish_with_message("Completed");
         let merge_started = Instant::now();
-        let result = self.merge_shards_and_fsj(output_bsj2, output_fsj, num_threads);
+        self.merge_shards_and_fsj(output_bsj2, output_fsj, num_threads)?;
         if let Some(profile) = profile_ref {
             profile
                 .merge_ns
@@ -1005,10 +1022,16 @@ impl Scan2 {
         if let Some(path) = segments_output_path {
             self.merge_segment_shards(path, num_threads)?;
         }
-        if let Some(path) = non_bsj_segments_output_path {
-            self.merge_segment_shards(path, num_threads)?;
-        }
-        result
+        let non_bsj_segment_evidence_paths = non_bsj_segments_output_path
+            .map(|path| {
+                (0..num_threads)
+                    .map(|idx| part_path(path, idx))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(Scan2SegmentArtifacts {
+            non_bsj_segment_evidence_paths,
+        })
     }
 
     /// Merges display shard files in shard order into one final temporary file.

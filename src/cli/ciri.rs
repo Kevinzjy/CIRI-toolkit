@@ -269,7 +269,7 @@ pub fn main() -> Result<()> {
         "Running scan 2",
         "Curating splicing signals & counting FSJs...",
     )?;
-    scan2.run_with_display_and_segments(
+    let scan2_segment_artifacts = scan2.run_with_display_and_segments(
         &args.in_sam,
         &bsj2_output,
         &fsj_output,
@@ -329,17 +329,26 @@ pub fn main() -> Result<()> {
     )?;
     let mut segment_progress_log =
         |label: &str, message: &str| log_info(&mut log_writer, label, message);
-    let segment_summary = run_ciri_as(AsConfig {
+    let non_bsj_segment_evidence_paths: Vec<&str> = scan2_segment_artifacts
+        .non_bsj_segment_evidence_paths
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let segment_summary_result = run_ciri_as(AsConfig {
         input_path: &args.in_sam,
         circ_path: &result_output,
         bsj_path: Some(&bsj_output),
         segment_evidence_paths: vec![&segments1_output, &segments2_output],
-        non_bsj_segment_evidence_paths: vec![&segments_non_bsj_output],
+        non_bsj_segment_evidence_paths,
         out_prefix: &args.out_prefix,
         reference: &fasta.chr_tcga_map,
         annotation: args.gtf.as_ref().map(|_| &annotation),
         progress_log: Some(&mut segment_progress_log),
-    })?;
+    });
+    for path in &scan2_segment_artifacts.non_bsj_segment_evidence_paths {
+        let _ = std::fs::remove_file(path);
+    }
+    let segment_summary = segment_summary_result?;
     log_info(
         &mut log_writer,
         "Segments output",

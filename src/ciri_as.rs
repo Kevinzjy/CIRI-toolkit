@@ -1012,27 +1012,35 @@ fn load_non_bsj_segment_evidence(
 ) -> Result<Vec<SegmentScanShardIndex>> {
     let shard_paths = {
         let ctx = SegmentScanContext::from_state(state);
-        let mut shard_paths = Vec::new();
-        for path in paths {
-            if non_bsj_sidecar_is_grouped(path)? {
-                let mut paths = spill_grouped_non_bsj_segment_evidence_mmap(
-                    path,
-                    out_prefix,
-                    shard_paths.len(),
-                    &ctx,
-                )?;
-                shard_paths.append(&mut paths);
-            } else {
-                let mut paths = spill_legacy_non_bsj_segment_evidence(
-                    path,
-                    out_prefix,
-                    shard_paths.len(),
-                    &ctx,
-                )?;
-                shard_paths.append(&mut paths);
+        let grouped_inputs = paths
+            .iter()
+            .map(|path| non_bsj_sidecar_is_grouped(path))
+            .collect::<Result<Vec<_>>>()?;
+        if paths.len() > 1 && grouped_inputs.iter().all(|is_grouped| *is_grouped) {
+            spill_grouped_non_bsj_segment_evidence_shards_mmap(paths, out_prefix, &ctx)?
+        } else {
+            let mut shard_paths = Vec::new();
+            for (path, is_grouped) in paths.iter().zip(grouped_inputs) {
+                if is_grouped {
+                    let mut paths = spill_grouped_non_bsj_segment_evidence_mmap(
+                        path,
+                        out_prefix,
+                        shard_paths.len(),
+                        &ctx,
+                    )?;
+                    shard_paths.append(&mut paths);
+                } else {
+                    let mut paths = spill_legacy_non_bsj_segment_evidence(
+                        path,
+                        out_prefix,
+                        shard_paths.len(),
+                        &ctx,
+                    )?;
+                    shard_paths.append(&mut paths);
+                }
             }
+            shard_paths
         }
-        shard_paths
     };
     on_merge_start()?;
     merge_segment_scan_candidate_shards(state, &shard_paths)
@@ -1095,6 +1103,53 @@ fn spill_grouped_non_bsj_segment_evidence_mmap(
         })
         .collect::<Result<Vec<_>>>()?;
     pb.set_position(mmap.len() as u64);
+    pb.finish_with_message("");
+    Ok(shard_paths)
+}
+
+/// Loads already sharded grouped non-BSJ sidecars without merging or re-splitting.
+///
+/// Scan2 writes one sidecar per BAM shard. When those shard paths are handed
+/// directly to segments finalize, each source shard is already read-group
+/// complete, so a second newline-based sharding layer would only multiply temp
+/// files and duplicate scheduling overhead.
+fn spill_grouped_non_bsj_segment_evidence_shards_mmap(
+    paths: &[&str],
+    out_prefix: &str,
+    ctx: &SegmentScanContext<'_>,
+) -> Result<Vec<SegmentScanShardPaths>> {
+    let total_bytes = paths.iter().try_fold(0_u64, |acc, path| {
+        Ok::<u64, anyhow::Error>(acc + std::fs::metadata(path)?.len())
+    })?;
+    let pb = ProgressBar::new(total_bytes);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {percent:>3}% ({eta}) {msg}",
+            )?
+            .progress_chars("#>-"),
+    );
+    pb.set_message("non-BSJ sidecar shards");
+    let shard_paths = paths
+        .par_iter()
+        .enumerate()
+        .map(|(idx, path)| {
+            let file = File::open(path)
+                .with_context(|| format!("open non-BSJ segment evidence {}", path))?;
+            let mmap = unsafe { Mmap::map(&file)? };
+            unsafe {
+                libc::madvise(
+                    mmap.as_ptr() as *mut libc::c_void,
+                    mmap.len(),
+                    libc::MADV_SEQUENTIAL,
+                );
+            }
+            let paths = SegmentScanShardPaths::new(out_prefix, idx);
+            process_grouped_non_bsj_sidecar_shard(&mmap, 0, mmap.len(), ctx, &pb, &paths)?;
+            Ok(paths)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    pb.set_position(total_bytes);
     pb.finish_with_message("");
     Ok(shard_paths)
 }
