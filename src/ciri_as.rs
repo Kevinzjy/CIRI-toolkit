@@ -1180,10 +1180,10 @@ fn process_grouped_non_bsj_sidecar_shard(
 }
 
 /// Parses one current-format grouped non-BSJ sidecar line.
-fn parse_non_bsj_group_line(
-    line: &str,
+fn parse_non_bsj_group_line<'a>(
+    line: &'a str,
     ctx: &SegmentScanContext<'_>,
-) -> Result<Option<(String, Vec<AsAlignment>)>> {
+) -> Result<Option<(&'a str, Vec<AsAlignment>)>> {
     let mut parts = line.splitn(3, '\t');
     let Some(read_id) = parts.next() else {
         return Ok(None);
@@ -1198,7 +1198,7 @@ fn parse_non_bsj_group_line(
         return Ok(None);
     }
     let records = parse_non_bsj_group_records(payload, line)?;
-    Ok(Some((read_id.to_string(), records)))
+    Ok(Some((read_id, records)))
 }
 
 /// Loads legacy one-alignment-per-line non-BSJ sidecars with visible progress.
@@ -1337,27 +1337,43 @@ fn parse_non_bsj_group_records(payload: &str, line: &str) -> Result<Vec<AsAlignm
         if encoded.is_empty() {
             continue;
         }
-        let fields: Vec<&str> = encoded.split('|').collect();
-        let (flag_idx, chrom_idx, pos_idx, mapq_idx, cigar_idx, seq_idx) = match fields.len() {
+        // This parser is on the 10+ GiB non-BSJ sidecar path. The current
+        // compact protocol has six fields, while the older verbose protocol
+        // has eight fields; keeping the first eight slots on the stack avoids
+        // one short Vec allocation for every alignment payload.
+        let mut fields = [None; 8];
+        let mut field_count = 0usize;
+        for field in encoded.split('|') {
+            if field_count < fields.len() {
+                fields[field_count] = Some(field);
+            }
+            field_count += 1;
+            if field_count >= fields.len() {
+                break;
+            }
+        }
+        let (flag_idx, chrom_idx, pos_idx, mapq_idx, cigar_idx, seq_idx) = match field_count {
             0..=5 => continue,
             6 => (0, 1, 2, 3, 4, 5),
+            7 => continue,
             _ => (1, 2, 3, 4, 5, 7),
         };
-        if seq_idx >= fields.len() {
-            continue;
-        }
-        let flag = fields[flag_idx]
+        let field = |idx: usize| fields[idx].expect("validated non-BSJ sidecar field");
+        let flag_text = field(flag_idx);
+        let chrom = field(chrom_idx);
+        let pos_text = field(pos_idx);
+        let mapq_text = field(mapq_idx);
+        let cigar = field(cigar_idx);
+        let seq = field(seq_idx);
+        let flag = flag_text
             .parse::<i32>()
             .with_context(|| format!("parse non-BSJ grouped flag from {}", line))?;
-        let chrom = fields[chrom_idx];
-        let pos = fields[pos_idx]
+        let pos = pos_text
             .parse::<i32>()
             .with_context(|| format!("parse non-BSJ grouped position from {}", line))?;
-        let mapq = fields[mapq_idx]
+        let mapq = mapq_text
             .parse::<i32>()
             .with_context(|| format!("parse non-BSJ grouped MAPQ from {}", line))?;
-        let cigar = fields[cigar_idx];
-        let seq = fields[seq_idx];
         let key = (flag, chrom, pos, mapq, cigar, seq);
         if !seen.insert(key) {
             continue;
@@ -5368,7 +5384,9 @@ fn build_sidecar_segment_records(
     log_segments_profile(profile, "unified_bsj_first_pass", phase_started);
 
     let phase_started = profile.then(Instant::now);
-    let non_bsj_records = state.prebuilt_segment_records.clone();
+    // Non-BSJ rows were already materialized during sidecar loading. Move them
+    // into the final vector instead of cloning the full read-level payload.
+    let non_bsj_records = std::mem::take(&mut state.prebuilt_segment_records);
     log_segments_profile(profile, "unified_non_bsj_first_pass", phase_started);
     out.extend(non_bsj_records);
 
@@ -5582,17 +5600,17 @@ fn rebuild_segment_record_with_correction(
 fn collect_junction_support(records: &[SegmentRecord]) -> JunctionSupportMap {
     let mut support = HashMap::new();
     for record in records {
-        collect_junction_support_from_segments(&record.chrom, &record.r1_segments, &mut support);
-        collect_junction_support_from_segments(&record.chrom, &record.r2_segments, &mut support);
+        let chrom_support = support.entry(record.chrom.clone()).or_default();
+        collect_junction_support_from_segments(&record.r1_segments, chrom_support);
+        collect_junction_support_from_segments(&record.r2_segments, chrom_support);
     }
     support
 }
 
 /// Adds retained read-chain `N` junctions from one mate's segment string.
 fn collect_junction_support_from_segments(
-    chrom: &str,
     segments: &str,
-    support: &mut JunctionSupportMap,
+    chrom_support: &mut HashMap<JunctionSupportKey, usize>,
 ) {
     let mut previous: Option<(i32, i32, char)> = None;
     let mut pending_bsj = false;
@@ -5615,11 +5633,7 @@ fn collect_junction_support_from_segments(
                 } else {
                     (end, prev_start)
                 };
-                *support
-                    .entry(chrom.to_string())
-                    .or_default()
-                    .entry((site2, site1, strand))
-                    .or_insert(0) += 1;
+                *chrom_support.entry((site2, site1, strand)).or_insert(0) += 1;
             }
         }
         previous = Some((start, end, strand));
