@@ -2680,11 +2680,9 @@ fn prebuild_non_bsj_segment_records(
     };
     let junction_hints = local_junction_hints(candidates);
     let strand_hint = local_strand_hint(candidates);
-    let enriched_records = if is_outward {
-        Some(add_non_bsj_local_clip_alignments_ctx(records, ctx))
-    } else {
-        None
-    };
+    let enriched_records = is_outward
+        .then(|| try_add_non_bsj_local_clip_alignments_ctx(records, ctx))
+        .flatten();
     let materialization_records = enriched_records.as_deref().unwrap_or(records);
 
     if !candidates.is_empty() {
@@ -2729,10 +2727,9 @@ fn build_backward_segment_record_from_group_ctx(
         Some(correction),
         ctx.read_len,
     )?;
-    let enriched_records = add_non_bsj_local_clip_alignments_ctx(records, ctx);
-    if enriched_records.len() == records.len() {
+    let Some(enriched_records) = try_add_non_bsj_local_clip_alignments_ctx(records, ctx) else {
         return Some(base);
-    }
+    };
     build_backward_segment_record(
         read_id,
         &enriched_records,
@@ -2791,20 +2788,34 @@ fn add_non_bsj_local_clip_alignments_ctx(
     records: &[AsAlignment],
     ctx: &SegmentScanContext<'_>,
 ) -> Vec<AsAlignment> {
+    try_add_non_bsj_local_clip_alignments_ctx(records, ctx).unwrap_or_else(|| records.to_vec())
+}
+
+/// Adds local soft-clip pseudo-alignments only when the rescue creates rows.
+///
+/// Most non-BSJ groups have no usable soft clip placement. Returning `None` for
+/// those cases avoids repeatedly cloning the read group while preserving the old
+/// materialized output through `add_non_bsj_local_clip_alignments_ctx`.
+fn try_add_non_bsj_local_clip_alignments_ctx(
+    records: &[AsAlignment],
+    ctx: &SegmentScanContext<'_>,
+) -> Option<Vec<AsAlignment>> {
     if !records.iter().any(|record| {
         !record.from_local_clip
             && record.cigar.contains('S')
             && !record.seq.is_empty()
             && record.seq != "*"
     }) {
-        return records.to_vec();
+        return None;
     }
     let windows = non_bsj_local_clip_windows_ctx(records, ctx);
     if windows.is_empty() {
-        return records.to_vec();
+        return None;
     }
-    let mut out = records.to_vec();
     let mut local = non_bsj_local_clip_alignments(records, &windows, ctx);
+    if local.is_empty() {
+        return None;
+    }
     local.sort_by(|a, b| {
         mate_bucket(a.flag)
             .cmp(&mate_bucket(b.flag))
@@ -2813,8 +2824,9 @@ fn add_non_bsj_local_clip_alignments_ctx(
             .then_with(|| a.cigar.cmp(&b.cigar))
     });
     local.truncate(NON_BSJ_LOCAL_CLIP_MAX_ROWS_PER_READ);
+    let mut out = records.to_vec();
     out.extend(local);
-    out
+    Some(out)
 }
 
 /// Builds bounded local reference windows for non-BSJ clip placement.
