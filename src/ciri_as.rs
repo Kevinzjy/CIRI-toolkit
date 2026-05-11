@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::annotation::Annotation;
@@ -1017,11 +1018,8 @@ fn load_non_bsj_segment_evidence(
             .map(|path| non_bsj_sidecar_is_grouped(path))
             .collect::<Result<Vec<_>>>()?;
         if paths.len() > 1 && grouped_inputs.iter().all(|is_grouped| *is_grouped) {
-            let accums = load_grouped_non_bsj_segment_evidence_shards_mmap(paths, &ctx)?;
             on_merge_start()?;
-            for (_, accum) in accums {
-                merge_segment_scan_accum(state, accum);
-            }
+            load_grouped_non_bsj_segment_evidence_shards_mmap(paths, state)?;
             return Ok(Vec::new());
         } else {
             let mut shard_paths = Vec::new();
@@ -1121,8 +1119,8 @@ fn spill_grouped_non_bsj_segment_evidence_mmap(
 /// R/A/C/S shard stream and reading it back immediately.
 fn load_grouped_non_bsj_segment_evidence_shards_mmap(
     paths: &[&str],
-    ctx: &SegmentScanContext<'_>,
-) -> Result<Vec<(usize, SegmentScanAccum)>> {
+    state: &mut ScanState<'_>,
+) -> Result<()> {
     let total_bytes = paths.iter().try_fold(0_u64, |acc, path| {
         Ok::<u64, anyhow::Error>(acc + std::fs::metadata(path)?.len())
     })?;
@@ -1135,15 +1133,59 @@ fn load_grouped_non_bsj_segment_evidence_shards_mmap(
             .progress_chars("#>-"),
     );
     pb.set_message("non-BSJ sidecar shards");
-    let mut accums = paths
-        .par_iter()
-        .enumerate()
-        .map(|(idx, path)| load_grouped_non_bsj_sidecar_shard_to_accum(path, idx, ctx, &pb))
-        .collect::<Result<Vec<_>>>()?;
-    accums.sort_by_key(|(idx, _)| *idx);
+
+    let (tx, rx) = mpsc::sync_channel(rayon::current_num_threads().max(1));
+    let ctx = SegmentScanContext {
+        junction_read_to_circ: &state.junction_read_to_circ,
+        reference: state.reference,
+        annotation: state.annotation,
+        circ_spans_by_chr: &state.circ_spans_by_chr,
+        clusters_by_chr: &state.clusters_by_chr,
+        read_len: state.read_len,
+    };
+    let candidates = &mut state.candidates;
+    let segment_groups = &mut state.segment_groups;
+    let outward_read_ids = &mut state.outward_read_ids;
+    let prebuilt_segment_records = &mut state.prebuilt_segment_records;
+    let stats = &mut state.stats;
+
+    let mut first_error = None;
+    rayon::scope(|scope| {
+        for (idx, path) in paths.iter().enumerate() {
+            let tx = tx.clone();
+            let pb = pb.clone();
+            let ctx = &ctx;
+            scope.spawn(move |_| {
+                let _ = tx.send(load_grouped_non_bsj_sidecar_shard_to_accum(
+                    path, idx, ctx, &pb,
+                ));
+            });
+        }
+        drop(tx);
+
+        for shard_result in rx {
+            match shard_result {
+                Ok((_, accum)) => merge_segment_scan_accum_fields(
+                    candidates,
+                    segment_groups,
+                    outward_read_ids,
+                    prebuilt_segment_records,
+                    stats,
+                    accum,
+                ),
+                Err(err) if first_error.is_none() => {
+                    first_error = Some(err);
+                }
+                Err(_) => {}
+            }
+        }
+    });
+    if let Some(err) = first_error {
+        return Err(err);
+    }
     pb.set_position(total_bytes);
     pb.finish_with_message("");
-    Ok(accums)
+    Ok(())
 }
 
 /// Parses one Scan2 non-BSJ sidecar shard and keeps only retained read groups.
@@ -1918,14 +1960,36 @@ impl<'a> SegmentScanContext<'a> {
 
 /// Merges one completed segments scan accumulator into the main state.
 fn merge_segment_scan_accum(state: &mut ScanState, accum: SegmentScanAccum) {
-    state.candidates.extend(accum.candidates);
-    state.outward_read_ids.extend(accum.outward_read_ids);
-    state
-        .prebuilt_segment_records
-        .extend(accum.prebuilt_segment_records);
-    state.stats.add_candidates += accum.add_candidates;
+    merge_segment_scan_accum_fields(
+        &mut state.candidates,
+        &mut state.segment_groups,
+        &mut state.outward_read_ids,
+        &mut state.prebuilt_segment_records,
+        &mut state.stats,
+        accum,
+    );
+}
+
+/// Merges one accumulator into disjoint mutable state fields.
+///
+/// The direct non-BSJ sidecar loader keeps Scan1/Scan2-style memory behavior by
+/// receiving shard results through a bounded channel and merging each result as
+/// soon as it arrives. Splitting the mutable fields lets workers borrow the
+/// read-only indexes while the main thread appends retained groups incrementally.
+fn merge_segment_scan_accum_fields(
+    candidates: &mut Vec<PositiveCandidate>,
+    segment_groups: &mut HashMap<String, Vec<AsAlignment>>,
+    outward_read_ids: &mut HashSet<String>,
+    prebuilt_segment_records: &mut Vec<SegmentRecord>,
+    stats: &mut AsStats,
+    accum: SegmentScanAccum,
+) {
+    candidates.extend(accum.candidates);
+    outward_read_ids.extend(accum.outward_read_ids);
+    prebuilt_segment_records.extend(accum.prebuilt_segment_records);
+    stats.add_candidates += accum.add_candidates;
     for (read_id, records) in accum.segment_groups {
-        state.segment_groups.entry(read_id).or_insert(records);
+        segment_groups.entry(read_id).or_insert(records);
     }
 }
 
