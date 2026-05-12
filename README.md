@@ -64,7 +64,8 @@ ciri \
 - `--linear-range-size-min`：线性竞争区间（默认 `50000`）
 - `-t, --threads`：线程数（默认为CPU可用核心数）
 - `-M, --mem-per-thread`：每线程内存预算（如 `2G`、`512M`，默认 `512M`）
-- `--debug`：逗号分隔的 read ID 列表，输出详细追踪到 `<prefix>.debug.log`
+- `--trace`：逗号分隔的 read ID 列表，输出详细追踪到 `<prefix>.trace.log`
+- `--debug`：保留内部临时文件（如 `.bsj1/.bsj2/.segments1/.segments2` 和 shard sidecar）
 - `--perf`：开启 profiling，自动写到 `<prefix>.perf.log`
 
 > 默认参数已对齐 CIRI3，推荐使用 `-s 0` 输出所有潜在 circRNA 后手动过滤，其他参数一般无需手动设置。

@@ -5,7 +5,7 @@
 
 use crate::index_compare::IndexCompare;
 use crate::runtime::{
-    emit_debug_line, emit_perf_line, scan1_profile_enabled, scan2_profile_enabled,
+    emit_perf_line, emit_trace_line, scan1_profile_enabled, scan2_profile_enabled,
     trace_hg2_enabled,
 };
 use std::collections::HashMap;
@@ -96,7 +96,7 @@ static HG2_PROFILE: Hg2Profile = Hg2Profile {
 ///
 /// This trace is intentionally separate from `CIRI_TRACE_ALL_CANDS`: the latter
 /// changes candidate traversal so developers can inspect the full search space,
-/// while `--debug` / `CIRI_TRACE_HG2` keep the original traversal and only
+/// while `--trace` / `CIRI_TRACE_HG2` keep the original traversal and only
 /// annotate which validator branch accepted or rejected a traced candidate.
 fn trace_scan2_hg2_enabled() -> bool {
     trace_hg2_enabled()
@@ -112,7 +112,7 @@ fn trace_scan2_hg2(stage: &str, circ_line_arr: &[String], extra: &str) {
     if !trace_scan2_hg2_enabled() {
         return;
     }
-    emit_debug_line(&format!(
+    emit_trace_line(&format!(
         "[TRACE_SCAN2_HG2] stage={} type={} strand={} chr={} site1={} site2={} mapq={} s2_ok={} str_len={} pair_len={} str3_len={} {}",
         stage,
         circ_line_arr[2],

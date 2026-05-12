@@ -8,7 +8,7 @@
 use crate::annotation::Annotation;
 use crate::is_bsj_hg2::{java_substring, report_scan1_hg_profile, IsBSJHg2};
 use crate::misd::misd;
-use crate::runtime::{emit_debug_line, emit_perf_line, scan1_profile_enabled, should_trace_read};
+use crate::runtime::{emit_perf_line, emit_trace_line, scan1_profile_enabled, should_trace_read};
 use crate::utils::{
     bam_shard_count, clip_sequence_payload, local_clip_evidence_lines, part_path, AlignmentRecord,
 };
@@ -99,7 +99,7 @@ fn advise_dontneed_aligned(mmap: &Mmap, offset: usize, len: usize) {
 
 /// Emits shard-boundary trace lines for targeted BAM parity debugging.
 ///
-/// This stays behind the same targeted read-selection logic used by `--debug`
+/// This stays behind the same targeted read-selection logic used by `--trace`
 /// and `CIRI_TRACE_READS`, so it can remain in the codebase without affecting
 /// normal runs. The output is intentionally narrow: only shard ownership
 /// decisions around read-group boundaries are logged.
@@ -113,7 +113,7 @@ fn trace_bam_shard_event(
     abs_c_pos: usize,
 ) {
     if should_trace_read(read_id) {
-        emit_debug_line(&format!(
+        emit_trace_line(&format!(
             "[TRACE_SCAN1_SHARD] shard={} stage={} id={} start={} block_start={} end={} abs_c_pos={}",
             shard_idx, stage, read_id, start, block_start, end, abs_c_pos
         ));
@@ -1619,7 +1619,7 @@ impl Scan1 {
         validator: &mut IsBSJHg2,
         profile: Option<&Scan1Profile>,
     ) -> Option<(String, String, String)> {
-        // Debug trace is intentionally read-scoped to avoid overwhelming output.
+        // Read tracing is intentionally read-scoped to avoid overwhelming output.
         let trace_read = should_trace_read(read_id);
         let [pair1, pair2] = group;
         let group_count =
@@ -1844,7 +1844,7 @@ impl Scan1 {
                             adj2.to_string(),
                         ];
                         if trace_read {
-                            emit_debug_line(&format!(
+                            emit_trace_line(&format!(
                                 "[TRACE_SCAN1_CAND] id={} n={} al1=({}, {}, {}, {}) al2=({}, {}, {}, {}) c1={:?} c2={:?} s1_n={} s2_n={} adj1={} adj2={} q=({},{},{}) s4_ok={} line_arr6_8={}/{}/{}",
                                 read_id,
                                 n,
@@ -1895,7 +1895,7 @@ impl Scan1 {
                                 }
                             }
                             if trace_read {
-                                emit_debug_line(&format!(
+                                emit_trace_line(&format!(
                                     "[TRACE_SCAN1_HG1] id={} result={} post_line_arr6_8={}/{}/{} sites={}->{}",
                                     read_id,
                                     if res.is_some() { "Some" } else { "None" },
@@ -2155,7 +2155,7 @@ impl Scan1 {
                         adj2.to_string(),
                     ];
                     if trace_read {
-                        emit_debug_line(&format!(
+                        emit_trace_line(&format!(
                             "[TRACE_SCAN1_DISPLAY] id={} slot={} al1=({}, {}, {}, {}) al2=({}, {}, {}, {}) c1={:?} c2={:?} s1_n={} s2_n={} adj1={} adj2={} q=({},{},{}) s4_ok={}",
                             read_id,
                             slot,

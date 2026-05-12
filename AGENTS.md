@@ -7,6 +7,7 @@
 - **Java 逻辑即规范**：`vendor/CIRI3` 是唯一行为标准，Rust 必须复现相同决策与输出。
 - **一致性优先于“聪明修复”**：已知 Java 行为时，不允许引入补偿性启发式逻辑。
 - **先对齐再优化**：仅在行为一致后再做性能优化。
+- **大规模可扩展性优先于速度**：面向真实全量 BAM/SAM、超大 sidecar 或 whole-genome hg38 数据时，优化目标首先是保证内存有明确上界、可流式/分片处理、不会随 read/row/alignment 全量线性驻留；在 scalability 和内存安全成立后，才进一步优化 wall-clock 时间和 CPU 吞吐。
 - **测试覆盖关键逻辑**：BSJ 识别、CIGAR 分类、Scan2 救援（rescue）、Summary 合并与严格度（stringency）过滤都应有验证。
 - **小步快跑、每步验证**：每次改动后都要立刻做差异比较。
 - **扩展模块不反向污染主流程**：CIRI-AS / CIRI-full / RO feature 等扩展能力默认作为 sidecar 或后处理推进，未完成验证前不得改变 `Scan1 -> Scan2 -> Summary` 的既有输出。
@@ -94,6 +95,7 @@
 - **阶段结论**：功能对齐已完成，当前版本可作为首个正式功能版本。
 - **全量 hg38 口径**：使用 `/data/public/database/gencode/hg38/gencode.v44.annotation.gtf` 与 Java 基线一致地复核 whole-genome parity。
 - **版本目标**：在不改变任何判定结果的前提下，继续推进性能优化（优先 Scan1/Scan2 I/O 路径）。
+- **性能优先级**：所有真实大数据路径的优化应先控制峰值 RSS 和临时 I/O 上界，优先采用 Scan1/Scan2 式 shard-local spill、bounded merge、按需回读和流式写出；只有在确认不会 OOM 或长时间持有全量 read-level 结构后，才允许用更多内存换取计算速度。
 - **变更红线**：
   - 任何优化提交都必须通过 `scripts/ciri_result_diff.py` 三层零差异检查。
   - 若出现差异，先回到行为对齐再谈性能。

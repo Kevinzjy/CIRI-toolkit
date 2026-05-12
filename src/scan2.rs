@@ -7,7 +7,7 @@
 use crate::is_bsj_hg2::{report_scan2_hg_profile, IsBSJHg2};
 use crate::misd::misd;
 use crate::runtime::{
-    emit_debug_line, emit_perf_line, scan2_profile_enabled, should_trace_read, with_trace_hg2_scope,
+    emit_perf_line, emit_trace_line, scan2_profile_enabled, should_trace_read, with_trace_hg2_scope,
 };
 use crate::utils::{
     bam_shard_count, bsj_is_summary_priority, bsj_payload_start, clip_sequence_payload,
@@ -2496,7 +2496,7 @@ impl Scan2 {
                                 }
                             }
                             if trace_read {
-                                emit_debug_line(&format!(
+                                emit_trace_line(&format!(
                                     "[TRACE_SCAN2_CAND] id={} type=sm seg={} aln_pos={} chr={} site1={} site2={} cand_site={} cigar={} mapq={} s2_ok={} str_len={} pair_len={} tag={}",
                                     id,
                                     seg_idx,
@@ -2686,7 +2686,7 @@ impl Scan2 {
                                 }
                             }
                             if trace_read {
-                                emit_debug_line(&format!(
+                                emit_trace_line(&format!(
                                     "[TRACE_SCAN2_CAND] id={} type=ms seg={} aln_pos={} chr={} site1={} site2={} cand_site={} cigar={} mapq={} s2_ok={} str_len={} pair_len={} tag={}",
                                     id,
                                     seg_idx,
@@ -2931,7 +2931,7 @@ impl Scan2 {
                                 is_bsj_hg2.is_bsj_hg2(&circ_c, chr_tcga_map.get(chr).unwrap())
                             });
                             if trace_read {
-                                emit_debug_line(&format!(
+                                emit_trace_line(&format!(
                                     "[TRACE_SCAN2_DISPLAY] id={} type=sm seg={} aln_pos={} chr={} site1={} site2={} cand_site={} cigar={} mapq={} tag={}",
                                     id,
                                     seg_idx,
@@ -3086,7 +3086,7 @@ impl Scan2 {
                                 is_bsj_hg2.is_bsj_hg2(&circ_c, chr_tcga_map.get(chr).unwrap())
                             });
                             if trace_read {
-                                emit_debug_line(&format!(
+                                emit_trace_line(&format!(
                                     "[TRACE_SCAN2_DISPLAY] id={} type=ms seg={} aln_pos={} chr={} site1={} site2={} cand_site={} cigar={} mapq={} tag={}",
                                     id,
                                     seg_idx,

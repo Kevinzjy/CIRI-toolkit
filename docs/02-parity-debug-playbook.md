@@ -60,19 +60,19 @@ python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-r
 
 ### 4.1 追踪指定 read
 
-推荐入口是 CLI `--debug`，环境变量方式保留给临时调试或脚本兼容。
+推荐入口是 CLI `--trace`，环境变量方式保留给临时调试或脚本兼容。
 
 ```bash
 ./target/release/ciri \
   -i tests/chr1/test.bam \
-  -o tests/chr1/CIRI-rs.trace \
+  -o tests/chr1/CIRI-rs \
   -r tests/chr1/chr1.fa \
   -a tests/chr1/chr1.gtf \
-  --debug "simulate:7037,simulate:7050" \
+  --trace "simulate:7037,simulate:7050" \
   -t 16
 ```
 
-详细 trace 会写到 `tests/chr1/CIRI-rs.trace.debug.log`。
+详细 trace 会写到 `tests/chr1/CIRI-rs.trace.log`。
 
 兼容旧入口：
 

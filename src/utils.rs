@@ -404,8 +404,8 @@ pub fn parse_mem_str(mem_str: &str) -> u64 {
 /// Returns the final Summary output path for one CLI `-o/--out` prefix.
 ///
 /// The CLI now treats `-o` strictly as a prefix so all outputs follow one
-/// predictable scheme: `<prefix>.out`, `<prefix>.bsj1`, `<prefix>.bsj`,
-/// and `<prefix>.fsj`.
+/// predictable scheme. Stage-local files such as `.bsj1/.bsj2` are now
+/// implementation details that the CLI removes unless `--debug` is set.
 ///
 /// Keeping the naming centralized here avoids another round of drift between
 /// CLI help, logging, temporary-file cleanup, and test fixtures.
@@ -421,12 +421,12 @@ pub fn log_path_for_output(output_arg: &str) -> String {
     format!("{}.log", output_arg)
 }
 
-/// Returns the targeted debug trace path for one CLI prefix.
+/// Returns the targeted read-trace path for one CLI prefix.
 ///
-/// `--debug` writes verbose per-read processing traces here so they do not get
+/// `--trace` writes verbose per-read processing traces here so they do not get
 /// mixed into the always-on stage summary log.
-pub fn debug_path_for_output(output_arg: &str) -> String {
-    format!("{}.debug.log", output_arg)
+pub fn trace_path_for_output(output_arg: &str) -> String {
+    format!("{}.trace.log", output_arg)
 }
 
 /// Returns the profiling report path for one CLI prefix.

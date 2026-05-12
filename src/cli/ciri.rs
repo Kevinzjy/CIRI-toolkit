@@ -20,10 +20,10 @@ use crate::scan1::Scan1;
 use crate::scan2::Scan2;
 use crate::summary::Summary;
 use crate::utils::{
-    bsj1_path_for_output, bsj2_path_for_output, bsj_path_for_output, debug_path_for_output,
-    fsj_path_for_output, log_path_for_output, parse_mem_str, perf_path_for_output,
-    result_path_for_output, segments1_path_for_output, segments2_path_for_output,
-    segments_non_bsj_path_for_output,
+    bsj1_path_for_output, bsj2_path_for_output, bsj_path_for_output, fsj_path_for_output,
+    log_path_for_output, parse_mem_str, perf_path_for_output, result_path_for_output,
+    segments1_path_for_output, segments2_path_for_output, segments_non_bsj_path_for_output,
+    trace_path_for_output,
 };
 
 /// Parsed command-line arguments for the end-to-end pipeline.
@@ -42,7 +42,7 @@ struct Args {
     #[arg(short = 'i', long = "in")]
     in_sam: String,
 
-    /// Output prefix; the pipeline writes `<prefix>.out/.bsj1/.bsj`
+    /// Output prefix; final outputs include `<prefix>.out/.bsj/.segments`
     #[arg(short = 'o', long = "out")]
     out_prefix: String,
 
@@ -84,9 +84,13 @@ struct Args {
 
     /// Comma-separated read IDs to trace through Scan1/Scan2.
     ///
-    /// When set, detailed trace lines are written to `<prefix>.debug.log`.
-    #[arg(long = "debug")]
-    debug_reads: Option<String>,
+    /// When set, detailed trace lines are written to `<prefix>.trace.log`.
+    #[arg(long = "trace", value_name = "READS")]
+    trace_reads: Option<String>,
+
+    /// Keep internal pipeline temporary files for debugging.
+    #[arg(long = "debug", default_value_t = false)]
+    debug: bool,
 
     /// Enable profiling and write the report to `<prefix>.perf.log`.
     #[arg(long = "perf", default_value_t = false)]
@@ -165,7 +169,7 @@ pub fn main() -> Result<()> {
     let mem_limit = parse_mem_str(&args.mem_per_thread);
     let result_output = result_path_for_output(&args.out_prefix);
     let log_output = log_path_for_output(&args.out_prefix);
-    let debug_output = debug_path_for_output(&args.out_prefix);
+    let trace_output = trace_path_for_output(&args.out_prefix);
     let perf_output = perf_path_for_output(&args.out_prefix);
     let bsj1_output = bsj1_path_for_output(&args.out_prefix);
     let bsj_output = bsj_path_for_output(&args.out_prefix);
@@ -177,8 +181,8 @@ pub fn main() -> Result<()> {
     let mut log_writer = BufWriter::new(File::create(&log_output)?);
 
     init_runtime(
-        args.debug_reads.as_deref(),
-        args.debug_reads.as_ref().map(|_| debug_output.as_str()),
+        args.trace_reads.as_deref(),
+        args.trace_reads.as_ref().map(|_| trace_output.as_str()),
         args.perf.then_some(perf_output.as_str()),
     )?;
 
@@ -211,8 +215,15 @@ pub fn main() -> Result<()> {
         InputFormat::Sam => "SAM (text-based)",
     };
     log_info(&mut log_writer, "Input format", format_str)?;
-    if args.debug_reads.is_some() {
-        log_info(&mut log_writer, "Debug trace", &debug_output)?;
+    if args.trace_reads.is_some() {
+        log_info(&mut log_writer, "Read trace", &trace_output)?;
+    }
+    if args.debug {
+        log_info(
+            &mut log_writer,
+            "Debug temp",
+            "Keeping internal temporary files after successful completion",
+        )?;
     }
     if args.perf {
         log_info(&mut log_writer, "Perf report", &perf_output)?;
@@ -341,13 +352,11 @@ pub fn main() -> Result<()> {
         segment_evidence_paths: vec![&segments1_output, &segments2_output],
         non_bsj_segment_evidence_paths,
         out_prefix: &args.out_prefix,
+        keep_temp_files: args.debug,
         reference: &fasta.chr_tcga_map,
         annotation: args.gtf.as_ref().map(|_| &annotation),
         progress_log: Some(&mut segment_progress_log),
     });
-    for path in &scan2_segment_artifacts.non_bsj_segment_evidence_paths {
-        let _ = std::fs::remove_file(path);
-    }
     let segment_summary = segment_summary_result?;
     log_info(
         &mut log_writer,
@@ -372,5 +381,38 @@ pub fn main() -> Result<()> {
         &format!("{:.2} seconds", run_started.elapsed().as_secs_f64()),
     )?;
 
+    if !args.debug {
+        cleanup_pipeline_temp_files(
+            &[
+                &bsj1_output,
+                &bsj2_output,
+                &segments1_output,
+                &segments2_output,
+                &segments_non_bsj_output,
+                &fsj_output,
+            ],
+            &scan2_segment_artifacts.non_bsj_segment_evidence_paths,
+        );
+    }
+
     Ok(())
+}
+
+/// Removes internal stage sidecars after the final user-facing outputs exist.
+///
+/// Official CLI outputs should remain focused on the final result files. The
+/// intermediate `.bsj1/.bsj2/.segments1/.segments2` stems are implementation
+/// details kept only when `--debug` is set, while shard paths are removed here
+/// because Scan1/Scan2/segments may leave either merged stems or `.part_*.tmp`
+/// files depending on which fast path was active.
+fn cleanup_pipeline_temp_files(stems: &[&str], extra_paths: &[String]) {
+    for path in extra_paths {
+        let _ = std::fs::remove_file(path);
+    }
+    for stem in stems {
+        let _ = std::fs::remove_file(stem);
+        for idx in 0..rayon::current_num_threads().max(1) {
+            let _ = std::fs::remove_file(crate::utils::part_path(stem, idx));
+        }
+    }
 }

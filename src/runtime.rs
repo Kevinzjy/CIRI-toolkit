@@ -15,8 +15,8 @@ use std::sync::{Mutex, OnceLock};
 
 /// Process-wide runtime diagnostics options initialized from the CLI.
 struct RuntimeConfig {
-    debug_reads: HashSet<String>,
-    debug_writer: Option<Mutex<BufWriter<File>>>,
+    trace_reads: HashSet<String>,
+    trace_writer: Option<Mutex<BufWriter<File>>>,
     perf_writer: Option<Mutex<BufWriter<File>>>,
 }
 
@@ -25,21 +25,21 @@ static RUNTIME_CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
 thread_local! {
     /// Tracks whether the current thread is inside a traced `is_bsj_hg2` call.
     ///
-    /// This keeps `--debug` focused on the requested read IDs instead of turning
+    /// This keeps `--trace` focused on the requested read IDs instead of turning
     /// on verbose validator branch logging for every candidate in the process.
     static TRACE_HG2_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Initializes the optional debug/perf outputs for the current process.
+/// Initializes the optional trace/perf outputs for the current process.
 ///
 /// This should be called once near startup. Later calls are ignored so tests
 /// and library users do not need to coordinate teardown.
 pub fn init_runtime(
-    debug_reads: Option<&str>,
-    debug_log_path: Option<&str>,
+    trace_reads: Option<&str>,
+    trace_log_path: Option<&str>,
     perf_path: Option<&str>,
 ) -> Result<()> {
-    let reads = debug_reads
+    let reads = trace_reads
         .map(|raw| {
             raw.split(',')
                 .filter_map(|token| {
@@ -49,7 +49,7 @@ pub fn init_runtime(
                 .collect::<HashSet<_>>()
         })
         .unwrap_or_default();
-    let debug_writer = match (debug_log_path, reads.is_empty()) {
+    let trace_writer = match (trace_log_path, reads.is_empty()) {
         (Some(path), false) => Some(Mutex::new(BufWriter::new(File::create(path)?))),
         _ => None,
     };
@@ -58,8 +58,8 @@ pub fn init_runtime(
         None => None,
     };
     let _ = RUNTIME_CONFIG.set(RuntimeConfig {
-        debug_reads: reads,
-        debug_writer,
+        trace_reads: reads,
+        trace_writer,
         perf_writer,
     });
     Ok(())
@@ -69,7 +69,7 @@ pub fn init_runtime(
 #[inline]
 pub fn should_trace_read(read_id: &str) -> bool {
     if let Some(config) = RUNTIME_CONFIG.get() {
-        if config.debug_reads.contains(read_id) {
+        if config.trace_reads.contains(read_id) {
             return true;
         }
     }
@@ -84,12 +84,12 @@ pub fn should_trace_read(read_id: &str) -> bool {
     false
 }
 
-/// Returns whether any CLI-provided debug reads are active.
+/// Returns whether any CLI-provided trace reads are active.
 #[inline]
-pub fn cli_debug_enabled() -> bool {
+pub fn cli_trace_enabled() -> bool {
     RUNTIME_CONFIG
         .get()
-        .is_some_and(|config| !config.debug_reads.is_empty())
+        .is_some_and(|config| !config.trace_reads.is_empty())
 }
 
 /// Executes a closure while enabling `is_bsj_hg2` branch tracing on this thread.
@@ -130,10 +130,10 @@ pub fn scan2_profile_enabled() -> bool {
         || matches!(std::env::var("CIRI_PROFILE_SCAN2"), Ok(v) if !v.is_empty() && v != "0")
 }
 
-/// Emits one debug trace line either to the configured file or to stderr.
-pub fn emit_debug_line(line: &str) {
+/// Emits one targeted read-trace line either to the configured file or stderr.
+pub fn emit_trace_line(line: &str) {
     if let Some(config) = RUNTIME_CONFIG.get() {
-        if let Some(writer) = &config.debug_writer {
+        if let Some(writer) = &config.trace_writer {
             let mut writer = writer.lock().unwrap();
             let _ = writeln!(writer, "{}", line);
             let _ = writer.flush();
