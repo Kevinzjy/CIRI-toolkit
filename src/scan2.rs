@@ -151,12 +151,17 @@ pub(crate) struct Scan2Profile {
     validator_call_ns: AtomicU64,
     display_ns: AtomicU64,
     segment_sidecar_ns: AtomicU64,
+    non_bsj_sidecar_ns: AtomicU64,
     write_ns: AtomicU64,
     merge_ns: AtomicU64,
     records: AtomicU64,
     groups: AtomicU64,
     candidate_checks: AtomicU64,
     candidate_hits: AtomicU64,
+    segment_sidecar_rows: AtomicU64,
+    segment_sidecar_bytes: AtomicU64,
+    non_bsj_sidecar_rows: AtomicU64,
+    non_bsj_sidecar_bytes: AtomicU64,
 }
 
 /// Mate-level Scan1 claims used to gate Scan2 display-only rescue rows.
@@ -225,15 +230,21 @@ impl Scan2Profile {
         let validator_call_ns = self.validator_call_ns.load(Ordering::Relaxed);
         let display_ns = self.display_ns.load(Ordering::Relaxed);
         let segment_sidecar_ns = self.segment_sidecar_ns.load(Ordering::Relaxed);
+        let non_bsj_sidecar_ns = self.non_bsj_sidecar_ns.load(Ordering::Relaxed);
         let write_ns = self.write_ns.load(Ordering::Relaxed);
         let merge_ns = self.merge_ns.load(Ordering::Relaxed);
         let records = self.records.load(Ordering::Relaxed);
         let groups = self.groups.load(Ordering::Relaxed);
         let candidate_checks = self.candidate_checks.load(Ordering::Relaxed);
         let candidate_hits = self.candidate_hits.load(Ordering::Relaxed);
+        let segment_sidecar_rows = self.segment_sidecar_rows.load(Ordering::Relaxed);
+        let segment_sidecar_bytes = self.segment_sidecar_bytes.load(Ordering::Relaxed);
+        let non_bsj_sidecar_rows = self.non_bsj_sidecar_rows.load(Ordering::Relaxed);
+        let non_bsj_sidecar_bytes = self.non_bsj_sidecar_bytes.load(Ordering::Relaxed);
         let accounted_ns = group_process_ns
             .saturating_add(display_ns)
             .saturating_add(segment_sidecar_ns)
+            .saturating_add(non_bsj_sidecar_ns)
             .saturating_add(write_ns);
         let other_shard_ns = shard_total_ns.saturating_sub(accounted_ns);
         let pct = |part: u64, whole: u64| -> f64 {
@@ -254,7 +265,7 @@ impl Scan2Profile {
             candidate_hits,
         ));
         emit_perf_line(&format!(
-            "[PROFILE_SCAN2] shard_breakdown_ms group_process={:.3} ({:.1}%) validator={:.3} ({:.1}% of group) display={:.3} ({:.1}%) segment_sidecar={:.3} ({:.1}%) write={:.3} ({:.1}%) other={:.3} ({:.1}%)",
+            "[PROFILE_SCAN2] shard_breakdown_ms group_process={:.3} ({:.1}%) validator={:.3} ({:.1}% of group) display={:.3} ({:.1}%) segment_sidecar={:.3} ({:.1}%) non_bsj_sidecar={:.3} ({:.1}%) write={:.3} ({:.1}%) other={:.3} ({:.1}%)",
             group_process_ns as f64 / 1_000_000.0,
             pct(group_process_ns, shard_total_ns),
             validator_call_ns as f64 / 1_000_000.0,
@@ -263,10 +274,19 @@ impl Scan2Profile {
             pct(display_ns, shard_total_ns),
             segment_sidecar_ns as f64 / 1_000_000.0,
             pct(segment_sidecar_ns, shard_total_ns),
+            non_bsj_sidecar_ns as f64 / 1_000_000.0,
+            pct(non_bsj_sidecar_ns, shard_total_ns),
             write_ns as f64 / 1_000_000.0,
             pct(write_ns, shard_total_ns),
             other_shard_ns as f64 / 1_000_000.0,
             pct(other_shard_ns, shard_total_ns),
+        ));
+        emit_perf_line(&format!(
+            "[PROFILE_SCAN2_SIDECAR] bsj_rows={} bsj_bytes={} non_bsj_rows={} non_bsj_bytes={}",
+            segment_sidecar_rows,
+            segment_sidecar_bytes,
+            non_bsj_sidecar_rows,
+            non_bsj_sidecar_bytes,
         ));
     }
 }
@@ -1839,13 +1859,37 @@ impl Scan2 {
                 *merged_fsj.entry(key).or_insert(0) += count;
             }
             if let Some(segments_writer) = segments_writer.as_deref_mut() {
+                let mut rows = 0_u64;
+                let mut bytes = 0_u64;
                 for line in evidence {
+                    rows += 1;
+                    bytes += line.len() as u64 + 1;
                     writeln!(segments_writer, "{}", line)?;
+                }
+                if let Some(profile) = profile {
+                    profile
+                        .segment_sidecar_rows
+                        .fetch_add(rows, Ordering::Relaxed);
+                    profile
+                        .segment_sidecar_bytes
+                        .fetch_add(bytes, Ordering::Relaxed);
                 }
             }
             if let Some(non_bsj_segments_writer) = non_bsj_segments_writer.as_deref_mut() {
+                let mut rows = 0_u64;
+                let mut bytes = 0_u64;
                 for line in non_bsj_evidence {
+                    rows += 1;
+                    bytes += line.len() as u64 + 1;
                     writeln!(non_bsj_segments_writer, "{}", line)?;
+                }
+                if let Some(profile) = profile {
+                    profile
+                        .non_bsj_sidecar_rows
+                        .fetch_add(rows, Ordering::Relaxed);
+                    profile
+                        .non_bsj_sidecar_bytes
+                        .fetch_add(bytes, Ordering::Relaxed);
                 }
             }
         }
@@ -2088,6 +2132,8 @@ impl Scan2 {
                         if has_bsj {
                             let mut bsj_lines = res_batch.clone();
                             bsj_lines.extend(display_lines.iter().cloned());
+                            let mut rows = 0_u64;
+                            let mut bytes = 0_u64;
                             for line in Self::segment_evidence_lines_with_local(
                                 &id_str,
                                 "scan2",
@@ -2096,7 +2142,17 @@ impl Scan2 {
                                 &bsj_lines,
                                 chr_tcga_map,
                             ) {
+                                rows += 1;
+                                bytes += line.len() as u64 + 1;
                                 writeln!(segments_writer, "{}", line)?;
+                            }
+                            if let Some(profile) = profile {
+                                profile
+                                    .segment_sidecar_rows
+                                    .fetch_add(rows, Ordering::Relaxed);
+                                profile
+                                    .segment_sidecar_bytes
+                                    .fetch_add(bytes, Ordering::Relaxed);
                             }
                         }
                         if let (Some(profile), Some(segment_started)) = (profile, segment_started) {
@@ -2108,10 +2164,29 @@ impl Scan2 {
                     }
                     if !has_bsj {
                         if let Some(non_bsj_segments_writer) = non_bsj_segments_writer.as_mut() {
+                            let non_bsj_started = profile.map(|_| Instant::now());
+                            let mut rows = 0_u64;
+                            let mut bytes = 0_u64;
                             for line in
                                 Self::non_bsj_segment_evidence_lines(&id_str, &all_alignments)
                             {
+                                rows += 1;
+                                bytes += line.len() as u64 + 1;
                                 writeln!(non_bsj_segments_writer, "{}", line)?;
+                            }
+                            if let (Some(profile), Some(non_bsj_started)) =
+                                (profile, non_bsj_started)
+                            {
+                                profile.non_bsj_sidecar_ns.fetch_add(
+                                    non_bsj_started.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                                profile
+                                    .non_bsj_sidecar_rows
+                                    .fetch_add(rows, Ordering::Relaxed);
+                                profile
+                                    .non_bsj_sidecar_bytes
+                                    .fetch_add(bytes, Ordering::Relaxed);
                             }
                         }
                     }
@@ -2278,6 +2353,8 @@ impl Scan2 {
                 if has_bsj {
                     let mut bsj_lines = res_batch.clone();
                     bsj_lines.extend(display_lines.iter().cloned());
+                    let mut rows = 0_u64;
+                    let mut bytes = 0_u64;
                     for line in Self::segment_evidence_lines_with_local(
                         &id_str,
                         "scan2",
@@ -2286,7 +2363,17 @@ impl Scan2 {
                         &bsj_lines,
                         chr_tcga_map,
                     ) {
+                        rows += 1;
+                        bytes += line.len() as u64 + 1;
                         writeln!(segments_writer, "{}", line)?;
+                    }
+                    if let Some(profile) = profile {
+                        profile
+                            .segment_sidecar_rows
+                            .fetch_add(rows, Ordering::Relaxed);
+                        profile
+                            .segment_sidecar_bytes
+                            .fetch_add(bytes, Ordering::Relaxed);
                     }
                 }
                 if let (Some(profile), Some(segment_started)) = (profile, segment_started) {
@@ -2298,8 +2385,25 @@ impl Scan2 {
             }
             if !has_bsj {
                 if let Some(non_bsj_segments_writer) = non_bsj_segments_writer.as_mut() {
+                    let non_bsj_started = profile.map(|_| Instant::now());
+                    let mut rows = 0_u64;
+                    let mut bytes = 0_u64;
                     for line in Self::non_bsj_segment_evidence_lines(&id_str, &all_alignments) {
+                        rows += 1;
+                        bytes += line.len() as u64 + 1;
                         writeln!(non_bsj_segments_writer, "{}", line)?;
+                    }
+                    if let (Some(profile), Some(non_bsj_started)) = (profile, non_bsj_started) {
+                        profile.non_bsj_sidecar_ns.fetch_add(
+                            non_bsj_started.elapsed().as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
+                        profile
+                            .non_bsj_sidecar_rows
+                            .fetch_add(rows, Ordering::Relaxed);
+                        profile
+                            .non_bsj_sidecar_bytes
+                            .fetch_add(bytes, Ordering::Relaxed);
                     }
                 }
             }

@@ -13,7 +13,7 @@
 2. `02-parity-debug-playbook.md`
    - Java 与 Rust 不一致时的标准排查手册（SOP），包含按具体 read trace 的命令模板与 FSJ 对齐检查口径。
 3. `03-performance-optimization.md`
-   - 性能优化阶段的统一总结、测量规范、维护约束，以及 Scan1 profiling 专项记录。
+   - 性能优化阶段的统一总结、测量规范、维护约束，以及 Scan1 / Scan2 / segments profiling 专项记录。
 4. `CIRI3.md`
    - CIRI3 Java 逻辑拆解、Rust parity 经验、`.bsj1/.bsj2/.bsj` mate-level 协议和 `priority` 语义。
 5. `04-BSJ_scoring.md`
@@ -23,7 +23,7 @@
 7. `06-simulation-truth-design.md`
    - 独立 Rust 模拟器、结构化 truth 表、circ/isoform fixture 生成和后续结构验证口径。
 8. `07-full-length-reconstruction.md`
-   - 基于 confirmed BSJ、second BAM/SAM sweep 和局部 splice graph 的 CIRI-AS-style full-length 结构识别设计。
+   - 默认 `<prefix>.segments` 后处理设计，包含 BSJ/backward/outward read-level chain、内部 junction 校正、major isoform GTF/FASTA sidecar、临时 sidecar 协议、IGV visualization sidecar 规划和后续 full-length 扩展入口。
 9. `CIRI-AS.md`
    - CIRI-AS 上游脚本功能拆解；当前作为 circRNA 内部结构识别思路参考，不作为完整 parity 目标，并记录 annotation-aware motif/offset 等有意偏离 Perl 的规则。
 10. `CIRI-full.md`
@@ -36,7 +36,10 @@
 - CIRI-AS-style full-length reconstruction 的阶段性设计写入 `07-full-length-reconstruction.md`；RO side evidence 设计保留在 `05-ro-feature-plan.md`；独立模拟器与 truth 输出设计写入 `06-simulation-truth-design.md`。
 - CIRI-AS / CIRI-full 相关实现若有意偏离上游历史输出，必须同步写入对应拆解文档，说明偏离原因、验证口径和对主 CIRI3 parity 的隔离方式。
 - 避免跨文档重复维护同一检查清单。
-- 所有临时文件统一放在 `tmp/`，不要散落在 `tests/` 或项目根目录。
+- 正式用户输出协议当前限定为 `<prefix>.out`、`<prefix>.bsj`、`<prefix>.segments`、`<prefix>.isoforms.gtf` 和 `<prefix>.isoforms.fa`；`.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj` 及 `.part_XXXX.tmp` 都是内部临时文件。
+- 多线程临时文件统一使用 `<merged-path>.part_XXXX.tmp` 命名，默认成功运行后删除；只有 `--debug` 才保留。
+- `--continue` 是普通命令的附加执行模式，不改变必填参数；它只从 `<prefix>.segments` 或 `<prefix>.out + <prefix>.bsj` 这两类合并完成的断点恢复，`.part_XXXX.tmp` 和其他 shard-local 临时文件不作为断点。
+- 所有一次性探针脚本、临时分析产物和手工测试输出统一放在 `tmp/`，不要散落在 `tests/` 或项目根目录。
 
 ---
-最后更新：2026-05-04
+最后更新：2026-05-17

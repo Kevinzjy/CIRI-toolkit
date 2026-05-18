@@ -66,14 +66,23 @@
   - 读段归属（read-assignment）层面
 - 除非正在做必须依赖 debug build 的单元级调试，否则涉及真实 SAM/BAM fixture、CIRI3/CIRI-AS parity 或性能观察的流程应使用 `--release` 模式运行，以避免 debug build 的额外耗时干扰迭代。
 - 可选定向追踪：
-  - `CIRI_TRACE_READS`：按读段 ID（read ID）定向追踪
+  - CLI `--trace <READS>`：按读段 ID（read ID）定向追踪，写入 `<prefix>.trace.log`
+  - `CIRI_TRACE_READS`：兼容旧脚本的按 read ID 定向追踪入口
   - `CIRI_TRACE_ALL_CANDS=1`：仅用于调试时查看被追踪读段（traced read）的 Scan2 全候选
+- 性能 profiling：
+  - CLI `--perf`：主流程 profiling 写入 `<prefix>.perf.log`
+  - 兼容旧入口：`CIRI_PROFILE_SCAN1=1` / `CIRI_PROFILE_SCAN2=1`
+  - `CIRI_PROFILE_SEGMENTS=1`：segments 内部阶段计时
+- `--debug` 只表示保留内部临时文件，不等同于 trace 或 profiling。
 - 调试结束后必须关闭追踪（trace）环境变量，再跑最终验证。
 - 详细操作手册见：
   - `docs/02-parity-debug-playbook.md`
   - `docs/00-index.md`
 
 ## 临时文件规范
+- 当前正式用户输出限定为 `<prefix>.out`、`<prefix>.bsj` 和 `<prefix>.segments`；`.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj` 以及 `.part_XXXX.tmp` shard 文件都是内部临时文件。
+- 所有多进程/多线程 shard 临时文件统一使用合并后文件名加 `.part_XXXX.tmp` 后缀，例如 `<prefix>.segments.non_bsj.part_0001.tmp`。
+- 默认成功运行后删除内部临时文件；只有 CLI `--debug` 才保留。
 - 所有临时脚本输出、探针产物、一次性依赖下载统一放在 `tmp/` 目录下。
 - 不要在 `tests/`、`src/`、仓库根目录散落临时文件或编译中间产物。
 - `tmp/` 为本地工作区目录，不纳入版本控制。

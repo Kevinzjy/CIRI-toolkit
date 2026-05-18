@@ -31,6 +31,15 @@ const SHORT_CIRC_FULL_LENGTH_MAX_LEN: usize = 300;
 /// distribution instead of the ordinary PE mixture.
 const SHORT_CIRC_FULL_LENGTH_BIAS_FRACTION: f64 = 0.70;
 
+/// Minimum coordinate displacement required before simulator truth calls a
+/// non-BSJ circular pair `type=outward`.
+///
+/// The simulator does not have mapper MAPQ, alternative-hit, or soft-clip
+/// evidence, so truth-side outward is intentionally a stricter pair-geometry
+/// proxy: both outward-facing block boundaries must shift by at least the same
+/// 19 bp anchor used by BSJ-style terminal evidence.
+const OUTWARD_TRUTH_MIN_PAIR_OFFSET: usize = 19;
+
 /// Command-line options for the standalone simulator.
 ///
 /// Defaults approximate a compact PE150 RNA-seq fixture. The circular and
@@ -702,9 +711,10 @@ fn format_segments(
 
 /// Returns the genomic span of the first read-chain block for one mate.
 ///
-/// This mirrors the 5' end used by the RO-style outward truth rule. The first
-/// block is enough here because `type=outward` is a pair-level 5' overlap class;
-/// downstream exon-junction support is still carried by the full segment chain.
+/// This mirrors the first mapper-visible block used by the simulator's
+/// pair-orientation truth rule. The first block is enough here because
+/// `type=outward` is a pair-level orientation class; downstream exon-junction
+/// support is still carried by the full segment chain.
 fn first_read_chain_segment_span(
     source_map: &[SourceBase],
     start: usize,
@@ -746,13 +756,16 @@ fn first_read_chain_segment_span(
     Some((min_coord, max_coord))
 }
 
-/// Tests the simulator-side 5'RO-like outward truth geometry.
+/// Tests the simulator-side outward-facing pair truth geometry.
 ///
 /// R1 maps in the transcript strand direction, while R2 maps in the opposite
-/// direction because its emitted sequence is reverse-complemented. A true
-/// outward pair has overlapping 5' blocks and outward-facing 3' ends:
-/// `reverse.start < forward.start <= reverse.end < forward.end`.
-fn is_5p_ro_like_outward_truth(
+/// direction because its emitted sequence is reverse-complemented. A simulator
+/// `type=outward` pair requires the reverse-oriented block to sit left of the
+/// forward-oriented block with a clear 19 bp displacement at both block
+/// boundaries. Overlap is not required because the truth label describes
+/// observable pair orientation, not a RO-overlap subtype; however tiny shifts
+/// are left as `forward` so evaluation does not reward ambiguous outward calls.
+fn is_outward_facing_truth(
     source_map: &[SourceBase],
     strand: char,
     r1_start: usize,
@@ -770,9 +783,9 @@ fn is_5p_ro_like_outward_truth(
     } else {
         (r2_span, r1_span)
     };
-    reverse_span.0 < forward_span.0
-        && forward_span.0 <= reverse_span.1
-        && reverse_span.1 < forward_span.1
+    let start_offset = forward_span.0.saturating_sub(reverse_span.0);
+    let end_offset = forward_span.1.saturating_sub(reverse_span.1);
+    start_offset >= OUTWARD_TRUTH_MIN_PAIR_OFFSET && end_offset >= OUTWARD_TRUTH_MIN_PAIR_OFFSET
 }
 
 /// Samples a non-negative coverage value from the configured Gaussian model.
@@ -1126,25 +1139,24 @@ fn write_circular_reads(
                 format_segments(&source_map, circ.strand, r2_start, args.read_len, true);
             let is_bsj = r1_segments.is_bsj || r2_segments.is_bsj;
             let pair_crosses_boundary = crosses_boundary(r1_start, insert_len, seq_len);
-            let is_circular = pair_crosses_boundary || is_bsj;
-            // `outward` is the 5'RO-like subset of non-BSJ circular pairs. The
-            // remaining non-BSJ circular pairs stay separate as `backward`, so
-            // outward precision is not penalized by a broader circular-origin
-            // truth class.
-            let truth_type = if is_bsj {
-                "bsj"
-            } else if pair_crosses_boundary
-                && is_5p_ro_like_outward_truth(
+            // Simulator truth is restricted to read-level observable evidence.
+            // A read crossing the BSJ is already `bsj`; there is no separate
+            // truth-side `backward` bucket. Non-BSJ circular-origin fragments
+            // become `outward` only when their pair orientation is observable.
+            let is_outward = !is_bsj
+                && pair_crosses_boundary
+                && is_outward_facing_truth(
                     &source_map,
                     circ.strand,
                     r1_start,
                     r2_start,
                     args.read_len,
-                )
-            {
+                );
+            let is_circular = is_bsj || is_outward;
+            let truth_type = if is_bsj {
+                "bsj"
+            } else if is_outward {
                 "outward"
-            } else if pair_crosses_boundary {
-                "backward"
             } else {
                 "forward"
             };

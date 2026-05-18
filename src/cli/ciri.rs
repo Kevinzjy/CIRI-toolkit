@@ -4,15 +4,16 @@
 //! Keeping it separate from `src/bin/ciri.rs` lets the binary remain a thin
 //! wrapper while the behaviorally sensitive logic stays testable in the library.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::Local;
 use clap::Parser;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::Path;
 use std::time::Instant;
 
 use crate::annotation::Annotation;
-use crate::ciri_as::{run_ciri_as, AsConfig};
+use crate::ciri_as::{rebuild_major_isoforms_from_segments, run_ciri_as, AsConfig};
 use crate::fasta::FastaReader;
 use crate::runtime::init_runtime;
 use crate::sam_bam::{check_bam_sorting, detect_format, InputFormat};
@@ -38,11 +39,12 @@ use crate::utils::{
     long_about = None
 )]
 struct Args {
-    /// Path to the input SAM/BAM file
+    /// Path to the input SAM/BAM file.
     #[arg(short = 'i', long = "in")]
     in_sam: String,
 
-    /// Output prefix; final outputs include `<prefix>.out/.bsj/.segments`
+    /// Output prefix; final outputs include `.out`, `.bsj`, `.segments`,
+    /// `.isoforms.gtf`, and `.isoforms.fa` sidecars.
     #[arg(short = 'o', long = "out")]
     out_prefix: String,
 
@@ -95,6 +97,16 @@ struct Args {
     /// Enable profiling and write the report to `<prefix>.perf.log`.
     #[arg(long = "perf", default_value_t = false)]
     perf: bool,
+
+    /// Resume from the latest completed merged checkpoint.
+    ///
+    /// The resume logic intentionally ignores shard-local `.part_*.tmp` files.
+    /// If `<prefix>.segments` exists, only isoforms are rebuilt. Otherwise, if
+    /// `<prefix>.out` and `<prefix>.bsj` exist, segments and isoforms are rebuilt
+    /// from the input BAM/SAM. All normal required inputs still must be provided
+    /// so `--continue` stays an execution-mode switch, not a separate CLI shape.
+    #[arg(long = "continue", default_value_t = false)]
+    continue_run: bool,
 }
 
 /// Emits one aligned, timestamped progress line.
@@ -206,15 +218,6 @@ pub fn main() -> Result<()> {
         annotation.read_gtf(gtf_path)?;
     }
 
-    let format = detect_format(&args.in_sam)?;
-    let format_str = match format {
-        InputFormat::Bam => {
-            check_bam_sorting(&args.in_sam)?;
-            "BAM (queryname-sorted)"
-        }
-        InputFormat::Sam => "SAM (text-based)",
-    };
-    log_info(&mut log_writer, "Input format", format_str)?;
     if args.trace_reads.is_some() {
         log_info(&mut log_writer, "Read trace", &trace_output)?;
     }
@@ -227,6 +230,122 @@ pub fn main() -> Result<()> {
     }
     if args.perf {
         log_info(&mut log_writer, "Perf report", &perf_output)?;
+    }
+
+    let input_path = args.in_sam.as_str();
+    let format = detect_format(input_path)?;
+    let format_str = match format {
+        InputFormat::Bam => {
+            check_bam_sorting(input_path)?;
+            "BAM (queryname-sorted)"
+        }
+        InputFormat::Sam => "SAM (text-based)",
+    };
+    log_info(&mut log_writer, "Input format", format_str)?;
+
+    let segments_output = format!("{}.segments", args.out_prefix);
+    if args.continue_run {
+        if Path::new(&segments_output).is_file() {
+            if !Path::new(&result_output).is_file() {
+                bail!(
+                    "--continue found {} but missing required circRNA table {}",
+                    segments_output,
+                    result_output
+                );
+            }
+            log_info(
+                &mut log_writer,
+                "Continue",
+                "Resuming from completed .segments; rebuilding isoforms only...",
+            )?;
+            let major_isoforms = rebuild_major_isoforms_from_segments(
+                &result_output,
+                &segments_output,
+                &args.out_prefix,
+                &fasta.chr_tcga_map,
+                args.gtf.as_ref().map(|_| &annotation),
+            )?;
+            log_info(
+                &mut log_writer,
+                "Isoforms output",
+                &format!(
+                    "{}.isoforms.gtf, {}.isoforms.fa",
+                    args.out_prefix, args.out_prefix
+                ),
+            )?;
+            log_info(
+                &mut log_writer,
+                "Isoforms summary",
+                &format!("{} major isoforms", major_isoforms),
+            )?;
+            log_info(
+                &mut log_writer,
+                "Total runtime",
+                &format!("{:.2} seconds", run_started.elapsed().as_secs_f64()),
+            )?;
+            return Ok(());
+        }
+
+        if Path::new(&result_output).is_file() && Path::new(&bsj_output).is_file() {
+            log_info(
+                &mut log_writer,
+                "Continue",
+                "Resuming from completed .out/.bsj; rebuilding segments and isoforms...",
+            )?;
+            let mut segment_progress_log =
+                |label: &str, message: &str| log_info(&mut log_writer, label, message);
+            let segment_summary = run_ciri_as(AsConfig {
+                input_path,
+                circ_path: &result_output,
+                bsj_path: Some(&bsj_output),
+                segment_evidence_paths: Vec::new(),
+                non_bsj_segment_evidence_paths: Vec::new(),
+                out_prefix: &args.out_prefix,
+                keep_temp_files: args.debug,
+                reference: &fasta.chr_tcga_map,
+                annotation: args.gtf.as_ref().map(|_| &annotation),
+                min_mapq: args.min_mapq,
+                progress_log: Some(&mut segment_progress_log),
+            })?;
+            log_info(&mut log_writer, "Segments output", &segments_output)?;
+            log_info(
+                &mut log_writer,
+                "Segments summary",
+                &format!(
+                    "{} rows ({} BSJ, {} backward, {} outward)",
+                    segment_summary.total_segments,
+                    segment_summary.bsj_segments,
+                    segment_summary.backward_segments,
+                    segment_summary.outward_segments
+                ),
+            )?;
+            log_info(
+                &mut log_writer,
+                "Isoforms output",
+                &format!(
+                    "{}.isoforms.gtf, {}.isoforms.fa",
+                    args.out_prefix, args.out_prefix
+                ),
+            )?;
+            log_info(
+                &mut log_writer,
+                "Isoforms summary",
+                &format!("{} major isoforms", segment_summary.major_isoforms),
+            )?;
+            log_info(
+                &mut log_writer,
+                "Total runtime",
+                &format!("{:.2} seconds", run_started.elapsed().as_secs_f64()),
+            )?;
+            return Ok(());
+        }
+
+        bail!(
+            "--continue did not find a resumable checkpoint: expected {} or both {} and {}",
+            segments_output,
+            result_output,
+            bsj_output
+        );
     }
 
     // Stage boundaries are logged explicitly because most benchmarking and parity
@@ -245,7 +364,7 @@ pub fn main() -> Result<()> {
     );
     scan1.set_mem_limit(mem_limit);
     scan1.run_with_priority_and_segments(
-        &args.in_sam,
+        input_path,
         &bsj1_output,
         Some(&segments1_output),
         &fasta.chr_tcga_map,
@@ -281,7 +400,7 @@ pub fn main() -> Result<()> {
         "Curating splicing signals & counting FSJs...",
     )?;
     let scan2_segment_artifacts = scan2.run_with_display_and_segments(
-        &args.in_sam,
+        input_path,
         &bsj2_output,
         &fsj_output,
         Some(&bsj1_output),
@@ -346,7 +465,7 @@ pub fn main() -> Result<()> {
         .map(String::as_str)
         .collect();
     let segment_summary_result = run_ciri_as(AsConfig {
-        input_path: &args.in_sam,
+        input_path,
         circ_path: &result_output,
         bsj_path: Some(&bsj_output),
         segment_evidence_paths: vec![&segments1_output, &segments2_output],
@@ -355,6 +474,7 @@ pub fn main() -> Result<()> {
         keep_temp_files: args.debug,
         reference: &fasta.chr_tcga_map,
         annotation: args.gtf.as_ref().map(|_| &annotation),
+        min_mapq: args.min_mapq,
         progress_log: Some(&mut segment_progress_log),
     });
     let segment_summary = segment_summary_result?;
@@ -373,6 +493,19 @@ pub fn main() -> Result<()> {
             segment_summary.backward_segments,
             segment_summary.outward_segments
         ),
+    )?;
+    log_info(
+        &mut log_writer,
+        "Isoforms output",
+        &format!(
+            "{}.isoforms.gtf, {}.isoforms.fa",
+            args.out_prefix, args.out_prefix
+        ),
+    )?;
+    log_info(
+        &mut log_writer,
+        "Isoforms summary",
+        &format!("{} major isoforms", segment_summary.major_isoforms),
     )?;
 
     log_info(

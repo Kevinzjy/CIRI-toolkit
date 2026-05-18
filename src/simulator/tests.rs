@@ -4,9 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use super::{
-    format_segments, is_5p_ro_like_outward_truth, run, sample_circular_insert_len,
-    sample_insert_len, select_fastq_compressor_from_availability, FastqCompressor, Lcg64,
-    SimulateArgs, SourceBase,
+    format_segments, is_outward_facing_truth, run, sample_circular_insert_len, sample_insert_len,
+    select_fastq_compressor_from_availability, FastqCompressor, Lcg64, SimulateArgs, SourceBase,
 };
 
 const ISOFORM_HEADER: &str = "circ_id\tchrom\tstart\tend\tstrand\tgene_id\ttranscript_id\tcoverage\tread_cnt\tbsj_read_cnt\tisoform_cnt\tisoform_exons\tisoform_len\tisoform_read_cnt\tisoform_bsj_read_cnt";
@@ -124,14 +123,16 @@ fn simulator_segments_keep_read_chain_bsj_order() {
 }
 
 #[test]
-fn simulator_outward_truth_requires_5p_overlap_and_3p_outward() {
+fn simulator_outward_truth_requires_clear_pair_offset() {
     let source_map: Vec<SourceBase> = (100..300)
         .map(|coord| SourceBase { coord, exon_idx: 0 })
         .collect();
 
-    assert!(is_5p_ro_like_outward_truth(&source_map, '-', 40, 70, 100));
-    assert!(!is_5p_ro_like_outward_truth(&source_map, '-', 40, 40, 100));
-    assert!(!is_5p_ro_like_outward_truth(&source_map, '+', 140, 0, 100));
+    assert!(is_outward_facing_truth(&source_map, '-', 40, 70, 100));
+    assert!(is_outward_facing_truth(&source_map, '-', 0, 100, 50));
+    assert!(!is_outward_facing_truth(&source_map, '-', 40, 55, 100));
+    assert!(!is_outward_facing_truth(&source_map, '-', 40, 40, 100));
+    assert!(!is_outward_facing_truth(&source_map, '+', 0, 140, 100));
 }
 
 #[test]
@@ -201,6 +202,7 @@ fn simulator_output_contract_is_stable() {
     let linear_read_pairs = reads.iter().filter(|row| row[1] == "NA").count();
     let bsj_read_pairs = reads.iter().filter(|row| row[8] == "1").count();
     let outward_read_pairs = reads.iter().filter(|row| row[13] == "outward").count();
+    let backward_read_pairs = reads.iter().filter(|row| row[13] == "backward").count();
     let bsj_reads = reads
         .iter()
         .map(|row| parse_usize(row, 10) + parse_usize(row, 12))
@@ -222,10 +224,6 @@ fn simulator_output_contract_is_stable() {
             assert_eq!(row[8], "0");
             assert_eq!(row[10], "0");
             assert_eq!(row[12], "0");
-        }
-        if row[13] == "backward" {
-            assert_eq!(row[7], "1");
-            assert_eq!(row[8], "0");
         }
         if row[13] == "forward" {
             assert_eq!(row[8], "0");
@@ -267,6 +265,10 @@ fn simulator_output_contract_is_stable() {
     assert!(
         outward_read_pairs > 0,
         "fixed simulator contract should contain pair-level outward truth"
+    );
+    assert_eq!(
+        backward_read_pairs, 0,
+        "simulator truth should not split BSJ-crossing reads into a separate backward class"
     );
 
     let expected_summary = format!(

@@ -23,6 +23,9 @@ Additional summaries:
   simulator truth. Outward rows carry pair-level circular topology support but
   do not encode a mate-level BSJ junction.
 
+Current simulator truth emits `bsj`, `outward`, and `forward`; explicit
+`backward` truth is kept here only so older truth TSVs can still be summarized.
+
 The default output format is a compact human-readable report. Use `--format tsv`
 to emit tidy rows that are easier to redirect into downstream shell tooling.
 By default, segment-set comparison ignores fragments shorter than 10 bp because
@@ -54,6 +57,7 @@ PRED_TYPES = ("bsj", "backward", "outward")
 TRUTH_TYPES = ("bsj", "backward", "outward", "forward")
 
 MATE_NAMES = ("r1", "r2")
+OUTWARD_TRUTH_MIN_PAIR_OFFSET = 19
 SEGMENT_ERROR_CLASSES = (
     "exact",
     "count_diff",
@@ -125,8 +129,13 @@ def first_truth_segment_span(text: str) -> tuple[int, int] | None:
     return None
 
 
-def truth_has_5p_ro_outward_geometry(row: dict[str, str]) -> bool:
-    """Infer the 5'RO-like outward truth class for legacy truth files."""
+def truth_has_outward_facing_geometry(row: dict[str, str]) -> bool:
+    """Infer the strict outward-facing pair truth class.
+
+    Legacy simulator truth TSVs can contain broad `type=outward` labels. The
+    evaluator re-checks those rows here so old truth files follow the current
+    stricter contract without requiring an immediate simulator rerun.
+    """
     r1_span = first_truth_segment_span(row["r1_segments"])
     r2_span = first_truth_segment_span(row["r2_segments"])
     if r1_span is None or r2_span is None:
@@ -135,23 +144,30 @@ def truth_has_5p_ro_outward_geometry(row: dict[str, str]) -> bool:
         reverse_span, forward_span = r1_span, r2_span
     else:
         reverse_span, forward_span = r2_span, r1_span
+    start_offset = forward_span[0] - reverse_span[0]
+    end_offset = forward_span[1] - reverse_span[1]
     return (
-        reverse_span[0] < forward_span[0]
-        <= reverse_span[1]
-        < forward_span[1]
+        start_offset >= OUTWARD_TRUTH_MIN_PAIR_OFFSET
+        and end_offset >= OUTWARD_TRUTH_MIN_PAIR_OFFSET
     )
 
 
 def infer_truth_type(row: dict[str, str]) -> str:
     """Map simulator truth labels to the current segments `type` contract."""
     if row.get("type"):
+        if row["type"] == "outward":
+            if (
+                row.get("is_circular") == "1"
+                and row.get("is_bsj") != "1"
+                and truth_has_outward_facing_geometry(row)
+            ):
+                return "outward"
+            return "forward"
         return row["type"]
     if row["is_bsj"] == "1":
         return "bsj"
-    if row["is_circular"] == "1":
-        if truth_has_5p_ro_outward_geometry(row):
-            return "outward"
-        return "backward"
+    if row["is_circular"] == "1" and truth_has_outward_facing_geometry(row):
+        return "outward"
     return "forward"
 
 

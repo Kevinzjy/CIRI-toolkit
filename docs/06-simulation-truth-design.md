@@ -101,7 +101,7 @@ read pair 数量整数化规则固定为：
 
 如果 transcript 在过滤后没有可用 exon，或剩余 exon chain 已不足以模拟有效 linear fragment，该 transcript 不进入 linear background read candidate pool。若过滤后没有任何可用 linear candidate，模拟器应给出明确错误，而不是退回完整 GTF。
 
-circRNA simulation 产生的一部分 reads 可能不包含 BSJ 或 backward alignment 特征，因此即使它们覆盖 circRNA-exclusive exon，也可能无法仅从比对结果确定其 circRNA 来源。这种覆盖是模拟设计的一部分，不需要由 linear background reads 补足。
+circRNA simulation 产生的一部分 reads 可能不包含 BSJ 或 outward-facing pair 特征，因此即使它们覆盖 circRNA-exclusive exon，也可能无法仅从比对结果确定其 circRNA 来源。这种覆盖是模拟设计的一部分，不需要由 linear background reads 补足。
 
 这个设计让 `.isoforms.tsv` 和 `.reads.tsv` 保持自明：truth 文件直接记录实际模拟出的 circRNA isoforms、read 来源和 BSJ 标签；评估时优先使用这两张 truth 表判断 circRNA BSJ reads 与 isoform 识别是否准确。
 
@@ -265,17 +265,18 @@ type
 - `read_id` 不带 `/1` 或 `/2`，对应 FASTQ 中同一 read pair 的 shared ID。
 - 对 circRNA reads，`circ_id`、`chrom`、`start`、`end`、`strand` 和 `isoform_id` 指明该 read pair 的真实 circRNA / isoform 来源，并与 `.isoforms.tsv` 中对应 circRNA 的字段一致。
 - 对 linear background reads，`circ_id`、`start`、`end` 和 `isoform_id` 使用 `NA`；`chrom` 保留线性来源 chromosome，`strand` 保留线性来源 strand，使不带 chromosome 的 segment token 仍可独立还原 genomic interval。
-- `is_circular=1` 是 topology rule，而不是来源标签；只有该 read pair 具有 backward order、跨 circular boundary、跨 BSJ，或其他无法解释为完美线性比对的拓扑结构时才标记为 1。
+- `is_circular=1` 是 observable topology rule，而不是来源标签；只有该 read pair 的 mate 自身跨 BSJ，或两个 mate 构成 outward-facing circular-compatible pair 时才标记为 1。
 - `is_circular=0` 表示该 read pair 的来源片段可以被解释为完美线性 reads；即使该 read pair 实际来自 circRNA，只要 topology 上可线性解释，也标记为 0。
 - `is_bsj=1` 表示 R1 或 R2 至少一个 mate 跨过 BSJ 位点。
 - `is_bsj=0` 表示两个 mate 都不跨 BSJ 位点。
 - `r1_is_bsj` / `r2_is_bsj` 分别表示 R1 / R2 是否为 BSJ read。
 - `r1_segments` / `r2_segments` 是该 mate 的真实模拟来源 read-chain 坐标片段。
-- `type` 是 read-pair 的主 truth 类型，当前取值为 `bsj` / `backward` / `outward` / `forward`：
+- `type` 是 read-pair 的主 truth 类型，当前取值为 `bsj` / `outward` / `forward`：
   - `bsj` 表示至少一个 mate 真实跨 BSJ；
-  - `outward` 表示两个 mate 都不跨 BSJ，且满足 5'RO-like pair geometry：5' 端 overlap、3' 端 outward；
-  - `backward` 表示两个 mate 都不跨 BSJ，insert/read pair 跨 circular boundary，但不满足当前 `outward` 的 5'RO-like 几何；
+  - `outward` 表示两个 mate 都不跨 BSJ，但 primary pair 呈严格 outward-facing geometry，即 reverse-oriented mate 位于 forward-oriented mate 左侧，且首个 read-chain block 的 start/end 两个边界相对位移都至少为 19 bp；
   - `forward` 表示 read pair 可按线性片段解释。
+
+Simulator truth 不再区分 `bsj` / `backward`。在 truth 侧，`backward` 必须意味着有 read 跨 BSJ，因此与 `bsj` 是同一个可观测事件；`backward` 只保留在 CIRI 预测结果中，用来表示有 BSJ-like / circular chain 结构但无法定位具体 BSJ 位点的 read。
 
 ### 5.1 segment protocol
 
@@ -308,7 +309,7 @@ BSJ read 必须使用第二种显式格式，即在跨 BSJ 位置加入 `<bsj>`�
 - 对负链 isoform，`strand=-`，但每个 token 内部的 `start <= end` 仍使用 genomic coordinate 的自然顺序。
 - 如果 read 横跨多个 exon，需要拆成多个 genomic segments。
 - 如果 read 在 circular boundary 回绕，必须保留回绕前后的 read-chain 顺序，并在 BSJ 分区之间插入 `<bsj>`。
-- 对不跨 BSJ 的 circular read，如果它来源于一个线性上连续可解释的 exon 片段，则 `is_circular=0` 且 `type=forward`；如果 mate 自身不跨 BSJ 但 insert/read pair 跨 circular boundary，则 `is_circular=1`，并按 5'RO-like geometry 细分为 `type=outward` 或 `type=backward`。
+- 对不跨 BSJ 的 circular-origin read，如果它来源于一个线性上连续可解释的 exon 片段，则 `is_circular=0` 且 `type=forward`；如果 mate 自身不跨 BSJ 但 read pair 呈严格 outward-facing geometry，且 reverse/forward 首个 block 的两个边界位移都至少为 19 bp，则 `is_circular=1` 且 `type=outward`。其他 circular-origin fragments 不写成 truth-side `backward`。
 
 ### 5.2 设计动机
 
@@ -370,7 +371,7 @@ RO debug 输出如果恢复，应继续遵守三层口径：
 - `<prefix>.isoforms.tsv` 中每个 `isoform_bsj_read_cnt` 的和等于该 circRNA 的 `bsj_read_cnt`。
 - `<prefix>.reads.tsv` 中每行的 `is_bsj` 必须等于 `r1_is_bsj OR r2_is_bsj`。
 - `<prefix>.reads.tsv` 中 `is_circular` 必须按 topology rule 标注；来自 circRNA 但可完美线性解释的 read pair 应为 `is_circular=0`。
-- `<prefix>.reads.tsv` 中 `type=outward` 必须满足 `is_circular=1` 且 `is_bsj=0`，并具有 5' overlap + 3' outward geometry；其余 non-BSJ circular pairs 写作 `type=backward`。
+- `<prefix>.reads.tsv` 中 `type=outward` 必须满足 `is_circular=1` 且 `is_bsj=0`，并具有严格 outward-facing pair geometry：reverse-oriented 首个 block 在 forward-oriented 首个 block 左侧，且 start/end 两个边界相对位移都至少为 19 bp；`type=backward` 不再由 simulator truth 输出。
 - `<prefix>.reads.tsv` 中 `r1_is_bsj=1` 的行必须在 `r1_segments` 中包含 `<bsj>` token；`r2_is_bsj=1` 同理。
 - 对每个 circRNA，按 `.reads.tsv` 汇总 `isoform_id` 的 `circ_id != NA` 行数必须等于 `.isoforms.tsv` 中对应 `isoform_read_cnt`。
 - 对每个 circRNA，按 `.reads.tsv` 汇总 `isoform_id` 的 `is_bsj=1` 行数必须等于 `.isoforms.tsv` 中对应 `isoform_bsj_read_cnt`。
@@ -386,7 +387,7 @@ RO debug 输出如果恢复，应继续遵守三层口径：
 - `<prefix>.annotation.gtf` 是 linear RNA annotation；后续运行 `ciri` 时应使用该文件作为 `-a` 输入，以评估 circRNA-specific exon / isoform 的识别效果。
 - `.reads.tsv` 记录所有模拟 read pairs。
 - linear background read pairs 使用 `circ_id=NA`、`start=NA`、`end=NA`、`isoform_id=NA`、`is_circular=0`、`is_bsj=0`，并保留 `chrom` 与 `strand` 以解释不带 chromosome 的 segment tokens。
-- circular origin read pairs 根据 topology rule 标注 `is_circular`，并根据 R1/R2 是否真实跨 BSJ 标注 `is_bsj`。
+- circular origin read pairs 根据可观测 topology rule 标注 `is_circular`，并根据 R1/R2 是否真实跨 BSJ 标注 `is_bsj`；没有 BSJ 或 outward-facing pair 证据的 circular-origin reads 仍写作 `type=forward`。
 
 ## 9. 当前实现状态
 

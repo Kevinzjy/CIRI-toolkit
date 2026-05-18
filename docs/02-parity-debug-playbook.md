@@ -133,19 +133,20 @@ CIRI_TRACE_HG2=1 \
 
 ### 4.4 打开 release profiling
 
-用于定位热点，不用于比较结果正确性。推荐入口是 `--perf`：
+用于定位热点，不用于比较结果正确性。Scan1/Scan2 推荐入口是 `--perf`：
 
 ```bash
 ./target/release/ciri -i input.bam -o sample ... --perf
 ```
 
-profiling 结果会自动写到 `sample.perf.log`。
+Scan1/Scan2 profiling 结果会自动写到 `sample.perf.log`。
 
 兼容旧入口：
 
 ```bash
 CIRI_PROFILE_SCAN1=1 ./target/release/ciri ...
 CIRI_PROFILE_SCAN2=1 ./target/release/ciri ...
+CIRI_PROFILE_SEGMENTS=1 ./target/release/ciri ...
 ```
 
 关键输出：
@@ -154,6 +155,39 @@ CIRI_PROFILE_SCAN2=1 ./target/release/ciri ...
 - `PROFILE_SCAN1_HG1`
 - `PROFILE_SCAN2`
 - `PROFILE_SCAN2_HG2`
+- `PROFILE_SCAN2_SIDECAR`
+- `CIRI_PROFILE_SEGMENTS`（当前写 stderr，用于 segments 内部阶段计时）
+
+解释规则：
+
+- `wall_ms` 是实际用户等待时间。
+- `shard_work_ms` 是所有 worker 累计时间，不能直接当成 wall time。
+- `*_rows` / `*_bytes` 用来判断输出体量是否和耗时匹配；大文件不一定是当前阶段的主要 CPU 瓶颈。
+
+### 4.5 保留临时文件
+
+默认成功运行后会删除内部临时文件。需要检查 `.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj` 或 `.part_XXXX.tmp` shard 时，用 CLI `--debug`：
+
+```bash
+./target/release/ciri -i input.bam -o sample ... --debug
+```
+
+注意：
+
+- `--debug` 是“保留临时文件”，不是 read-level trace。
+- read-level trace 使用 `--trace <READS>`。
+- Scan1/Scan2 profiling 使用 `--perf`；segments 细分 profiling 使用 `CIRI_PROFILE_SEGMENTS=1`。
+
+### 4.6 长时程阶段是否“卡住”
+
+如果终端显示某个进度条已经结束但程序仍在运行，先看下一行 INFO 阶段提示：
+
+- `Segments finalize : Loading Scan2 non-BSJ read topology sidecar...`
+- `Segments finalize : Preparing streamed non-BSJ segment shards...`
+- `Segments finalize : Collecting junction support from retained segment shards...`
+- `Segments finalize : Correcting ambiguous segment rows with junction support...`
+
+这些阶段是有意拆开的 streaming finalize 工作，不应误判为死循环。若新增任何超过数十秒的阶段，必须同步增加 INFO 提示；能计算输入体量时应加进度条。
 
 ## 5. 推荐排查流程（SOP）
 
@@ -165,7 +199,7 @@ CIRI_PROFILE_SCAN2=1 ./target/release/ciri ...
 6. 如怀疑 `is_bsj_hg2` 内部分支，再开 `CIRI_TRACE_HG2=1`。
 7. 在 Java 源码中对应位置做逐分支比对（变量级）。
 8. 只做一个最小改动，立即复测四层指标。
-9. 关闭所有 trace/profile 环境变量，做最终验证。
+9. 关闭所有 trace/profile 环境变量，删除或确认 `--debug` 保留的临时文件，再做最终验证。
 
 ## 6. 单条 read 定位建议
 

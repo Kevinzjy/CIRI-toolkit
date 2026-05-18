@@ -67,6 +67,7 @@ ciri \
 - `--trace`：逗号分隔的 read ID 列表，输出详细追踪到 `<prefix>.trace.log`
 - `--debug`：保留内部临时文件（如 `.bsj1/.bsj2/.segments1/.segments2` 和 shard sidecar）
 - `--perf`：开启 profiling，自动写到 `<prefix>.perf.log`
+- `--continue`：作为附加执行模式，从已完成的合并断点继续；所有普通运行必需参数仍需正常指定。若 `<prefix>.segments` 已存在，则只重建 isoform GTF/FASTA；否则若 `<prefix>.out` 和 `<prefix>.bsj` 已存在，则重建 segments + isoforms
 
 > 默认参数已对齐 CIRI3，推荐使用 `-s 0` 输出所有潜在 circRNA 后手动过滤，其他参数一般无需手动设置。
 
@@ -101,9 +102,13 @@ ciri \
 - 环形RNA识别结果：`<prefix>.out`
 - 运行日志：`<prefix>.log`
 - BSJ reads 比对情况：`<prefix>.bsj`
-- Scan1 mate-level 中间证据：`<prefix>.bsj1`
-- Scan2 mate-level 中间证据：`<prefix>.bsj2`
 - read-level circRNA segment 解释：`<prefix>.segments`
+- major circRNA isoform 结构：`<prefix>.isoforms.gtf`
+- major circRNA isoform 序列：`<prefix>.isoforms.fa`
+
+内部临时文件（如 `<prefix>.bsj1`、`<prefix>.bsj2`、`<prefix>.segments1`、`<prefix>.segments2`、`<prefix>.segments.non_bsj.part_XXXX.tmp`）默认在成功运行后删除；需要排查时可用 `--debug` 保留。
+
+`--continue` 只使用已合并、可校验的断点文件，不把 `.part_XXXX.tmp` 或其他 shard-local 临时文件当作可恢复状态。
 
 ## 结果格式
 
@@ -145,4 +150,4 @@ read_id  mate_label  priority  <CIGAR payload>  <判定结果 payload>  source_s
 - CIRI-AS-style full-length 结构识别设计：`docs/07-full-length-reconstruction.md`
 
 ---
-最后更新：2026-05-04
+最后更新：2026-05-13

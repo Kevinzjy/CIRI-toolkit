@@ -616,6 +616,12 @@ Java CIRI3 的 Scan1 / Scan2 只消费已经 materialize 成 SAM/BAM record 的 
 - 它们可以消费 `.out`、最终 `.bsj` 的 mate-level evidence、原始 BAM/SAM 和额外 evidence，但默认不得改动 `priority=1` 主流程证据和 `.out` 判定结果。
 - 这是本项目能在保持主流程稳定的同时继续扩展功能的根本前提。
 
+### 12.10 已知 BSJ mate-level artifact
+
+当前 CIRI3 parity 路径保留一类 legacy 行为：一个 read pair 的 `priority=1` mate 可以支持 final BSJ，另一个 mate 作为 `priority=0` display evidence 保留到最终 `.bsj`，但这个附加 mate 的 supplementary/chimeric alignment 不一定跨同一个 final BSJ。典型 case 是同一 mate 在多个 junction-separated blocks 中重复覆盖同一 genomic segment，符合 reverse-transcription artifact / chimeric alignment 特征。
+
+为保持 `.out/.bsj` 与 CIRI3 主流程兼容，当前不在 Scan1/Scan2/Summary 阶段删除这类行，也不改变 junction read count。下游 isoform reconstruction 可以把这类 mate-level chain 作为重建阶段 artifact 过滤，但不得反向修改 `.out` 或 `.bsj`。后续如果要在 BSJ 识别阶段解决，需要单独设计并验证：区分 `priority=1` final-BSJ evidence、`priority=0` mate-level display evidence 和 chimeric/RT artifact，并重新跑 CIRI3 parity diff 来评估主输出变化。
+
 ## 13. Rust 实现时的边界建议
 
 为了后续维护清晰，建议继续把 Rust 主流程边界固定为：

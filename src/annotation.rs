@@ -43,6 +43,13 @@ pub struct Annotation {
     pub chr_exon_end_index: HashMap<String, HashMap<i32, (String, char)>>,
     /// Maps from Gene ID to a vector of its exons (as start and end pairs).
     pub gene_exon_map: HashMap<String, Vec<(i32, i32)>>,
+    /// Transcript-consistent exon chains grouped by gene ID.
+    ///
+    /// `gene_exon_map` keeps the historical gene-level union used by Summary
+    /// fallback labels. Full-length sidecar reconstruction needs a stricter
+    /// projection source, because mixing all transcript exons from one gene can
+    /// create impossible exon chains inside unsupported blocks.
+    pub gene_transcript_exon_map: HashMap<String, Vec<Vec<(i32, i32)>>>,
     /// Transcript-consistent introns keyed as `chr\tleft_exon_end\tright_exon_start\tstrand`.
     ///
     /// This is intentionally a side lookup rather than a replacement for the
@@ -66,6 +73,7 @@ impl Annotation {
             chr_exon_start_index: HashMap::new(),
             chr_exon_end_index: HashMap::new(),
             gene_exon_map: HashMap::new(),
+            gene_transcript_exon_map: HashMap::new(),
             transcript_splice_map: HashSet::new(),
             transcript_splice_index: HashMap::new(),
             chr_gene_map: HashMap::new(),
@@ -83,7 +91,7 @@ impl Annotation {
         let file = File::open(annotation_file)?;
         let reader = BufReader::new(file);
         let mut gene_bounds: HashMap<(String, String), (i32, i32)> = HashMap::new();
-        let mut transcript_exons: HashMap<(String, String), Vec<(i32, i32, String)>> =
+        let mut transcript_exons: HashMap<(String, String, String), Vec<(i32, i32, String)>> =
             HashMap::new();
         for line_res in reader.lines() {
             let line = line_res?;
@@ -139,7 +147,7 @@ impl Annotation {
                 .push((start, end));
             if let Some(transcript_id) = transcript_id {
                 transcript_exons
-                    .entry((chr.to_string(), transcript_id))
+                    .entry((chr.to_string(), gene_id_key.clone(), transcript_id))
                     .or_default()
                     .push((start, end, strand.to_string()));
             }
@@ -154,8 +162,19 @@ impl Annotation {
         }
         self.transcript_splice_map.clear();
         self.transcript_splice_index.clear();
-        for ((chr, _transcript_id), mut exons) in transcript_exons {
+        self.gene_transcript_exon_map.clear();
+        for ((chr, gene_id, _transcript_id), mut exons) in transcript_exons {
             exons.sort_by_key(|(start, end, _strand)| (*start, *end));
+            let chain: Vec<(i32, i32)> = exons
+                .iter()
+                .map(|(start, end, _strand)| (*start, *end))
+                .collect();
+            if !chain.is_empty() {
+                self.gene_transcript_exon_map
+                    .entry(gene_id)
+                    .or_default()
+                    .push(chain);
+            }
             for pair in exons.windows(2) {
                 let left = &pair[0];
                 let right = &pair[1];
@@ -172,6 +191,10 @@ impl Annotation {
                     .or_default()
                     .insert((left.1, right.0));
             }
+        }
+        for chains in self.gene_transcript_exon_map.values_mut() {
+            chains.sort();
+            chains.dedup();
         }
         self.chr_gene_map.clear();
         for ((chr, gene_id), (start, end)) in gene_bounds {

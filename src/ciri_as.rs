@@ -7,7 +7,9 @@
 //! The current deliverable is `<prefix>.segments`: a read-level, splice-aware
 //! representation of confirmed BSJ reads that can be compared directly against
 //! simulator truth before full-length path reconstruction is re-enabled on top
-//! of it.
+//! of it. Full-length reconstruction is likewise a sidecar: it consumes the
+//! completed segment rows and writes one major isoform per Summary-confirmed
+//! circRNA without changing CIRI3 `.out` or `.bsj` decisions.
 
 use anyhow::{anyhow, bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -30,8 +32,8 @@ use crate::annotation::Annotation;
 use crate::sam_bam::{detect_format, InputFormat};
 use crate::utils::{
     bam_shard_count, bsj_payload_start, clip_placement_cigar, clip_sequence_payload,
-    exact_clip_match_positions, is_bsj_mate_label, parse_clip_payload, part_path,
-    reverse_complement,
+    exact_clip_match_positions, is_bsj_mate_label, parse_cigar_ops_basic, parse_clip_payload,
+    part_path, reverse_complement,
 };
 
 const MIN_INTRON: i32 = 70;
@@ -43,9 +45,76 @@ const MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH: i32 = 10;
 const INTERNAL_SPLICE_CORRECTION_WINDOW: i32 = 4;
 const PARTIAL_LOCAL_SPLICE_CORRECTION_WINDOW: i32 = 16;
 const MAPQ_THRES: i32 = 5;
+/// Minimum terminal 3' clip required on both mates for exact-span outward-pair evidence.
+///
+/// BSJ detection relies on roughly 20 bp split anchors. Exact-span outward pairs
+/// have no aligned outward length, so their terminal clip evidence should not be
+/// weaker.
+const OUTWARD_MIN_TERMINAL_CLIP: i32 = 19;
+/// Minimum aligned outward length required on both sides of a non-identical
+/// outward-facing pair. Terminal clips are not required when the aligned spans
+/// already provide this much outward extension.
+const OUTWARD_MIN_PAIR_OFFSET: i32 = 19;
 const MAPQ_UNI: i32 = 0;
 const MAPQ_BOTH: i32 = 0;
 const STRINGENCY: usize = 1;
+/// Maximum unspliced graph block kept as a single mature exon in isoform output.
+///
+/// This follows the CIRI-AS exon-length scale instead of a permissive genomic
+/// span cutoff. Larger blocks usually mean the segment graph lacks internal
+/// splice evidence; when annotation is available, those blocks are projected to
+/// known exons so intronic genomic span is not reported as mature RNA sequence.
+const MAJOR_MAX_UNSPLICED_EXON_LEN: i32 = MAX_EXON_LENGTH;
+/// Minimum BSJ/backward read-chain support required for every adjacent selected
+/// junction pair in a mature multi-exon isoform.
+///
+/// Outward reads are useful weak completion evidence during path selection, but
+/// they do not localize a BSJ range precisely enough to certify mature phasing.
+const MAJOR_MIN_MATURE_LINK_SUPPORT: f64 = 1.0;
+/// Smallest non-BSJ assignment probability retained for isoform graph support.
+///
+/// Backward/outward rows have no exact Summary BSJ. The isoform stage therefore
+/// treats their circRNA membership as probabilistic and leaves weak, internal
+/// placements unassigned instead of hard-counting them for an enclosing locus.
+const MAJOR_MIN_NON_BSJ_ASSIGNMENT_WEIGHT: f64 = 0.001;
+/// Minimum distance scale used when comparing non-BSJ anchors with BSJ sites.
+///
+/// The dynamic scale starts from the read-level aligned bases. This lower bound
+/// keeps normal read-pair jitter from erasing real boundary-adjacent support.
+const MAJOR_NON_BSJ_MIN_DISTANCE_SCALE: f64 = 100.0;
+/// Maximum distance scale used for non-BSJ circRNA assignment.
+///
+/// Long genomic spans often include introns or internal circular wraps; letting
+/// that span define the scale would incorrectly make distant internal reads look
+/// compatible with an outer BSJ.
+const MAJOR_NON_BSJ_MAX_DISTANCE_SCALE: f64 = 1000.0;
+/// Maximum genomic gap used to merge high-confidence read spans into one
+/// estimate anchor.
+///
+/// Paired BSJ/backward mates can bracket a short unsequenced insert inside the
+/// same exon even when the reads do not overlap. Keeping this window small lets
+/// those mate-level anchors guide annotation projection without merging across
+/// the kilobase-scale introns that should still be represented as exon gaps.
+const MAJOR_ESTIMATE_ANCHOR_MERGE_GAP: i32 = 300;
+/// Minimum segment-covered fraction required to trust unannotated long exons.
+///
+/// Annotation can legitimately contain rare mega-exons, but an unannotated
+/// long exon with only tiny read anchors is usually an unresolved structure
+/// estimate rather than a sequence-ready isoform. This threshold only gates
+/// FASTA output for estimates; the GTF audit row is still emitted.
+const MAJOR_MIN_FASTA_SEGMENT_COVERAGE_PCT: f64 = 10.0;
+/// Minimum segment-covered fraction required for estimate FASTA output.
+///
+/// FASTA is intended to be the high-confidence sequence set. Estimates can
+/// remain valuable audit records in GTF, but sequence output should require
+/// broad direct segment support unless the isoform is classified as mature.
+const MAJOR_MIN_TRUSTED_ESTIMATE_SEGMENT_COVERAGE_PCT: f64 = 50.0;
+/// Minimum segment-covered fraction for high-confidence unphased candidates.
+///
+/// These records are not mature because adjacent junction-pair phasing is
+/// incomplete, but a broadly segment-covered chain is still useful enough to
+/// include in the sequence FASTA with its estimate reason preserved.
+const MAJOR_MIN_CANDIDATE_SEGMENT_COVERAGE_PCT: f64 = 90.0;
 /// Half-window around local anchors searched for non-BSJ clip placement.
 const NON_BSJ_LOCAL_CLIP_ANCHOR_FLANK_MULTIPLIER: i32 = 2;
 /// Maximum local clip pseudo-alignments retained per read group.
@@ -112,6 +181,12 @@ pub struct AsConfig<'a> {
     /// The Rust sidecar deliberately uses annotation as a deterministic
     /// biological tie-break before falling back to the lowest offset.
     pub annotation: Option<&'a Annotation>,
+    /// Minimum mapping quality shared with the main BSJ scan.
+    ///
+    /// Outward reads are weaker circRNA evidence than BSJ/backward reads, so the
+    /// post-Summary detector uses the same user-facing MAPQ threshold instead
+    /// of the permissive CIRI-AS sidecar constant used for local coverage.
+    pub min_mapq: i32,
     /// Optional user-facing progress logger supplied by the CLI.
     ///
     /// The segments phase owns an internal BAM progress bar, but several
@@ -137,6 +212,8 @@ pub struct SegmentRunSummary {
     pub backward_segments: usize,
     /// Non-BSJ pair-orientation rows.
     pub outward_segments: usize,
+    /// Major isoforms written to `<prefix>.isoforms.gtf/.fa`.
+    pub major_isoforms: usize,
 }
 
 /// Compact alignment representation for CIRI-AS read-group matching.
@@ -190,6 +267,8 @@ struct SegmentRecord {
     is_circular: usize,
     is_r1_bsj: usize,
     is_r2_bsj: usize,
+    r1_align_strand: String,
+    r2_align_strand: String,
     r1_cigar: String,
     r1_segments: String,
     r2_cigar: String,
@@ -385,6 +464,218 @@ struct IsoformRecord {
     rank: usize,
 }
 
+/// One internal splice edge used by the major-isoform graph.
+///
+/// The edge represents a transcript-compatible intron from `donor_end` to
+/// `acceptor_start` in genomic coordinates. It is intentionally independent of
+/// read ID because BSJ, backward, and outward reads are combined as support
+/// tiers after the final segment rows are stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct MajorEdge {
+    donor_end: i32,
+    acceptor_start: i32,
+    strand: char,
+}
+
+/// Junction token used to phase the selected major-isoform path.
+///
+/// The implicit BSJ is part of the circular junction chain. Treating it as a
+/// first-class token prevents two-exon circRNAs with an unsupported long block
+/// from being labeled `mature` simply because they have only one internal
+/// splice edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum MajorJunction {
+    Bsj,
+    Edge(MajorEdge),
+}
+
+/// Pair of adjacent junctions observed in one read-chain segment.
+///
+/// Individual junction support is not enough to prove a mature full-length
+/// chain: two neighboring junctions can be observed by separate reads while the
+/// block between them remains unphased. Link support records that one read
+/// chain contains both junctions consecutively, including BSJ-to-internal
+/// boundary links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MajorJunctionLink {
+    left: MajorJunction,
+    right: MajorJunction,
+}
+
+impl MajorJunctionLink {
+    /// Builds a directional link key from two adjacent junctions in read-chain order.
+    ///
+    /// The two BSJ boundaries around a single internal junction must remain
+    /// distinguishable. Collapsing `(BSJ, edge)` and `(edge, BSJ)` would let a
+    /// read that only covers the short exon between one internal junction and
+    /// one BSJ side certify both circular blocks as mature.
+    fn new(a: MajorJunction, b: MajorJunction) -> Self {
+        Self { left: a, right: b }
+    }
+}
+
+/// Tiered read support for one major-isoform splice edge.
+///
+/// BSJ and backward reads are treated as high-confidence phasing evidence;
+/// outward reads are retained only as weak completion evidence because they
+/// support circular origin but do not localize a BSJ span by themselves.
+#[derive(Debug, Clone, Copy, Default)]
+struct MajorEdgeSupport {
+    bsj: f64,
+    backward: f64,
+    outward: f64,
+}
+
+/// Tiered read support for a neighboring-junction link.
+#[derive(Debug, Clone, Copy, Default)]
+struct MajorLinkSupport {
+    bsj: f64,
+    backward: f64,
+    outward: f64,
+}
+
+/// Continuous aligned segment used as junction-exclusive evidence.
+///
+/// If a read has one uninterrupted alignment block spanning a candidate intron,
+/// that read is evidence that the candidate splice junction was not used in
+/// this molecule. The signal is only used to keep annotation-only junctions from
+/// over-splitting unphased blocks; read-supported junctions still take priority.
+#[derive(Debug, Clone, Copy)]
+struct MajorAlignedSpan {
+    start: i32,
+    end: i32,
+    bsj: f64,
+    backward: f64,
+    outward: f64,
+}
+
+/// Weighted circRNA assignment for one `<prefix>.segments` row.
+///
+/// BSJ rows keep a single exact assignment with weight 1.0. Backward/outward
+/// rows can be compatible with several confirmed circRNAs or with none; their
+/// weights are probabilities used only by isoform reconstruction so the public
+/// read-level segments remain unmodified.
+#[derive(Debug, Clone, Copy)]
+struct MajorCircAssignment {
+    circ_index: usize,
+    weight: f64,
+}
+
+/// Exact circRNA interval index entry for assigning non-BSJ segment rows.
+///
+/// `max_end_through` enables backward scans over a start-sorted vector to stop
+/// once no earlier interval can contain the query span, which keeps assignment
+/// bounded without retaining read-level state for every circRNA.
+#[derive(Debug, Clone, Copy)]
+struct MajorCircIndexEntry {
+    start: i32,
+    end: i32,
+    circ_index: usize,
+    max_end_through: i32,
+}
+
+/// Major isoform selected for one Summary-confirmed circRNA.
+///
+/// The output is deliberately single-isoform for now. `structure_hash` and
+/// `sample_id` are emitted so later multi-sample code can compare major
+/// isoform switching without changing the file contract again.
+#[derive(Debug, Clone)]
+struct MajorIsoformRecord {
+    circ_id: String,
+    isoform_id: String,
+    sample_id: String,
+    chr: String,
+    start: i32,
+    end: i32,
+    strand: char,
+    source_gene_id: String,
+    exons: Vec<(i32, i32)>,
+    cov: f64,
+    segment_coverage_pct: f64,
+    path_score: f64,
+    bsj_reads: usize,
+    structure_hash: u64,
+    isoform_len: i32,
+    isoform_origin: String,
+    estimate_reason: String,
+}
+
+/// Result of converting graph blocks into mature exon intervals.
+struct MajorExonBuild {
+    exons: Vec<(i32, i32)>,
+    projected_long_block: bool,
+    unresolved_long_block: bool,
+    unphased_junction_chain: bool,
+    inferred_internal_block: bool,
+    unphased_single_exon_block: bool,
+}
+
+impl MajorExonBuild {
+    /// Returns whether this isoform is fully supported by segment graph blocks.
+    fn origin(&self) -> &'static str {
+        if self.projected_long_block || self.unresolved_long_block {
+            "estimate"
+        } else if self.unphased_junction_chain
+            || self.inferred_internal_block
+            || self.unphased_single_exon_block
+        {
+            "estimate"
+        } else {
+            "mature"
+        }
+    }
+
+    /// Returns a compact reason string for estimate records.
+    fn estimate_reason(&self) -> String {
+        let mut reasons = Vec::new();
+        if self.projected_long_block {
+            reasons.push("gtf_long_block_projection");
+        }
+        if self.unresolved_long_block {
+            reasons.push("unresolved_long_block");
+        }
+        if self.unphased_junction_chain {
+            reasons.push("unphased_junction_chain");
+        }
+        if self.inferred_internal_block {
+            reasons.push("inferred_internal_block");
+        }
+        if self.unphased_single_exon_block {
+            reasons.push("unphased_single_exon_block");
+        }
+        if reasons.is_empty() {
+            "none".to_string()
+        } else {
+            reasons.join(",")
+        }
+    }
+}
+
+/// Per-block result from annotation projection.
+#[derive(Debug, Clone, Copy, Default)]
+struct MajorBlockBuildStatus {
+    projected: bool,
+    unresolved: bool,
+    inferred: bool,
+    unphased_single_exon: bool,
+}
+
+/// Column indexes required to rebuild major isoforms from `<prefix>.segments`.
+///
+/// Header-driven lookup keeps the isoform stage coupled to the public segments
+/// contract instead of to the in-memory `SegmentRecord` layout, which is the
+/// interface needed for later standalone and multi-sample processing.
+#[derive(Debug, Clone, Copy)]
+struct MajorSegmentsColumns {
+    type_name: usize,
+    circ_id: usize,
+    chrom: usize,
+    start: usize,
+    end: usize,
+    r1_segments: usize,
+    r2_segments: usize,
+}
+
 /// Validation result from the CIRI-AS coverage filter.
 #[derive(Debug, Clone, Copy)]
 struct CoverageValidation {
@@ -551,6 +842,7 @@ pub fn run_ciri_as(mut config: AsConfig<'_>) -> Result<SegmentRunSummary> {
         circ_spans_by_chr: circ_spans_by_chr(&circ_records),
         clusters_by_chr: clusters_by_chr(clusters),
         read_len,
+        min_mapq: config.min_mapq,
         candidates: Vec::new(),
         coverage: HashMap::new(),
         read_mappings: HashMap::new(),
@@ -609,16 +901,24 @@ pub fn run_ciri_as(mut config: AsConfig<'_>) -> Result<SegmentRunSummary> {
         log_segments_user_progress(
             &mut config,
             "Segments finalize",
-            "Collecting junction support and correcting ambiguous rows...",
+            "Collecting junction support from retained segment shards...",
         )?;
         let phase_started = profile.then(Instant::now);
         state.stats.motif_validated = state.candidates.len();
         state.stats.junction_reads_seen = state.segment_groups.len();
+        let keep_temp_files = config.keep_temp_files;
         let records = build_sidecar_segment_records(
             &mut state,
             bsj_segment_shard_paths,
             rescan_group_shard_paths,
-            config.keep_temp_files,
+            keep_temp_files,
+            || {
+                log_segments_user_progress(
+                    &mut config,
+                    "Segments finalize",
+                    "Correcting ambiguous segment rows with junction support...",
+                )
+            },
         )?;
         log_segments_profile(profile, "build_sidecar_segment_records", phase_started);
         records
@@ -626,10 +926,52 @@ pub fn run_ciri_as(mut config: AsConfig<'_>) -> Result<SegmentRunSummary> {
     log_segments_profile(profile, "build_segments", phase_started);
     state.stats.final_segments = segments.len();
     let summary = segment_run_summary(&segments);
+    drop(state);
     let phase_started = profile.then(Instant::now);
-    write_segments(&format!("{}.segments", config.out_prefix), &segments)?;
+    let segments_path = format!("{}.segments", config.out_prefix);
+    write_segments(&segments_path, &segments)?;
     log_segments_profile(profile, "write_segments", phase_started);
+    drop(segments);
+    log_segments_user_progress(
+        &mut config,
+        "Running isoforms",
+        "Selecting major circRNA isoforms from .segments graph...",
+    )?;
+    let phase_started = profile.then(Instant::now);
+    let major_isoforms = build_major_isoforms_from_segments_file(
+        &circ_records,
+        &segments_path,
+        config.out_prefix,
+        config.reference,
+        config.annotation,
+    )?;
+    log_segments_profile(profile, "write_major_isoforms", phase_started);
+    let mut summary = summary;
+    summary.major_isoforms = major_isoforms;
     Ok(summary)
+}
+
+/// Rebuilds major circRNA isoform sidecars from completed `.out` and `.segments` files.
+///
+/// This is the resumable checkpoint used by `ciri --continue` when
+/// `<prefix>.segments` already exists. It deliberately starts from the public
+/// merged segment file instead of any shard-local temporary files, so isoform
+/// debugging can rerun without depending on partially written parallel state.
+pub fn rebuild_major_isoforms_from_segments(
+    circ_path: &str,
+    segments_path: &str,
+    out_prefix: &str,
+    reference: &HashMap<String, String>,
+    annotation: Option<&Annotation>,
+) -> Result<usize> {
+    let (circ_records, _junction_read_to_circ) = load_circ_records(circ_path)?;
+    build_major_isoforms_from_segments_file(
+        &circ_records,
+        segments_path,
+        out_prefix,
+        reference,
+        annotation,
+    )
 }
 
 /// Summarizes final segment row counts by evidence type.
@@ -676,6 +1018,45 @@ fn log_segments_user_progress(config: &mut AsConfig<'_>, label: &str, message: &
     Ok(())
 }
 
+/// Builds a byte-progress bar for retained segment shard passes.
+///
+/// The support and correction passes walk temporary `R/A/C/S` shard streams
+/// instead of the original BAM. Summing shard byte sizes gives users the same
+/// progress expectation as Scan1/Scan2 without retaining read-level state just
+/// for reporting.
+fn retained_segment_progress_bar(
+    bsj_shards: &[SegmentScanShardPaths],
+    non_bsj_shards: &[SegmentScanShardPaths],
+    message: &'static str,
+) -> Result<Option<ProgressBar>> {
+    let total_bytes = retained_segment_shard_bytes(bsj_shards, non_bsj_shards)?;
+    if total_bytes == 0 {
+        return Ok(None);
+    }
+    let pb = ProgressBar::new(total_bytes);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {percent:>3}% ({eta}) {msg}")?
+            .progress_chars("#>-"),
+    );
+    pb.set_message(message);
+    pb.enable_steady_tick(Duration::from_millis(120));
+    Ok(Some(pb))
+}
+
+/// Returns the total on-disk size of retained segment shards.
+fn retained_segment_shard_bytes(
+    bsj_shards: &[SegmentScanShardPaths],
+    non_bsj_shards: &[SegmentScanShardPaths],
+) -> Result<u64> {
+    bsj_shards
+        .iter()
+        .chain(non_bsj_shards)
+        .try_fold(0_u64, |acc, shard| {
+            Ok(acc + std::fs::metadata(&shard.path)?.len())
+        })
+}
+
 /// Mutable state accumulated while scanning the original alignment file.
 ///
 /// Perl stores these as package globals. Rust keeps them in one struct so later
@@ -690,6 +1071,7 @@ struct ScanState<'a> {
     circ_spans_by_chr: HashMap<String, Vec<CircSpan>>,
     clusters_by_chr: HashMap<String, Vec<CircCluster>>,
     read_len: i32,
+    min_mapq: i32,
     candidates: Vec<PositiveCandidate>,
     coverage: HashMap<String, HashMap<i32, u32>>,
     read_mappings: HashMap<String, [Vec<ReadMapping>; 2]>,
@@ -713,6 +1095,7 @@ struct SegmentScanContext<'a> {
     circ_spans_by_chr: &'a HashMap<String, Vec<CircSpan>>,
     clusters_by_chr: &'a HashMap<String, Vec<CircCluster>>,
     read_len: i32,
+    min_mapq: i32,
 }
 
 /// Shard-local mutable output from the segments BAM rescan.
@@ -2066,6 +2449,7 @@ impl<'a> SegmentScanContext<'a> {
             circ_spans_by_chr: &state.circ_spans_by_chr,
             clusters_by_chr: &state.clusters_by_chr,
             read_len: state.read_len,
+            min_mapq: state.min_mapq,
         }
     }
 }
@@ -2190,7 +2574,7 @@ impl SegmentScanShardWriter {
         for record in segment_records {
             writeln!(
                 self.writer,
-                "S\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "S\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 record.read_id,
                 record.type_name,
                 record.circ_id,
@@ -2201,6 +2585,8 @@ impl SegmentScanShardWriter {
                 record.is_circular,
                 record.is_r1_bsj,
                 record.is_r2_bsj,
+                record.r1_align_strand,
+                record.r2_align_strand,
                 record.r1_cigar,
                 record.r1_segments,
                 record.r2_cigar,
@@ -2263,7 +2649,11 @@ fn parse_xa_alternatives_field(raw: &str) -> Vec<XaAlternative> {
 /// This is the preferred large-data access pattern for finalize. It keeps only
 /// one read group in memory, preserving the read-local `A/C/S` payload needed
 /// for support-aware correction without building a global read-id offset map.
-fn for_each_retained_segment_group<F>(path: &str, mut on_group: F) -> Result<()>
+fn for_each_retained_segment_group<F>(
+    path: &str,
+    pb: Option<&ProgressBar>,
+    mut on_group: F,
+) -> Result<()>
 where
     F: FnMut(RetainedSegmentGroup) -> Result<()>,
 {
@@ -2271,14 +2661,22 @@ where
     let mut reader = BufReader::new(file);
     let mut line = String::new();
     let mut current: Option<RetainedSegmentGroup> = None;
+    let mut pending_progress = 0usize;
     loop {
         line.clear();
         let bytes = reader.read_line(&mut line)?;
         if bytes == 0 {
             break;
         }
+        pending_progress += bytes;
         let line = line.trim_end_matches(['\n', '\r']);
         if line.is_empty() {
+            if pending_progress >= 4 * 1024 * 1024 {
+                if let Some(pb) = pb {
+                    pb.inc(pending_progress as u64);
+                }
+                pending_progress = 0;
+            }
             continue;
         }
         let parts: Vec<&str> = line.split('\t').collect();
@@ -2341,15 +2739,53 @@ where
             }
             _ => {}
         }
+        if pending_progress >= 4 * 1024 * 1024 {
+            if let Some(pb) = pb {
+                pb.inc(pending_progress as u64);
+            }
+            pending_progress = 0;
+        }
     }
     if let Some(group) = current {
         on_group(group)?;
+    }
+    if pending_progress > 0 {
+        if let Some(pb) = pb {
+            pb.inc(pending_progress as u64);
+        }
     }
     Ok(())
 }
 
 /// Parses one shard-local preliminary segment row.
 fn segment_record_from_shard_fields(parts: &[&str]) -> Option<SegmentRecord> {
+    let has_alignment_strands = parts.len() >= 16;
+    let (
+        r1_align_strand,
+        r2_align_strand,
+        r1_cigar_idx,
+        r1_segments_idx,
+        r2_cigar_idx,
+        r2_segments_idx,
+    ) = if has_alignment_strands {
+        (
+            parts.get(10)?.to_string(),
+            parts.get(11)?.to_string(),
+            12usize,
+            13usize,
+            14usize,
+            15usize,
+        )
+    } else {
+        (
+            "NA".to_string(),
+            "NA".to_string(),
+            10usize,
+            11usize,
+            12usize,
+            13usize,
+        )
+    };
     Some(SegmentRecord {
         read_id: parts.first()?.to_string(),
         type_name: match *parts.get(1)? {
@@ -2365,10 +2801,12 @@ fn segment_record_from_shard_fields(parts: &[&str]) -> Option<SegmentRecord> {
         is_circular: parts.get(7)?.parse().ok()?,
         is_r1_bsj: parts.get(8)?.parse().ok()?,
         is_r2_bsj: parts.get(9)?.parse().ok()?,
-        r1_cigar: parts.get(10)?.to_string(),
-        r1_segments: parts.get(11)?.to_string(),
-        r2_cigar: parts.get(12)?.to_string(),
-        r2_segments: parts.get(13)?.to_string(),
+        r1_align_strand,
+        r2_align_strand,
+        r1_cigar: parts.get(r1_cigar_idx)?.to_string(),
+        r1_segments: parts.get(r1_segments_idx)?.to_string(),
+        r2_cigar: parts.get(r2_cigar_idx)?.to_string(),
+        r2_segments: parts.get(r2_segments_idx)?.to_string(),
     })
 }
 
@@ -2874,6 +3312,7 @@ fn prebuild_non_bsj_segment_records(
             materialization_records,
             Some(&correction),
             ctx.read_len,
+            ctx.min_mapq,
         ) {
             return (vec![record], enriched_records);
         }
@@ -3395,11 +3834,13 @@ fn overlaps_any_circ_cluster_ctx(records: &[AsAlignment], ctx: &SegmentScanConte
 /// Returns whether one non-BSJ read group is pair-level outward circ evidence.
 ///
 /// Unlike `type=backward`, this detector does not require a mate-internal read
-/// chain wrap. It keeps the 5' RO-like primary-pair geometry: the reverse mate's
-/// 5' side overlaps the forward mate's 5' side, while their 3' ends point
-/// outward. The row remains `circ_id=NA`; later graph construction may project
-/// it onto every compatible circRNA instead of forcing a read-level unique
-/// assignment.
+/// chain wrap. It keeps primary-pair geometry where the reverse mate and
+/// forward mate face outward by coordinate order. Gap length is intentionally
+/// not capped because a gap-facing pair can still become useful once projected
+/// onto confirmed BSJ loci; exact same-span pairs require 3' terminal clipping
+/// on both mates so fully overlapping artifacts are not promoted. The row
+/// remains `circ_id=NA`; later graph construction may project it onto every
+/// compatible circRNA instead of forcing a read-level unique assignment.
 #[cfg(test)]
 fn is_outward_pair_group(records: &[AsAlignment], state: &ScanState) -> bool {
     is_outward_pair_group_ctx(records, &SegmentScanContext::from_state(state))
@@ -3410,7 +3851,10 @@ fn is_outward_pair_group_ctx(records: &[AsAlignment], ctx: &SegmentScanContext<'
     let Some((r1, r2)) = primary_mate_pair(records) else {
         return false;
     };
-    if r1.chr != r2.chr || r1.chr == "*" || r1.mapq < MAPQ_THRES || r2.mapq < MAPQ_THRES {
+    if r1.chr != r2.chr || r1.chr == "*" || r1.mapq < ctx.min_mapq || r2.mapq < ctx.min_mapq {
+        return false;
+    }
+    if has_linear_mate_pair_mapping(records, ctx) {
         return false;
     }
     let Some((r1_start, r1_end)) = alignment_ref_span(r1, ctx.read_len) else {
@@ -3419,7 +3863,7 @@ fn is_outward_pair_group_ctx(records: &[AsAlignment], ctx: &SegmentScanContext<'
     let Some((r2_start, r2_end)) = alignment_ref_span(r2, ctx.read_len) else {
         return false;
     };
-    if !has_5p_overlap_with_3p_outward(r1, (r1_start, r1_end), r2, (r2_start, r2_end)) {
+    if !has_3p_outward_pair_geometry(r1, (r1_start, r1_end), r2, (r2_start, r2_end)) {
         return false;
     }
     let span_start = r1_start.min(r2_start);
@@ -3427,15 +3871,77 @@ fn is_outward_pair_group_ctx(records: &[AsAlignment], ctx: &SegmentScanContext<'
     span_end - span_start + 1 <= BACKWARD_MAX_SPAN
 }
 
-/// Tests the 5' RO-like geometry for a primary R1/R2 pair.
+/// Returns whether any R1/R2 alignment pair can explain the read as linear.
+///
+/// Outward is weaker than backward because it is inferred from mate orientation
+/// rather than a read-internal wrap. Before accepting the primary outward pair,
+/// inspect all retained mapper alignments, including secondary/supplementary
+/// alternatives, and reject the read if any mate pair forms a conventional
+/// forward-left / reverse-right linear mapping within the allowed span.
+fn has_linear_mate_pair_mapping(records: &[AsAlignment], ctx: &SegmentScanContext<'_>) -> bool {
+    for i in 0..records.len() {
+        let left = &records[i];
+        if left.flag & 0x4 != 0 || left.chr == "*" || left.mapq < ctx.min_mapq {
+            continue;
+        }
+        for right in &records[i + 1..] {
+            if right.flag & 0x4 != 0
+                || right.chr == "*"
+                || right.mapq < ctx.min_mapq
+                || left.chr != right.chr
+                || mate_bucket(left.flag) == mate_bucket(right.flag)
+            {
+                continue;
+            }
+            let Some(left_span) = alignment_ref_span(left, ctx.read_len) else {
+                continue;
+            };
+            let Some(right_span) = alignment_ref_span(right, ctx.read_len) else {
+                continue;
+            };
+            let span = left_span.0.min(right_span.0)..=left_span.1.max(right_span.1);
+            if *span.end() - *span.start() + 1 <= BACKWARD_MAX_SPAN
+                && has_linear_pair_geometry(left, left_span, right, right_span)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Tests whether two mate alignments look like an ordinary linear pair.
+fn has_linear_pair_geometry(
+    left: &AsAlignment,
+    left_span: (i32, i32),
+    right: &AsAlignment,
+    right_span: (i32, i32),
+) -> bool {
+    let left_reverse = is_reverse_strand(left.flag);
+    let right_reverse = is_reverse_strand(right.flag);
+    if left_reverse == right_reverse {
+        return false;
+    }
+    let (forward_span, reverse_span) = if left_reverse {
+        (right_span, left_span)
+    } else {
+        (left_span, right_span)
+    };
+    forward_span != reverse_span
+        && forward_span.0 <= reverse_span.0
+        && forward_span.1 <= reverse_span.1
+}
+
+/// Tests broad outward-facing geometry for a primary R1/R2 pair.
 ///
 /// A valid pair has one reverse and one forward primary alignment. The reverse
-/// mate's 5' side is its high genomic end; the forward mate's 5' side is its low
-/// genomic start. Requiring `reverse.start < forward.start <= reverse.end <
-/// forward.end` accepts only a 5' overlap with the two 3' ends facing outward,
-/// and rejects ordinary contained/overlapping proper pairs on negative-strand
-/// transcripts.
-fn has_5p_overlap_with_3p_outward(
+/// mate must sit to the left of the forward mate by both start and end
+/// coordinates. Non-identical spans are accepted when both aligned outward
+/// extensions are at least 19 bp; terminal clips are not required in that case.
+/// Exact same-span pairs have zero aligned outward length, so they still need
+/// paired 3' terminal clip evidence, with the opposite mate's 5' clip
+/// subtracted, to avoid promoting fully overlapping artifacts.
+fn has_3p_outward_pair_geometry(
     r1: &AsAlignment,
     r1_span: (i32, i32),
     r2: &AsAlignment,
@@ -3451,9 +3957,55 @@ fn has_5p_overlap_with_3p_outward(
     } else {
         (r2_span, r1_span)
     };
-    reverse_span.0 < forward_span.0
-        && forward_span.0 <= reverse_span.1
-        && reverse_span.1 < forward_span.1
+    let (reverse_record, forward_record) = if r1_reverse { (r1, r2) } else { (r2, r1) };
+    if reverse_span == forward_span {
+        return has_paired_outward_terminal_clip(reverse_record, forward_record);
+    }
+    if forward_span.0 - reverse_span.0 >= OUTWARD_MIN_PAIR_OFFSET
+        && forward_span.1 - reverse_span.1 >= OUTWARD_MIN_PAIR_OFFSET
+    {
+        return true;
+    }
+    false
+}
+
+/// Returns whether both mates carry outward-specific terminal clip evidence.
+///
+/// SAM CIGAR is query-order regardless of mapper strand, so the first and last
+/// operations represent the sequenced 5' and 3' read ends. A real outward pair
+/// should have strong 3' tails on both mates; if the opposite mate has a similar
+/// 5' clip, that tail can be explained as unaligned mate overlap and is not
+/// strong outward evidence.
+fn has_paired_outward_terminal_clip(
+    reverse_record: &AsAlignment,
+    forward_record: &AsAlignment,
+) -> bool {
+    let Some((reverse_5p, reverse_3p)) = terminal_query_clips(reverse_record) else {
+        return false;
+    };
+    let Some((forward_5p, forward_3p)) = terminal_query_clips(forward_record) else {
+        return false;
+    };
+    reverse_3p >= OUTWARD_MIN_TERMINAL_CLIP
+        && forward_3p >= OUTWARD_MIN_TERMINAL_CLIP
+        && reverse_3p - forward_5p >= OUTWARD_MIN_TERMINAL_CLIP
+        && forward_3p - reverse_5p >= OUTWARD_MIN_TERMINAL_CLIP
+}
+
+/// Returns 5' and 3' terminal query clip lengths from a CIGAR string.
+fn terminal_query_clips(record: &AsAlignment) -> Option<(i32, i32)> {
+    let ops = parse_cigar_ops_basic(&record.cigar)?;
+    let five_prime = ops
+        .first()
+        .copied()
+        .filter(|(_, op)| matches!(op, 'S' | 'H'))
+        .map_or(0, |(len, _)| len);
+    let three_prime = ops
+        .last()
+        .copied()
+        .filter(|(_, op)| matches!(op, 'S' | 'H'))
+        .map_or(0, |(len, _)| len);
+    Some((five_prime, three_prime))
 }
 
 /// Selects the single primary R1/R2 pair used for outward orientation checks.
@@ -3473,6 +4025,29 @@ fn primary_mate_pair(records: &[AsAlignment]) -> Option<(&AsAlignment, &AsAlignm
         }
     }
     Some((r1?, r2?))
+}
+
+/// Returns the primary mapper alignment strand for R1 and R2.
+///
+/// Segment token strands describe RNA/circRNA interpretation and can remain
+/// unknown for pair-orientation-only `outward` rows. These fields expose the
+/// raw primary alignment orientation used to audit outward geometry without
+/// changing the existing read-chain segment semantics.
+fn primary_mate_alignment_strands(records: &[AsAlignment]) -> (String, String) {
+    let mut strands: [Option<char>; 2] = [None, None];
+    for record in records {
+        if record.flag & 0x4 != 0 || is_secondary(record.flag) || is_supplementary(record.flag) {
+            continue;
+        }
+        let bucket = mate_bucket(record.flag);
+        if strands[bucket].is_none() {
+            strands[bucket] = Some(strand_char(record.flag));
+        }
+    }
+    (
+        strands[0].map_or_else(|| "NA".to_string(), |strand| strand.to_string()),
+        strands[1].map_or_else(|| "NA".to_string(), |strand| strand.to_string()),
+    )
 }
 
 /// Returns the reference span covered by one alignment's retained blocks.
@@ -5522,6 +6097,7 @@ fn build_sidecar_segment_records(
     bsj_segment_shard_paths: Vec<SegmentScanShardPaths>,
     rescan_group_shard_paths: Vec<SegmentScanShardPaths>,
     keep_temp_files: bool,
+    mut on_correction_start: impl FnMut() -> Result<()>,
 ) -> Result<Vec<SegmentRecord>> {
     let profile = segments_profile_enabled();
     let first_pass_correction = SegmentCorrectionContext {
@@ -5545,6 +6121,7 @@ fn build_sidecar_segment_records(
         "unified_build_junction_support_index",
         phase_started,
     );
+    on_correction_start()?;
     let phase_started = profile.then(Instant::now);
     let correction = SegmentCorrectionContext {
         reference: state.reference,
@@ -5592,8 +6169,10 @@ fn collect_sidecar_junction_support_from_shards(
     correction: &SegmentCorrectionContext<'_>,
 ) -> Result<JunctionSupportMap> {
     let mut support = HashMap::new();
+    let pb = retained_segment_progress_bar(bsj_shards, non_bsj_shards, "collect junctions")?;
+    let pb_ref = pb.as_ref();
     for shard in bsj_shards {
-        for_each_retained_segment_group(&shard.path, |group| {
+        for_each_retained_segment_group(&shard.path, pb_ref, |group| {
             if let Some(record) =
                 build_bsj_segment_record_from_retained_group(state, &group, correction, &[])?
             {
@@ -5603,12 +6182,15 @@ fn collect_sidecar_junction_support_from_shards(
         })?;
     }
     for shard in non_bsj_shards {
-        for_each_retained_segment_group(&shard.path, |group| {
+        for_each_retained_segment_group(&shard.path, pb_ref, |group| {
             for record in &group.segment_records {
                 collect_junction_support_from_record(record, &mut support);
             }
             Ok(())
         })?;
+    }
+    if let Some(pb) = pb {
+        pb.finish_with_message("");
     }
     Ok(support)
 }
@@ -5623,8 +6205,10 @@ fn build_corrected_sidecar_records_from_shards(
     correction: &SegmentCorrectionContext<'_>,
 ) -> Result<Vec<SegmentRecord>> {
     let mut out = Vec::new();
+    let pb = retained_segment_progress_bar(bsj_shards, non_bsj_shards, "correct segments")?;
+    let pb_ref = pb.as_ref();
     for shard in bsj_shards {
-        for_each_retained_segment_group(&shard.path, |group| {
+        for_each_retained_segment_group(&shard.path, pb_ref, |group| {
             let Some(preliminary) = build_bsj_segment_record_from_retained_group(
                 state,
                 &group,
@@ -5645,7 +6229,7 @@ fn build_corrected_sidecar_records_from_shards(
         })?;
     }
     for shard in non_bsj_shards {
-        for_each_retained_segment_group(&shard.path, |group| {
+        for_each_retained_segment_group(&shard.path, pb_ref, |group| {
             let strand_hint = read_strand_hint_from_candidates(&group.candidates);
             let junction_hints = read_junction_hints_from_candidates(&group.candidates);
             for preliminary in &group.segment_records {
@@ -5667,6 +6251,9 @@ fn build_corrected_sidecar_records_from_shards(
             }
             Ok(())
         })?;
+    }
+    if let Some(pb) = pb {
+        pb.finish_with_message("");
     }
     Ok(out)
 }
@@ -5724,6 +6311,7 @@ fn rebuild_segment_record_from_retained_group(
             &group.records,
             Some(correction),
             state.read_len,
+            state.min_mapq,
         ),
         _ => None,
     }
@@ -5973,6 +6561,7 @@ fn build_bsj_segment_record(
     if chains[0].is_none() && chains[1].is_none() {
         return None;
     }
+    let (r1_align_strand, r2_align_strand) = primary_mate_alignment_strands(records);
     let (r1_segments, r1_cigar, is_r1_bsj) = chain_text(chains[0].as_ref());
     let (r2_segments, r2_cigar, is_r2_bsj) = chain_text(chains[1].as_ref());
     Some(SegmentRecord {
@@ -5986,6 +6575,8 @@ fn build_bsj_segment_record(
         is_circular: 1,
         is_r1_bsj,
         is_r2_bsj,
+        r1_align_strand,
+        r2_align_strand,
         r1_cigar,
         r1_segments,
         r2_cigar,
@@ -6047,6 +6638,7 @@ fn build_backward_segment_record(
     if span_end - span_start + 1 > BACKWARD_MAX_SPAN {
         return None;
     }
+    let (r1_align_strand, r2_align_strand) = primary_mate_alignment_strands(records);
     let (r1_segments, r1_cigar, _) = chain_text(chains[0].as_ref());
     let (r2_segments, r2_cigar, _) = chain_text(chains[1].as_ref());
     Some(SegmentRecord {
@@ -6060,6 +6652,8 @@ fn build_backward_segment_record(
         is_circular,
         is_r1_bsj: 0,
         is_r2_bsj: 0,
+        r1_align_strand,
+        r2_align_strand,
         r1_cigar,
         r1_segments,
         r2_cigar,
@@ -6078,8 +6672,12 @@ fn build_outward_segment_record(
     records: &[AsAlignment],
     correction: Option<&SegmentCorrectionContext<'_>>,
     read_len: i32,
+    min_mapq: i32,
 ) -> Option<SegmentRecord> {
     let (r1, r2) = primary_mate_pair(records)?;
+    if r1.mapq < min_mapq || r2.mapq < min_mapq {
+        return None;
+    }
     let mut chains = build_pair_chains(records, read_len, None, "outward", '?', &[], correction);
     if chains.iter().flatten().any(|chain| chain.is_circular) {
         let selected = [r1.clone(), r2.clone()];
@@ -6120,6 +6718,12 @@ fn build_outward_segment_record(
     if span_end - span_start + 1 > BACKWARD_MAX_SPAN {
         return None;
     }
+    let r1_span = chain_ref_span(chains[0].as_ref())?;
+    let r2_span = chain_ref_span(chains[1].as_ref())?;
+    if !has_3p_outward_pair_geometry(r1, r1_span, r2, r2_span) {
+        return None;
+    }
+    let (r1_align_strand, r2_align_strand) = primary_mate_alignment_strands(records);
     let (r1_segments, r1_cigar, _) = chain_text(chains[0].as_ref());
     let (r2_segments, r2_cigar, _) = chain_text(chains[1].as_ref());
     Some(SegmentRecord {
@@ -6133,6 +6737,8 @@ fn build_outward_segment_record(
         is_circular: 1,
         is_r1_bsj: 0,
         is_r2_bsj: 0,
+        r1_align_strand,
+        r2_align_strand,
         r1_cigar,
         r1_segments,
         r2_cigar,
@@ -6636,6 +7242,18 @@ fn selected_chain_span(chains: &[Option<MateChain>; 2]) -> Option<(i32, i32)> {
     let mut start = i32::MAX;
     let mut end = i32::MIN;
     for block in chains.iter().flatten().flat_map(|chain| &chain.blocks) {
+        start = start.min(block.ref_start);
+        end = end.max(block.ref_end);
+    }
+    (start <= end).then_some((start, end))
+}
+
+/// Returns the genomic span covered by one selected mate chain.
+fn chain_ref_span(chain: Option<&MateChain>) -> Option<(i32, i32)> {
+    let chain = chain?;
+    let mut start = i32::MAX;
+    let mut end = i32::MIN;
+    for block in &chain.blocks {
         start = start.min(block.ref_start);
         end = end.max(block.ref_end);
     }
@@ -7808,12 +8426,12 @@ fn write_segments(path: &str, records: &[SegmentRecord]) -> Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     writeln!(
         writer,
-        "read_id\ttype\tcirc_id\tchrom\tstart\tend\tstrand\tis_circular\tis_r1_bsj\tis_r2_bsj\tr1_cigar\tr1_segments\tr2_cigar\tr2_segments"
+        "read_id\ttype\tcirc_id\tchrom\tstart\tend\tstrand\tis_circular\tis_r1_bsj\tis_r2_bsj\tr1_align_strand\tr2_align_strand\tr1_cigar\tr1_segments\tr2_cigar\tr2_segments"
     )?;
     for record in records {
         writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             record.read_id,
             record.type_name,
             record.circ_id,
@@ -7824,6 +8442,8 @@ fn write_segments(path: &str, records: &[SegmentRecord]) -> Result<()> {
             record.is_circular,
             record.is_r1_bsj,
             record.is_r2_bsj,
+            record.r1_align_strand,
+            record.r2_align_strand,
             record.r1_cigar,
             record.r1_segments,
             record.r2_cigar,
@@ -7831,6 +8451,1874 @@ fn write_segments(path: &str, records: &[SegmentRecord]) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Builds and writes one major full-length isoform for every confirmed circRNA.
+///
+/// This is the Rust integration of the validated phase-seed-union prototype:
+/// BSJ/backward reads define high-confidence phasing edges, outward reads can
+/// fill compatible gaps with low weight, and ambiguous non-BSJ rows are ignored
+/// unless their segment span is uniquely contained by one final circRNA.
+fn build_major_isoforms_from_segments_file(
+    circ_records: &[CircRecord],
+    segments_path: &str,
+    out_prefix: &str,
+    reference: &HashMap<String, String>,
+    annotation: Option<&Annotation>,
+) -> Result<usize> {
+    let circ_by_id: HashMap<&str, usize> = circ_records
+        .iter()
+        .enumerate()
+        .map(|(idx, circ)| (circ.id.as_str(), idx))
+        .collect();
+    let circ_index_by_chr = build_major_circ_index(circ_records);
+    let mut edge_support_by_circ: HashMap<usize, HashMap<MajorEdge, MajorEdgeSupport>> =
+        HashMap::new();
+    let mut link_support_by_circ: HashMap<usize, HashMap<MajorJunctionLink, MajorLinkSupport>> =
+        HashMap::new();
+    let link_exclusion_by_circ: HashMap<usize, HashMap<MajorJunctionLink, MajorLinkSupport>> =
+        HashMap::new();
+    let mut span_support_by_circ: HashMap<usize, Vec<MajorAlignedSpan>> = HashMap::new();
+
+    let file =
+        File::open(segments_path).with_context(|| format!("open segments {}", segments_path))?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .transpose()?
+        .ok_or_else(|| anyhow!("empty segments file: {}", segments_path))?;
+    let columns = major_segments_columns(&header, segments_path)?;
+    for line_result in lines {
+        let line = line_result?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        let Some(row) = major_segment_row(&cols, columns) else {
+            continue;
+        };
+        let assignments = assign_major_circs_from_segments(
+            row.type_name,
+            row.circ_id,
+            row.chrom,
+            row.start,
+            row.end,
+            row.r1_segments,
+            row.r2_segments,
+            &circ_by_id,
+            &circ_index_by_chr,
+            circ_records,
+        );
+        if assignments.is_empty() {
+            continue;
+        }
+        for assignment in assignments {
+            let circ_index = assignment.circ_index;
+            let circ = &circ_records[circ_index];
+            let r1_is_chimeric = major_segment_has_reused_overlap(row.r1_segments, circ);
+            let r2_is_chimeric = major_segment_has_reused_overlap(row.r2_segments, circ);
+            let r1_junctions = if r1_is_chimeric {
+                Vec::new()
+            } else {
+                major_segment_junction_chain(row.r1_segments, circ)
+            };
+            let r2_junctions = if r2_is_chimeric {
+                Vec::new()
+            } else {
+                major_segment_junction_chain(row.r2_segments, circ)
+            };
+            let record_spans: HashSet<(i32, i32)> = (!r1_is_chimeric)
+                .then(|| major_contiguous_segment_spans(row.r1_segments, circ))
+                .into_iter()
+                .flatten()
+                .chain(
+                    (!r2_is_chimeric)
+                        .then(|| major_contiguous_segment_spans(row.r2_segments, circ))
+                        .into_iter()
+                        .flatten(),
+                )
+                .collect();
+            if !record_spans.is_empty() {
+                let circ_spans = span_support_by_circ.entry(circ_index).or_default();
+                for (start, end) in record_spans {
+                    let mut span = MajorAlignedSpan {
+                        start,
+                        end,
+                        bsj: 0.0,
+                        backward: 0.0,
+                        outward: 0.0,
+                    };
+                    match row.type_name {
+                        "bsj" => span.bsj = assignment.weight,
+                        "backward" => span.backward = assignment.weight,
+                        "outward" => span.outward = assignment.weight,
+                        _ => {}
+                    }
+                    circ_spans.push(span);
+                }
+            }
+            let record_edges: HashSet<MajorEdge> = r1_junctions
+                .iter()
+                .chain(r2_junctions.iter())
+                .filter_map(|junction| match junction {
+                    MajorJunction::Edge(edge) => Some(*edge),
+                    MajorJunction::Bsj => None,
+                })
+                .collect();
+            if !record_edges.is_empty() {
+                let circ_support = edge_support_by_circ.entry(circ_index).or_default();
+                for edge in record_edges {
+                    let support = circ_support.entry(edge).or_default();
+                    match row.type_name {
+                        "bsj" => support.bsj += assignment.weight,
+                        "backward" => support.backward += assignment.weight,
+                        "outward" => support.outward += assignment.weight,
+                        _ => {}
+                    }
+                }
+            }
+            let record_links: HashSet<MajorJunctionLink> =
+                major_adjacent_junction_links(&r1_junctions)
+                    .into_iter()
+                    .chain(major_adjacent_junction_links(&r2_junctions))
+                    .collect();
+            if !record_links.is_empty() {
+                let circ_links = link_support_by_circ.entry(circ_index).or_default();
+                for &link in &record_links {
+                    let support = circ_links.entry(link).or_default();
+                    match row.type_name {
+                        "bsj" => support.bsj += assignment.weight,
+                        "backward" => support.backward += assignment.weight,
+                        "outward" => support.outward += assignment.weight,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    let sample_id = major_sample_id(out_prefix);
+    let mut isoforms = Vec::with_capacity(circ_records.len());
+    for (idx, circ) in circ_records.iter().enumerate() {
+        let empty = HashMap::new();
+        let empty_links = HashMap::new();
+        let empty_exclusions = HashMap::new();
+        let empty_spans = Vec::new();
+        let support = edge_support_by_circ.get(&idx).unwrap_or(&empty);
+        let link_support = link_support_by_circ.get(&idx).unwrap_or(&empty_links);
+        let link_exclusion = link_exclusion_by_circ
+            .get(&idx)
+            .unwrap_or(&empty_exclusions);
+        let span_support = span_support_by_circ.get(&idx).unwrap_or(&empty_spans);
+        isoforms.push(select_major_isoform(
+            circ,
+            support,
+            link_support,
+            link_exclusion,
+            span_support,
+            &sample_id,
+            annotation,
+        ));
+    }
+    isoforms.sort_by(|a, b| {
+        a.chr
+            .cmp(&b.chr)
+            .then_with(|| a.start.cmp(&b.start))
+            .then_with(|| a.end.cmp(&b.end))
+            .then_with(|| a.circ_id.cmp(&b.circ_id))
+    });
+
+    write_major_isoform_gtf(&format!("{}.isoforms.gtf", out_prefix), &isoforms)?;
+    write_major_isoform_fasta(&format!("{}.isoforms.fa", out_prefix), &isoforms, reference)?;
+    Ok(isoforms.len())
+}
+
+/// Borrowed view of one `<prefix>.segments` row used by the isoform stage.
+struct MajorSegmentRow<'a> {
+    type_name: &'a str,
+    circ_id: &'a str,
+    chrom: &'a str,
+    start: &'a str,
+    end: &'a str,
+    r1_segments: &'a str,
+    r2_segments: &'a str,
+}
+
+/// Resolves required `<prefix>.segments` columns by header name.
+fn major_segments_columns(header: &str, path: &str) -> Result<MajorSegmentsColumns> {
+    let headers: Vec<&str> = header.split('\t').collect();
+    let idx = |name: &str| -> Result<usize> {
+        headers
+            .iter()
+            .position(|field| *field == name)
+            .ok_or_else(|| anyhow!("missing `{}` column in {}", name, path))
+    };
+    Ok(MajorSegmentsColumns {
+        type_name: idx("type")?,
+        circ_id: idx("circ_id")?,
+        chrom: idx("chrom")?,
+        start: idx("start")?,
+        end: idx("end")?,
+        r1_segments: idx("r1_segments")?,
+        r2_segments: idx("r2_segments")?,
+    })
+}
+
+/// Projects a parsed column slice into the fields needed for graph building.
+fn major_segment_row<'a>(
+    cols: &'a [&'a str],
+    indexes: MajorSegmentsColumns,
+) -> Option<MajorSegmentRow<'a>> {
+    Some(MajorSegmentRow {
+        type_name: *cols.get(indexes.type_name)?,
+        circ_id: *cols.get(indexes.circ_id)?,
+        chrom: *cols.get(indexes.chrom)?,
+        start: *cols.get(indexes.start)?,
+        end: *cols.get(indexes.end)?,
+        r1_segments: *cols.get(indexes.r1_segments)?,
+        r2_segments: *cols.get(indexes.r2_segments)?,
+    })
+}
+
+/// Builds a start-sorted exact circRNA span index for non-BSJ row assignment.
+fn build_major_circ_index(
+    circ_records: &[CircRecord],
+) -> HashMap<String, Vec<MajorCircIndexEntry>> {
+    let mut by_chr: HashMap<String, Vec<MajorCircIndexEntry>> = HashMap::new();
+    for (idx, circ) in circ_records.iter().enumerate() {
+        by_chr
+            .entry(circ.chr.clone())
+            .or_default()
+            .push(MajorCircIndexEntry {
+                start: circ.start,
+                end: circ.end,
+                circ_index: idx,
+                max_end_through: circ.end,
+            });
+    }
+    for entries in by_chr.values_mut() {
+        entries.sort_by_key(|entry| (entry.start, entry.end, entry.circ_index));
+        let mut max_end = i32::MIN;
+        for entry in entries {
+            max_end = max_end.max(entry.end);
+            entry.max_end_through = max_end;
+        }
+    }
+    by_chr
+}
+
+/// Assigns a segment row to final circRNAs for graph reconstruction.
+///
+/// BSJ rows use their Summary circRNA ID directly. Backward/outward rows do not
+/// have a trustworthy BSJ assignment, so every containing confirmed circRNA is
+/// scored by how close the read's observed segment endpoints are to that
+/// circRNA's BSJ boundaries. The normalized weights sum to at most one, with
+/// the remaining probability intentionally left unassigned when the read looks
+/// internal to an enclosing locus.
+fn assign_major_circs_from_segments(
+    type_name: &str,
+    circ_id: &str,
+    chrom: &str,
+    start_text: &str,
+    end_text: &str,
+    r1_segments: &str,
+    r2_segments: &str,
+    circ_by_id: &HashMap<&str, usize>,
+    circ_index_by_chr: &HashMap<String, Vec<MajorCircIndexEntry>>,
+    circ_records: &[CircRecord],
+) -> Vec<MajorCircAssignment> {
+    if type_name == "bsj" {
+        return circ_by_id
+            .get(circ_id)
+            .copied()
+            .map(|circ_index| {
+                vec![MajorCircAssignment {
+                    circ_index,
+                    weight: 1.0,
+                }]
+            })
+            .unwrap_or_default();
+    }
+    let Ok(start) = start_text.parse::<i32>() else {
+        return Vec::new();
+    };
+    let Ok(end) = end_text.parse::<i32>() else {
+        return Vec::new();
+    };
+    let Some(entries) = circ_index_by_chr.get(chrom) else {
+        return Vec::new();
+    };
+    let endpoints = major_segment_endpoints_for_assignment(r1_segments, r2_segments);
+    if endpoints.is_empty() {
+        return Vec::new();
+    }
+    let scale = major_non_bsj_assignment_distance_scale(&endpoints);
+    let right = entries.partition_point(|entry| entry.start <= start);
+    let mut raw = Vec::new();
+    for entry in entries[..right]
+        .iter()
+        .rev()
+        .take_while(|entry| entry.max_end_through >= end)
+        .filter(|entry| entry.end >= end)
+    {
+        let circ = &circ_records[entry.circ_index];
+        if circ.chr == chrom && circ.start <= start && circ.end >= end {
+            let weight = major_non_bsj_assignment_weight(circ, &endpoints, scale);
+            if weight >= MAJOR_MIN_NON_BSJ_ASSIGNMENT_WEIGHT {
+                raw.push((entry.circ_index, weight));
+            }
+        }
+    }
+    let total: f64 = raw.iter().map(|(_, weight)| *weight).sum();
+    if total <= 0.0 {
+        return Vec::new();
+    }
+    let normalizer = total.max(1.0);
+    raw.into_iter()
+        .filter_map(|(circ_index, weight)| {
+            let weight = weight / normalizer;
+            (weight >= MAJOR_MIN_NON_BSJ_ASSIGNMENT_WEIGHT)
+                .then_some(MajorCircAssignment { circ_index, weight })
+        })
+        .collect()
+}
+
+/// Collects read-level segment endpoints used to score non-BSJ circ assignment.
+///
+/// Only parsed `start-end:strand` tokens are considered; `<bsj>` markers remain
+/// topology labels and should not create artificial coordinates. Both block
+/// boundaries are retained because a circular fragment can expose either side
+/// of the BSJ depending on mate orientation and clipping.
+fn major_segment_endpoints_for_assignment(r1_segments: &str, r2_segments: &str) -> Vec<(i32, i32)> {
+    r1_segments
+        .split('|')
+        .chain(r2_segments.split('|'))
+        .filter_map(parse_segment_token)
+        .map(|(start, end, _)| (start, end))
+        .collect()
+}
+
+/// Estimates the fragment-scale distance window for non-BSJ assignment.
+///
+/// The scale follows aligned read bases rather than genomic span so introns and
+/// internal circular wraps cannot make a far-away read look boundary-compatible
+/// with a large outer circRNA.
+fn major_non_bsj_assignment_distance_scale(endpoints: &[(i32, i32)]) -> f64 {
+    let aligned_bases: i32 = endpoints
+        .iter()
+        .map(|(start, end)| end - start + 1)
+        .filter(|len| *len > 0)
+        .sum();
+    (aligned_bases as f64 * 2.0).clamp(
+        MAJOR_NON_BSJ_MIN_DISTANCE_SCALE,
+        MAJOR_NON_BSJ_MAX_DISTANCE_SCALE,
+    )
+}
+
+/// Scores how likely one non-BSJ row belongs to a candidate circRNA.
+///
+/// A true boundary-compatible backward/outward read should place observed
+/// segment ends close to both BSJ sides within the read-pair fragment scale.
+/// Internal reads from a large enclosing locus receive an exponentially small
+/// probability and are mostly left unassigned.
+fn major_non_bsj_assignment_weight(circ: &CircRecord, endpoints: &[(i32, i32)], scale: f64) -> f64 {
+    let left_dist = major_min_endpoint_distance(circ.start, endpoints);
+    let right_dist = major_min_endpoint_distance(circ.end, endpoints);
+    let combined_dist = left_dist.saturating_add(right_dist) as f64;
+    (-combined_dist / scale).exp()
+}
+
+/// Returns the nearest distance from a coordinate to any observed segment end.
+fn major_min_endpoint_distance(position: i32, endpoints: &[(i32, i32)]) -> i32 {
+    endpoints
+        .iter()
+        .flat_map(|(start, end)| [*start, *end])
+        .map(|edge| (edge - position).abs())
+        .min()
+        .unwrap_or(i32::MAX)
+}
+
+/// Returns BSJ and internal splice junctions from one mate segment string.
+///
+/// Edges crossing an explicit `<bsj>` marker are represented by a `Bsj` token
+/// instead of an internal edge. Keeping that boundary token in read order lets
+/// mature classification require support for BSJ-to-internal neighboring
+/// junctions, which is the only way to phase two-exon circRNA blocks from the
+/// segment graph itself.
+fn major_segment_junction_chain(segments: &str, circ: &CircRecord) -> Vec<MajorJunction> {
+    let mut out = Vec::new();
+    let mut previous: Option<(i32, i32, char)> = None;
+    let mut pending_bsj = false;
+    for token in segments.split('|') {
+        if token == "<bsj>" {
+            if previous.is_some() {
+                out.push(MajorJunction::Bsj);
+            }
+            pending_bsj = previous.is_some();
+            continue;
+        }
+        let Some((start, end, strand)) = parse_segment_token(token) else {
+            previous = None;
+            pending_bsj = false;
+            continue;
+        };
+        if end - start + 1 < MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH {
+            continue;
+        }
+        if let Some((prev_start, prev_end, prev_strand)) = previous {
+            if !pending_bsj && prev_strand == strand {
+                let (donor_end, acceptor_start) = if prev_start <= start {
+                    (prev_end, start)
+                } else {
+                    (end, prev_start)
+                };
+                if donor_end < acceptor_start
+                    && donor_end >= circ.start
+                    && acceptor_start <= circ.end
+                {
+                    out.push(MajorJunction::Edge(MajorEdge {
+                        donor_end,
+                        acceptor_start,
+                        strand,
+                    }));
+                }
+            }
+        }
+        previous = Some((start, end, strand));
+        pending_bsj = false;
+    }
+    out
+}
+
+/// Returns continuous aligned blocks from one mate segment string.
+///
+/// These spans are not positive splice evidence. They are used later as
+/// junction-exclusive evidence when an annotation-only candidate junction falls
+/// entirely inside one uninterrupted alignment block.
+fn major_contiguous_segment_spans(segments: &str, circ: &CircRecord) -> Vec<(i32, i32)> {
+    let mut out = Vec::new();
+    for token in segments.split('|') {
+        if token == "<bsj>" {
+            continue;
+        }
+        let Some((start, end, _)) = parse_segment_token(token) else {
+            continue;
+        };
+        if end - start + 1 < MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH {
+            continue;
+        }
+        let clipped_start = start.max(circ.start);
+        let clipped_end = end.min(circ.end);
+        if clipped_start <= clipped_end {
+            out.push((clipped_start, clipped_end));
+        }
+    }
+    out
+}
+
+/// Detects cyclic reuse of aligned bases within one mate segment chain.
+///
+/// A mate that crosses multiple circular/splice junctions can contain positive
+/// neighboring-junction tokens while also reusing the same genomic bases after a
+/// later junction. In isoform reconstruction this is treated as a chimeric
+/// reverse-transcription artifact and the affected mate is filtered before it
+/// can add spans, splice edges, or phasing links. The check is intentionally
+/// limited to overlaps between different junction-separated groups so adjacent
+/// blocks from the same uninterrupted mapping are not penalized.
+fn major_segment_has_reused_overlap(segments: &str, circ: &CircRecord) -> bool {
+    let mut groups: Vec<(i32, i32, usize)> = Vec::new();
+    let mut previous: Option<(i32, i32, char)> = None;
+    let mut pending_bsj = false;
+    let mut group_id = 0usize;
+    for token in segments.split('|') {
+        if token == "<bsj>" {
+            if previous.is_some() {
+                group_id += 1;
+            }
+            pending_bsj = previous.is_some();
+            continue;
+        }
+        let Some((start, end, strand)) = parse_segment_token(token) else {
+            previous = None;
+            pending_bsj = false;
+            continue;
+        };
+        if end - start + 1 < MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH {
+            continue;
+        }
+        if let Some((prev_start, prev_end, prev_strand)) = previous {
+            if !pending_bsj && prev_strand == strand {
+                let (donor_end, acceptor_start) = if prev_start <= start {
+                    (prev_end, start)
+                } else {
+                    (end, prev_start)
+                };
+                if donor_end < acceptor_start
+                    && donor_end >= circ.start
+                    && acceptor_start <= circ.end
+                {
+                    group_id += 1;
+                }
+            }
+        }
+        let clipped_start = start.max(circ.start);
+        let clipped_end = end.min(circ.end);
+        if clipped_start <= clipped_end {
+            for &(prior_start, prior_end, prior_group) in &groups {
+                if prior_group != group_id {
+                    let overlap = prior_end.min(clipped_end) - prior_start.max(clipped_start) + 1;
+                    if overlap >= MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH {
+                        return true;
+                    }
+                }
+            }
+            groups.push((clipped_start, clipped_end, group_id));
+        }
+        previous = Some((start, end, strand));
+        pending_bsj = false;
+    }
+    false
+}
+
+/// Builds unique neighboring-junction link keys from one read-chain list.
+fn major_adjacent_junction_links(junctions: &[MajorJunction]) -> Vec<MajorJunctionLink> {
+    junctions
+        .windows(2)
+        .map(|pair| MajorJunctionLink::new(pair[0], pair[1]))
+        .collect()
+}
+
+/// Returns whether every neighboring junction pair in the selected path is phased.
+///
+/// The selected path is circular, so the implicit BSJ is adjacent to the first
+/// and last internal splice edges. A single-exon circRNA has no internal
+/// junction, so this function leaves it to block-level evidence checks; any
+/// multi-exon path must have high-confidence BSJ/backward read-chain support
+/// for all BSJ/internal boundary links and all internal neighboring-junction
+/// links.
+fn major_chain_has_adjacent_link_support(
+    edges: &[MajorEdge],
+    link_support: &HashMap<MajorJunctionLink, MajorLinkSupport>,
+    link_exclusion: &HashMap<MajorJunctionLink, MajorLinkSupport>,
+) -> bool {
+    if edges.is_empty() {
+        return true;
+    }
+    let mut junctions = Vec::with_capacity(edges.len() + 2);
+    junctions.push(MajorJunction::Bsj);
+    junctions.extend(edges.iter().copied().map(MajorJunction::Edge));
+    junctions.push(MajorJunction::Bsj);
+    junctions.windows(2).all(|pair| {
+        major_link_is_mature_supported(
+            MajorJunctionLink::new(pair[0], pair[1]),
+            link_support,
+            link_exclusion,
+        )
+    })
+}
+
+/// Returns whether one neighboring-junction link is supported and not excluded.
+///
+/// Positive phasing and junction-exclusive evidence are treated symmetrically
+/// for mature classification: one high-confidence BSJ/backward read can support
+/// a link, but one high-confidence BSJ/backward read showing contradictory
+/// cyclic reuse prevents that link from certifying a mature path.
+fn major_link_is_mature_supported(
+    link: MajorJunctionLink,
+    link_support: &HashMap<MajorJunctionLink, MajorLinkSupport>,
+    link_exclusion: &HashMap<MajorJunctionLink, MajorLinkSupport>,
+) -> bool {
+    let supported = link_support
+        .get(&link)
+        .is_some_and(|support| support.bsj + support.backward >= MAJOR_MIN_MATURE_LINK_SUPPORT);
+    if !supported {
+        return false;
+    }
+    !link_exclusion
+        .get(&link)
+        .is_some_and(|support| support.bsj + support.backward >= MAJOR_MIN_MATURE_LINK_SUPPORT)
+}
+
+/// Selects the major isoform path for one circRNA with phase-seed-union.
+fn select_major_isoform(
+    circ: &CircRecord,
+    support: &HashMap<MajorEdge, MajorEdgeSupport>,
+    link_support: &HashMap<MajorJunctionLink, MajorLinkSupport>,
+    link_exclusion: &HashMap<MajorJunctionLink, MajorLinkSupport>,
+    span_support: &[MajorAlignedSpan],
+    sample_id: &str,
+    annotation: Option<&Annotation>,
+) -> MajorIsoformRecord {
+    let phase_edges = major_phase_chain(circ, support);
+    let seed_edges = major_seed_chain(support);
+    let union_edges = major_union_chain(seed_edges, phase_edges);
+    let strand = major_isoform_strand(circ, &union_edges);
+    let annotation_exons =
+        major_projection_annotation_exons_for_circ(circ, annotation, span_support);
+    let chain_is_phased =
+        major_chain_has_adjacent_link_support(&union_edges, link_support, link_exclusion);
+    let exon_build = major_exons_from_edges(
+        circ.start,
+        circ.end,
+        strand,
+        &union_edges,
+        &annotation_exons,
+        support,
+        link_support,
+        link_exclusion,
+        span_support,
+        chain_is_phased,
+    );
+    let isoform_origin = exon_build.origin().to_string();
+    let mut estimate_reason = exon_build.estimate_reason();
+    let exons = exon_build.exons;
+    let isoform_len = exons.iter().map(|(start, end)| end - start + 1).sum();
+    let path_score: f64 = union_edges
+        .iter()
+        .filter_map(|edge| support.get(edge))
+        .map(major_edge_weight)
+        .sum();
+    let cov = union_edges
+        .iter()
+        .filter_map(|edge| support.get(edge))
+        .map(major_edge_weight)
+        .fold(None, |best: Option<f64>, value| {
+            Some(best.map_or(value, |current| current.min(value)))
+        })
+        .unwrap_or_else(|| circ.junction_read_count.parse::<usize>().unwrap_or(0) as f64);
+    let segment_coverage_pct = major_segment_coverage_pct(&exons, span_support);
+    if isoform_origin == "estimate"
+        && segment_coverage_pct < MAJOR_MIN_FASTA_SEGMENT_COVERAGE_PCT
+        && major_has_unannotated_long_exon(&exons, &annotation_exons)
+    {
+        major_append_estimate_reason(
+            &mut estimate_reason,
+            "low_segment_coverage_unannotated_long_exon",
+        );
+    }
+    let structure_hash = major_structure_hash(&circ.chr, strand, circ.start, circ.end, &exons);
+    MajorIsoformRecord {
+        circ_id: circ.id.clone(),
+        isoform_id: format!("{}.major", circ.id),
+        sample_id: sample_id.to_string(),
+        chr: circ.chr.clone(),
+        start: circ.start,
+        end: circ.end,
+        strand,
+        source_gene_id: circ.gene_id.clone(),
+        exons,
+        cov,
+        segment_coverage_pct,
+        path_score,
+        bsj_reads: circ.junction_read_count.parse::<usize>().unwrap_or(0),
+        structure_hash,
+        isoform_len,
+        isoform_origin,
+        estimate_reason,
+    }
+}
+
+/// Builds the BSJ-phased chain and fills gaps with backward/outward evidence.
+fn major_phase_chain(
+    circ: &CircRecord,
+    support: &HashMap<MajorEdge, MajorEdgeSupport>,
+) -> Vec<MajorEdge> {
+    let skeleton = choose_major_edge_chain(
+        &support
+            .iter()
+            .filter_map(|(&edge, counts)| (counts.bsj > 0.0).then_some((edge, counts.bsj)))
+            .collect::<Vec<_>>(),
+    );
+    let mut phase = skeleton.clone();
+    for (start, end) in major_completion_intervals(circ.start, circ.end, &skeleton) {
+        let completion = choose_major_edge_chain(
+            &support
+                .iter()
+                .filter_map(|(&edge, counts)| {
+                    if edge.donor_end >= start && edge.acceptor_start <= end {
+                        let weight = counts.backward as f64 + counts.outward as f64 * 0.05;
+                        (weight > 0.0).then_some((edge, weight))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        phase.extend(completion);
+    }
+    major_sorted_unique_chain(phase)
+}
+
+/// Returns circRNA intervals between BSJ-phased skeleton edges.
+fn major_completion_intervals(
+    circ_start: i32,
+    circ_end: i32,
+    skeleton: &[MajorEdge],
+) -> Vec<(i32, i32)> {
+    let mut intervals = Vec::with_capacity(skeleton.len() + 1);
+    let mut cursor = circ_start;
+    for edge in skeleton {
+        if cursor <= edge.donor_end {
+            intervals.push((cursor, edge.donor_end));
+        }
+        cursor = edge.acceptor_start;
+    }
+    if cursor <= circ_end {
+        intervals.push((cursor, circ_end));
+    }
+    intervals
+}
+
+/// Builds a high-confidence seed chain from strongest compatible edges.
+fn major_seed_chain(support: &HashMap<MajorEdge, MajorEdgeSupport>) -> Vec<MajorEdge> {
+    let mut ranked: Vec<(MajorEdge, f64)> = support
+        .iter()
+        .filter_map(|(&edge, counts)| {
+            let seed = counts.bsj as f64 * 3.0 + counts.backward as f64 * 2.0;
+            (seed > 0.0).then_some((edge, seed))
+        })
+        .collect();
+    ranked.sort_by(|(edge_a, score_a), (edge_b, score_b)| {
+        score_b
+            .partial_cmp(score_a)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| edge_a.cmp(edge_b))
+    });
+    let Some((_, max_score)) = ranked.first().copied() else {
+        return Vec::new();
+    };
+    let min_score = max_score * 0.05;
+    let mut chain = Vec::new();
+    for (edge, score) in ranked {
+        if score < min_score {
+            continue;
+        }
+        if chain
+            .iter()
+            .all(|selected| major_edges_compatible(*selected, edge))
+        {
+            chain.push(edge);
+        }
+    }
+    major_sorted_unique_chain(chain)
+}
+
+/// Merges the seed and phase paths, keeping the seed path as the primary path.
+fn major_union_chain(mut seed: Vec<MajorEdge>, phase: Vec<MajorEdge>) -> Vec<MajorEdge> {
+    for edge in phase {
+        if seed
+            .iter()
+            .all(|selected| major_edges_compatible(*selected, edge))
+        {
+            seed.push(edge);
+        }
+    }
+    major_sorted_unique_chain(seed)
+}
+
+/// Chooses the highest-weight compatible edge chain by dynamic programming.
+fn choose_major_edge_chain(weighted_edges: &[(MajorEdge, f64)]) -> Vec<MajorEdge> {
+    if weighted_edges.is_empty() {
+        return Vec::new();
+    }
+    let mut edges = weighted_edges.to_vec();
+    edges.sort_by(|(edge_a, weight_a), (edge_b, weight_b)| {
+        edge_a
+            .donor_end
+            .cmp(&edge_b.donor_end)
+            .then_with(|| edge_a.acceptor_start.cmp(&edge_b.acceptor_start))
+            .then_with(|| edge_a.strand.cmp(&edge_b.strand))
+            .then_with(|| weight_b.partial_cmp(weight_a).unwrap_or(Ordering::Equal))
+    });
+    let n = edges.len();
+    let mut best = vec![0.0; n];
+    let mut prev = vec![None; n];
+    for i in 0..n {
+        best[i] = edges[i].1;
+        for j in 0..i {
+            if major_edges_compatible(edges[j].0, edges[i].0) && best[j] + edges[i].1 > best[i] {
+                best[i] = best[j] + edges[i].1;
+                prev[i] = Some(j);
+            }
+        }
+    }
+    let mut best_idx = 0;
+    for i in 1..n {
+        if best[i] > best[best_idx] {
+            best_idx = i;
+        }
+    }
+    let mut chain = Vec::new();
+    let mut current = Some(best_idx);
+    while let Some(idx) = current {
+        chain.push(edges[idx].0);
+        current = prev[idx];
+    }
+    chain.reverse();
+    major_sorted_unique_chain(chain)
+}
+
+/// Tests whether two internal splice edges can coexist in one transcript path.
+fn major_edges_compatible(a: MajorEdge, b: MajorEdge) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.strand != b.strand {
+        return false;
+    }
+    let (left, right) = if a.donor_end <= b.donor_end {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    left.acceptor_start <= right.donor_end
+}
+
+/// Sorts a chain in genomic order and removes duplicate edges.
+fn major_sorted_unique_chain(mut chain: Vec<MajorEdge>) -> Vec<MajorEdge> {
+    chain.sort_by_key(|edge| (edge.donor_end, edge.acceptor_start, edge.strand));
+    chain.dedup();
+    chain
+}
+
+/// Returns annotation exon intervals overlapping a circRNA span.
+///
+/// The segment graph defines which introns are skipped, but mature RNA length
+/// must not count every genomic base between two supported splice edges. When
+/// annotation is available, each graph block is projected through one
+/// transcript-consistent exon chain from the Summary-assigned gene. Using the
+/// gene-level exon union here can combine mutually exclusive transcript exons
+/// and create unsupported isoform structures, so the union is only a fallback
+/// for annotations that lack transcript IDs.
+fn major_annotation_exons_for_circ(
+    circ: &CircRecord,
+    annotation: Option<&Annotation>,
+) -> Vec<(i32, i32)> {
+    let Some(annotation) = annotation else {
+        return Vec::new();
+    };
+    let mut best_transcript: Option<((i32, i32, i32, i32), Vec<(i32, i32)>)> = None;
+    for gene in circ.gene_id.split(',') {
+        let Some(transcripts) = annotation.gene_transcript_exon_map.get(gene) else {
+            continue;
+        };
+        for transcript_exons in transcripts {
+            let Some(clipped) = major_clip_annotation_chain(transcript_exons, circ.start, circ.end)
+            else {
+                continue;
+            };
+            let rank = major_annotation_transcript_rank(transcript_exons, &clipped, circ);
+            if best_transcript
+                .as_ref()
+                .is_none_or(|(best_rank, _)| rank > *best_rank)
+            {
+                best_transcript = Some((rank, clipped));
+            }
+        }
+    }
+    if let Some((_rank, exons)) = best_transcript {
+        return exons;
+    }
+    let mut exons: Vec<(i32, i32)> = circ
+        .gene_id
+        .split(',')
+        .filter_map(|gene| annotation.gene_exon_map.get(gene))
+        .flat_map(|items| items.iter().copied())
+        .filter_map(|(start, end)| {
+            let clipped_start = start.max(circ.start);
+            let clipped_end = end.min(circ.end);
+            (clipped_start <= clipped_end).then_some((clipped_start, clipped_end))
+        })
+        .collect();
+    exons.sort_unstable();
+    exons.dedup();
+    exons
+}
+
+/// Chooses annotation exons used to project unphased major-isoform blocks.
+///
+/// Transcript-consistent annotation remains the default because it avoids
+/// impossible exon combinations. When high-confidence BSJ/backward spans show
+/// that one transcript chain fails to cover observed mate-level anchors, the
+/// projection can switch to a gene-level hybrid chain that better explains the
+/// anchored blocks. This keeps the result as an estimate while avoiding the
+/// worse fallback of filling the whole circRNA span as one exon.
+fn major_projection_annotation_exons_for_circ(
+    circ: &CircRecord,
+    annotation: Option<&Annotation>,
+    span_support: &[MajorAlignedSpan],
+) -> Vec<(i32, i32)> {
+    let primary = major_annotation_exons_for_circ(circ, annotation);
+    let Some(annotation) = annotation else {
+        return primary;
+    };
+    let anchors = major_estimate_anchor_blocks(circ.start, circ.end, span_support);
+    if anchors.is_empty() {
+        return primary;
+    }
+    let gene_exons = major_gene_annotation_exons_for_circ(circ, annotation);
+    if gene_exons.is_empty() {
+        return primary;
+    }
+    let hybrid = major_anchor_guided_annotation_exons(circ, &gene_exons, &anchors);
+    if hybrid.is_empty() {
+        return primary;
+    }
+    let primary_score = major_annotation_anchor_score(&primary, &anchors, circ);
+    let hybrid_score = major_annotation_anchor_score(&hybrid, &anchors, circ);
+    if hybrid_score > primary_score {
+        hybrid
+    } else {
+        primary
+    }
+}
+
+/// Returns the gene-level exon union clipped to one circRNA span.
+///
+/// This is intentionally separate from `major_annotation_exons_for_circ`:
+/// full-length mature calls prefer transcript consistency, while estimate
+/// projection sometimes needs a retained-intron block from one transcript and a
+/// terminal exon from another to explain observed read anchors.
+fn major_gene_annotation_exons_for_circ(
+    circ: &CircRecord,
+    annotation: &Annotation,
+) -> Vec<(i32, i32)> {
+    let mut exons: Vec<(i32, i32)> = circ
+        .gene_id
+        .split(',')
+        .filter_map(|gene| annotation.gene_exon_map.get(gene))
+        .flat_map(|items| items.iter().copied())
+        .filter_map(|(start, end)| {
+            let clipped_start = start.max(circ.start);
+            let clipped_end = end.min(circ.end);
+            (clipped_start <= clipped_end).then_some((clipped_start, clipped_end))
+        })
+        .collect();
+    exons.sort_unstable();
+    exons.dedup();
+    exons
+}
+
+/// Merges BSJ/backward continuous spans into estimate anchors.
+///
+/// These anchors are not used to certify maturity. They only tell annotation
+/// projection which parts of a long unphased block have direct read support, so
+/// the fallback can choose retained-intron or terminal exons that actually cover
+/// the observed alignments.
+fn major_estimate_anchor_blocks(
+    circ_start: i32,
+    circ_end: i32,
+    span_support: &[MajorAlignedSpan],
+) -> Vec<(i32, i32)> {
+    let mut spans: Vec<(i32, i32)> = span_support
+        .iter()
+        .filter(|span| span.bsj + span.backward >= MAJOR_MIN_MATURE_LINK_SUPPORT)
+        .filter_map(|span| {
+            let start = span.start.max(circ_start);
+            let end = span.end.min(circ_end);
+            (start <= end).then_some((start, end))
+        })
+        .collect();
+    spans.sort_unstable();
+    let mut anchors: Vec<(i32, i32)> = Vec::new();
+    for (start, end) in spans {
+        if let Some(last) = anchors.last_mut() {
+            if start <= last.1 + MAJOR_ESTIMATE_ANCHOR_MERGE_GAP + 1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        anchors.push((start, end));
+    }
+    anchors
+}
+
+/// Selects the best gene-level annotation exon for every read-supported anchor.
+///
+/// The rank strongly prefers exons that contain the whole anchor, then the
+/// largest overlap, then terminal-boundary agreement and compact exon length.
+/// This favors retained-intron exons when mates extend past a canonical exon
+/// boundary, while still choosing the shortest common terminal exon for a BSJ
+/// side anchor.
+fn major_anchor_guided_annotation_exons(
+    circ: &CircRecord,
+    gene_exons: &[(i32, i32)],
+    anchors: &[(i32, i32)],
+) -> Vec<(i32, i32)> {
+    let mut selected = Vec::new();
+    for &(anchor_start, anchor_end) in anchors {
+        let best = gene_exons
+            .iter()
+            .copied()
+            .filter(|&(exon_start, exon_end)| exon_start <= anchor_end && exon_end >= anchor_start)
+            .max_by_key(|&(exon_start, exon_end)| {
+                let overlap_start = exon_start.max(anchor_start);
+                let overlap_end = exon_end.min(anchor_end);
+                let overlap = overlap_end - overlap_start + 1;
+                let contains = (exon_start <= anchor_start && exon_end >= anchor_end) as i32;
+                let terminal_match =
+                    (exon_start == circ.start) as i32 + (exon_end == circ.end) as i32;
+                let exon_len = exon_end - exon_start + 1;
+                let anchor_delta =
+                    (exon_start - anchor_start).abs() + (exon_end - anchor_end).abs();
+                (contains, overlap, terminal_match, -exon_len, -anchor_delta)
+            });
+        if let Some(exon) = best {
+            selected.push(exon);
+        }
+    }
+    major_normalize_annotation_blocks(selected)
+}
+
+/// Scores how well an annotation projection explains read-supported anchors.
+fn major_annotation_anchor_score(
+    exons: &[(i32, i32)],
+    anchors: &[(i32, i32)],
+    circ: &CircRecord,
+) -> (i32, i32, i32, i32, i32) {
+    let mut contained = 0;
+    let mut covered_bases = 0;
+    for &(anchor_start, anchor_end) in anchors {
+        if exons
+            .iter()
+            .any(|&(exon_start, exon_end)| exon_start <= anchor_start && exon_end >= anchor_end)
+        {
+            contained += 1;
+        }
+        covered_bases += major_interval_union_overlap(exons, anchor_start, anchor_end);
+    }
+    let terminal_matches = exons.iter().any(|&(start, _end)| start == circ.start) as i32
+        + exons.iter().any(|&(_start, end)| end == circ.end) as i32;
+    let total_len: i32 = exons.iter().map(|(start, end)| end - start + 1).sum();
+    (
+        contained,
+        covered_bases,
+        terminal_matches,
+        -(exons.len() as i32),
+        -total_len,
+    )
+}
+
+/// Returns covered bases between an exon set and one anchor interval.
+fn major_interval_union_overlap(exons: &[(i32, i32)], anchor_start: i32, anchor_end: i32) -> i32 {
+    let mut pieces: Vec<(i32, i32)> = exons
+        .iter()
+        .filter_map(|&(start, end)| {
+            let clipped_start = start.max(anchor_start);
+            let clipped_end = end.min(anchor_end);
+            (clipped_start <= clipped_end).then_some((clipped_start, clipped_end))
+        })
+        .collect();
+    pieces.sort_unstable();
+    let mut total = 0;
+    let mut current: Option<(i32, i32)> = None;
+    for (start, end) in pieces {
+        if let Some((current_start, current_end)) = current {
+            if start <= current_end + 1 {
+                current = Some((current_start, current_end.max(end)));
+            } else {
+                total += current_end - current_start + 1;
+                current = Some((start, end));
+            }
+        } else {
+            current = Some((start, end));
+        }
+    }
+    if let Some((start, end)) = current {
+        total += end - start + 1;
+    }
+    total
+}
+
+/// Sorts, deduplicates and removes overlaps from hybrid annotation blocks.
+///
+/// Hybrid estimate projection may pick exons from different transcripts. The
+/// GTF sidecar must still emit a non-overlapping exon chain, so overlapping
+/// selected blocks are conservatively merged instead of emitted as conflicting
+/// features.
+fn major_normalize_annotation_blocks(mut exons: Vec<(i32, i32)>) -> Vec<(i32, i32)> {
+    exons.sort_unstable();
+    exons.dedup();
+    let mut normalized: Vec<(i32, i32)> = Vec::with_capacity(exons.len());
+    for (start, end) in exons {
+        if let Some(last) = normalized.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        normalized.push((start, end));
+    }
+    normalized
+}
+
+/// Clips one transcript exon chain to a circRNA span.
+fn major_clip_annotation_chain(
+    exons: &[(i32, i32)],
+    circ_start: i32,
+    circ_end: i32,
+) -> Option<Vec<(i32, i32)>> {
+    let mut clipped = Vec::new();
+    for &(start, end) in exons {
+        let clipped_start = start.max(circ_start);
+        let clipped_end = end.min(circ_end);
+        if clipped_start <= clipped_end {
+            clipped.push((clipped_start, clipped_end));
+        }
+    }
+    if clipped.is_empty() {
+        None
+    } else {
+        clipped.sort_unstable();
+        clipped.dedup();
+        Some(clipped)
+    }
+}
+
+/// Ranks transcript candidates for annotation fallback projection.
+///
+/// Exact terminal exon-boundary agreement with the circRNA span is preferred.
+/// This avoids selecting a transcript merely because a long terminal exon
+/// overlaps the circ boundary after clipping, which would erase the intended
+/// transcript-specific chain.
+fn major_annotation_transcript_rank(
+    transcript_exons: &[(i32, i32)],
+    clipped: &[(i32, i32)],
+    circ: &CircRecord,
+) -> (i32, i32, i32, i32) {
+    let boundary_matches = transcript_exons
+        .iter()
+        .any(|(start, _end)| *start == circ.start) as i32
+        + transcript_exons
+            .iter()
+            .any(|(_start, end)| *end == circ.end) as i32;
+    let terminal_delta = transcript_exons
+        .iter()
+        .map(|(start, _end)| (*start - circ.start).abs())
+        .min()
+        .unwrap_or(i32::MAX / 4)
+        + transcript_exons
+            .iter()
+            .map(|(_start, end)| (*end - circ.end).abs())
+            .min()
+            .unwrap_or(i32::MAX / 4);
+    let clipped_len = clipped.iter().map(|(start, end)| end - start + 1).sum();
+    (
+        boundary_matches,
+        -terminal_delta,
+        clipped_len,
+        -(clipped.len() as i32),
+    )
+}
+
+/// Converts an internal edge chain into 1-based inclusive exon intervals.
+fn major_exons_from_edges(
+    circ_start: i32,
+    circ_end: i32,
+    strand: char,
+    edges: &[MajorEdge],
+    annotation_exons: &[(i32, i32)],
+    support: &HashMap<MajorEdge, MajorEdgeSupport>,
+    link_support: &HashMap<MajorJunctionLink, MajorLinkSupport>,
+    link_exclusion: &HashMap<MajorJunctionLink, MajorLinkSupport>,
+    span_support: &[MajorAlignedSpan],
+    chain_is_phased: bool,
+) -> MajorExonBuild {
+    let mut exons = Vec::with_capacity(edges.len() + 1);
+    let mut projected_long_block = false;
+    let mut unresolved_long_block = false;
+    let mut inferred_internal_block = false;
+    let mut unphased_single_exon_block = false;
+    let mut cursor = circ_start;
+    let block_phasing = major_selected_block_phasing(edges, link_support, link_exclusion);
+    let is_single_exon_path = edges.is_empty();
+    for (idx, edge) in edges.iter().enumerate() {
+        if cursor <= edge.donor_end {
+            let status = push_major_exon_block(
+                &mut exons,
+                cursor,
+                edge.donor_end,
+                strand,
+                block_phasing.get(idx).copied().unwrap_or(false),
+                false,
+                annotation_exons,
+                support,
+                span_support,
+            );
+            projected_long_block |= status.projected;
+            unresolved_long_block |= status.unresolved;
+            inferred_internal_block |= status.inferred;
+            unphased_single_exon_block |= status.unphased_single_exon;
+        }
+        cursor = edge.acceptor_start;
+    }
+    if cursor <= circ_end {
+        let status = push_major_exon_block(
+            &mut exons,
+            cursor,
+            circ_end,
+            strand,
+            block_phasing.last().copied().unwrap_or(false),
+            is_single_exon_path,
+            annotation_exons,
+            support,
+            span_support,
+        );
+        projected_long_block |= status.projected;
+        unresolved_long_block |= status.unresolved;
+        inferred_internal_block |= status.inferred;
+        unphased_single_exon_block |= status.unphased_single_exon;
+    }
+    if exons.is_empty() && circ_start <= circ_end {
+        exons.push((circ_start, circ_end));
+    }
+    exons.sort_unstable();
+    exons.dedup();
+    MajorExonBuild {
+        exons,
+        projected_long_block,
+        unresolved_long_block,
+        unphased_junction_chain: !chain_is_phased,
+        inferred_internal_block,
+        unphased_single_exon_block,
+    }
+}
+
+/// Returns per-block phasing status for the selected circular junction path.
+fn major_selected_block_phasing(
+    edges: &[MajorEdge],
+    link_support: &HashMap<MajorJunctionLink, MajorLinkSupport>,
+    link_exclusion: &HashMap<MajorJunctionLink, MajorLinkSupport>,
+) -> Vec<bool> {
+    if edges.is_empty() {
+        return vec![false];
+    }
+    let mut junctions = Vec::with_capacity(edges.len() + 2);
+    junctions.push(MajorJunction::Bsj);
+    junctions.extend(edges.iter().copied().map(MajorJunction::Edge));
+    junctions.push(MajorJunction::Bsj);
+    junctions
+        .windows(2)
+        .map(|pair| {
+            major_link_is_mature_supported(
+                MajorJunctionLink::new(pair[0], pair[1]),
+                link_support,
+                link_exclusion,
+            )
+        })
+        .collect()
+}
+
+/// Appends one transcript block after resolving unphased internal structure.
+fn push_major_exon_block(
+    out: &mut Vec<(i32, i32)>,
+    block_start: i32,
+    block_end: i32,
+    strand: char,
+    block_is_phased: bool,
+    is_single_exon_path: bool,
+    annotation_exons: &[(i32, i32)],
+    support: &HashMap<MajorEdge, MajorEdgeSupport>,
+    span_support: &[MajorAlignedSpan],
+) -> MajorBlockBuildStatus {
+    let block_len = block_end - block_start + 1;
+    let annotation_edges =
+        major_annotation_edges_for_block(block_start, block_end, strand, annotation_exons);
+    let candidate_edges = major_infer_block_edges(
+        block_start,
+        block_end,
+        strand,
+        annotation_exons,
+        support,
+        span_support,
+    );
+    if is_single_exon_path && annotation_edges.is_empty() && candidate_edges.is_empty() {
+        out.push((block_start, block_end));
+        if major_single_exon_block_has_mature_support(block_start, block_end, span_support) {
+            return MajorBlockBuildStatus::default();
+        }
+        return MajorBlockBuildStatus {
+            projected: false,
+            unresolved: false,
+            inferred: false,
+            unphased_single_exon: true,
+        };
+    }
+    if block_is_phased
+        && block_len <= MAJOR_MAX_UNSPLICED_EXON_LEN
+        && candidate_edges.is_empty()
+        && annotation_edges.is_empty()
+    {
+        out.push((block_start, block_end));
+        return MajorBlockBuildStatus::default();
+    }
+    if !candidate_edges.is_empty() {
+        return push_major_blocks_from_inferred_edges(
+            out,
+            block_start,
+            block_end,
+            &candidate_edges,
+            annotation_exons,
+        );
+    }
+    if !annotation_edges.is_empty() {
+        out.push((block_start, block_end));
+        return MajorBlockBuildStatus {
+            projected: false,
+            unresolved: block_len > MAJOR_MAX_UNSPLICED_EXON_LEN,
+            inferred: false,
+            unphased_single_exon: false,
+        };
+    }
+    if annotation_exons.is_empty() {
+        out.push((block_start, block_end));
+        return MajorBlockBuildStatus {
+            projected: false,
+            unresolved: block_len > MAJOR_MAX_UNSPLICED_EXON_LEN,
+            inferred: false,
+            unphased_single_exon: false,
+        };
+    }
+    let before = out.len();
+    for &(exon_start, exon_end) in annotation_exons {
+        if exon_end < block_start {
+            continue;
+        }
+        if exon_start > block_end {
+            break;
+        }
+        let start = exon_start.max(block_start);
+        let end = exon_end.min(block_end);
+        if start <= end {
+            out.push((start, end));
+        }
+    }
+    if out.len() == before {
+        out.push((block_start, block_end));
+        MajorBlockBuildStatus {
+            projected: false,
+            unresolved: true,
+            inferred: false,
+            unphased_single_exon: false,
+        }
+    } else {
+        MajorBlockBuildStatus {
+            projected: true,
+            unresolved: false,
+            inferred: !block_is_phased,
+            unphased_single_exon: false,
+        }
+    }
+}
+
+/// Infers splice edges inside one unphased graph block.
+///
+/// Read-supported BSJ/backward/outward junctions are positive candidates.
+/// Annotation-only junctions are added only when no high-confidence continuous
+/// BSJ/backward alignment spans across the candidate intron, so aligned
+/// junction-exclusive evidence can prevent over-splitting.
+fn major_infer_block_edges(
+    block_start: i32,
+    block_end: i32,
+    strand: char,
+    annotation_exons: &[(i32, i32)],
+    support: &HashMap<MajorEdge, MajorEdgeSupport>,
+    span_support: &[MajorAlignedSpan],
+) -> Vec<MajorEdge> {
+    let mut weighted = Vec::new();
+    let mut seen = HashSet::new();
+    for (&edge, counts) in support {
+        if edge.donor_end >= block_start
+            && edge.acceptor_start <= block_end
+            && edge.donor_end < edge.acceptor_start
+        {
+            let weight = major_edge_weight(counts);
+            if weight > 0.0 && seen.insert(edge) {
+                weighted.push((edge, weight));
+            }
+        }
+    }
+    for edge in major_annotation_edges_for_block(block_start, block_end, strand, annotation_exons) {
+        if seen.contains(&edge) {
+            continue;
+        }
+        if !major_edge_has_high_conf_exclusion(edge, span_support) {
+            seen.insert(edge);
+            weighted.push((edge, 0.01));
+        }
+    }
+    choose_major_edge_chain(&weighted)
+}
+
+/// Returns annotation-implied splice edges inside a graph block.
+fn major_annotation_edges_for_block(
+    block_start: i32,
+    block_end: i32,
+    strand: char,
+    annotation_exons: &[(i32, i32)],
+) -> Vec<MajorEdge> {
+    let mut clipped: Vec<(i32, i32)> = annotation_exons
+        .iter()
+        .filter_map(|&(start, end)| {
+            let clipped_start = start.max(block_start);
+            let clipped_end = end.min(block_end);
+            (clipped_start <= clipped_end).then_some((clipped_start, clipped_end))
+        })
+        .collect();
+    clipped.sort_unstable();
+    clipped.dedup();
+    clipped
+        .windows(2)
+        .filter_map(|pair| {
+            let donor_end = pair[0].1;
+            let acceptor_start = pair[1].0;
+            (donor_end < acceptor_start).then_some(MajorEdge {
+                donor_end,
+                acceptor_start,
+                strand,
+            })
+        })
+        .collect()
+}
+
+/// Tests whether a single-exon circRNA block has enough evidence to be mature.
+///
+/// With no internal junctions, the normal neighboring-junction phasing test has
+/// nothing to check. Annotation can define a plausible single-exon structure,
+/// but it cannot by itself prove that read evidence excludes hidden internal
+/// splicing. A single-exon call is therefore mature only when high-confidence
+/// BSJ/backward continuous spans tile the complete block without gaps.
+fn major_single_exon_block_has_mature_support(
+    block_start: i32,
+    block_end: i32,
+    span_support: &[MajorAlignedSpan],
+) -> bool {
+    major_high_conf_spans_cover_block(block_start, block_end, span_support)
+}
+
+/// Returns whether BSJ/backward continuous spans tile the whole block.
+fn major_high_conf_spans_cover_block(
+    block_start: i32,
+    block_end: i32,
+    span_support: &[MajorAlignedSpan],
+) -> bool {
+    let mut spans: Vec<(i32, i32)> = span_support
+        .iter()
+        .filter(|span| span.bsj + span.backward >= MAJOR_MIN_MATURE_LINK_SUPPORT)
+        .filter_map(|span| {
+            let start = span.start.max(block_start);
+            let end = span.end.min(block_end);
+            (start <= end).then_some((start, end))
+        })
+        .collect();
+    spans.sort_unstable();
+    let mut cursor = block_start;
+    for (start, end) in spans {
+        if start > cursor {
+            return false;
+        }
+        if end >= block_end {
+            return true;
+        }
+        cursor = cursor.max(end + 1);
+    }
+    false
+}
+
+/// Returns the weighted percentage of selected exon-chain bases covered by segments.
+///
+/// This is a structural audit metric, not the expression-like `cov` score. BSJ
+/// spans contribute full coverage, while backward/outward spans contribute their
+/// circRNA assignment probability. Per-base support is capped at one so several
+/// ambiguous reads cannot inflate coverage beyond the selected exon length.
+fn major_segment_coverage_pct(exons: &[(i32, i32)], span_support: &[MajorAlignedSpan]) -> f64 {
+    let isoform_len: i32 = exons.iter().map(|(start, end)| end - start + 1).sum();
+    if isoform_len <= 0 {
+        return 0.0;
+    }
+    let mut covered = 0.0;
+    for &(exon_start, exon_end) in exons {
+        let mut events: Vec<(i32, f64)> = span_support
+            .iter()
+            .filter_map(|span| {
+                let start = span.start.max(exon_start);
+                let end = span.end.min(exon_end);
+                let weight = span.bsj + span.backward + span.outward;
+                (start <= end && weight > 0.0).then_some([(start, weight), (end + 1, -weight)])
+            })
+            .flatten()
+            .collect();
+        events.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut active: f64 = 0.0;
+        let mut cursor = exon_start;
+        for (position, delta) in events {
+            if position > cursor && active > 0.0 {
+                let end = (position - 1).min(exon_end);
+                if end >= cursor {
+                    covered += (end - cursor + 1) as f64 * active.min(1.0);
+                }
+            }
+            active += delta;
+            if position > cursor {
+                cursor = position;
+            }
+            if cursor > exon_end {
+                break;
+            }
+        }
+    }
+    covered * 100.0 / isoform_len as f64
+}
+
+/// Appends one estimate reason while preserving stable comma-separated output.
+fn major_append_estimate_reason(reasons: &mut String, reason: &str) {
+    if reasons == "none" || reasons.is_empty() {
+        *reasons = reason.to_string();
+    } else if !reasons.split(',').any(|existing| existing == reason) {
+        reasons.push(',');
+        reasons.push_str(reason);
+    }
+}
+
+/// Returns whether a selected isoform contains a long exon absent from GTF.
+///
+/// The check requires complete containment by one annotation exon. Partial
+/// overlaps are not enough to trust the entire projected sequence because the
+/// uncovered portion may still be an unresolved internal structure.
+fn major_has_unannotated_long_exon(exons: &[(i32, i32)], annotation_exons: &[(i32, i32)]) -> bool {
+    exons.iter().any(|&(start, end)| {
+        end - start + 1 > MAJOR_MAX_UNSPLICED_EXON_LEN
+            && !annotation_exons
+                .iter()
+                .any(|&(anno_start, anno_end)| anno_start <= start && anno_end >= end)
+    })
+}
+
+/// Tests whether high-confidence continuous alignment excludes a splice edge.
+fn major_edge_has_high_conf_exclusion(edge: MajorEdge, span_support: &[MajorAlignedSpan]) -> bool {
+    span_support.iter().any(|span| {
+        span.start <= edge.donor_end
+            && span.end >= edge.acceptor_start
+            && span.bsj + span.backward >= MAJOR_MIN_MATURE_LINK_SUPPORT
+    })
+}
+
+/// Converts inferred internal edges into exon blocks.
+fn push_major_blocks_from_inferred_edges(
+    out: &mut Vec<(i32, i32)>,
+    block_start: i32,
+    block_end: i32,
+    edges: &[MajorEdge],
+    annotation_exons: &[(i32, i32)],
+) -> MajorBlockBuildStatus {
+    let before = out.len();
+    let mut projected = false;
+    let mut unresolved = false;
+    let mut cursor = block_start;
+    for edge in edges {
+        if cursor <= edge.donor_end {
+            let status =
+                push_major_resolved_subblock(out, cursor, edge.donor_end, annotation_exons);
+            projected |= status.projected;
+            unresolved |= status.unresolved;
+        }
+        cursor = edge.acceptor_start;
+    }
+    if cursor <= block_end {
+        let status = push_major_resolved_subblock(out, cursor, block_end, annotation_exons);
+        projected |= status.projected;
+        unresolved |= status.unresolved;
+    }
+    MajorBlockBuildStatus {
+        projected: projected
+            || edges.iter().any(|edge| {
+                major_annotation_edges_for_block(
+                    block_start,
+                    block_end,
+                    edge.strand,
+                    annotation_exons,
+                )
+                .contains(edge)
+            }),
+        unresolved: unresolved || out.len() == before,
+        inferred: true,
+        unphased_single_exon: false,
+    }
+}
+
+/// Appends an inferred subblock, projecting only if it is still implausibly long.
+fn push_major_resolved_subblock(
+    out: &mut Vec<(i32, i32)>,
+    block_start: i32,
+    block_end: i32,
+    annotation_exons: &[(i32, i32)],
+) -> MajorBlockBuildStatus {
+    let block_len = block_end - block_start + 1;
+    if block_len <= MAJOR_MAX_UNSPLICED_EXON_LEN {
+        out.push((block_start, block_end));
+        return MajorBlockBuildStatus::default();
+    }
+    if annotation_exons.is_empty() {
+        out.push((block_start, block_end));
+        return MajorBlockBuildStatus {
+            projected: false,
+            unresolved: true,
+            inferred: false,
+            unphased_single_exon: false,
+        };
+    }
+    let before = out.len();
+    for &(exon_start, exon_end) in annotation_exons {
+        if exon_end < block_start {
+            continue;
+        }
+        if exon_start > block_end {
+            break;
+        }
+        let start = exon_start.max(block_start);
+        let end = exon_end.min(block_end);
+        if start <= end {
+            out.push((start, end));
+        }
+    }
+    MajorBlockBuildStatus {
+        projected: out.len() > before,
+        unresolved: out.len() == before,
+        inferred: false,
+        unphased_single_exon: false,
+    }
+}
+
+/// Chooses the user-facing strand for a major isoform.
+fn major_isoform_strand(circ: &CircRecord, edges: &[MajorEdge]) -> char {
+    circ.strand
+        .chars()
+        .next()
+        .filter(|strand| matches!(strand, '+' | '-'))
+        .or_else(|| edges.first().map(|edge| edge.strand))
+        .unwrap_or('.')
+}
+
+/// Weight used by the selected path score and coverage estimate.
+fn major_edge_weight(support: &MajorEdgeSupport) -> f64 {
+    support.bsj + support.backward + support.outward * 0.05
+}
+
+/// Returns a stable sample label from the output prefix.
+fn major_sample_id(out_prefix: &str) -> String {
+    std::path::Path::new(out_prefix)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(out_prefix)
+        .to_string()
+}
+
+/// Computes a deterministic FNV-1a hash for multi-sample structure matching.
+fn major_structure_hash(
+    chr: &str,
+    strand: char,
+    start: i32,
+    end: i32,
+    exons: &[(i32, i32)],
+) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    fn feed(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x100000001b3);
+        }
+        *hash ^= 0xff;
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
+    feed(&mut hash, chr.as_bytes());
+    feed(&mut hash, strand.to_string().as_bytes());
+    feed(&mut hash, &start.to_le_bytes());
+    feed(&mut hash, &end.to_le_bytes());
+    for (exon_start, exon_end) in exons {
+        feed(&mut hash, &exon_start.to_le_bytes());
+        feed(&mut hash, &exon_end.to_le_bytes());
+    }
+    hash
+}
+
+/// Writes major isoforms as a GTF sidecar with coverage and structure metadata.
+fn write_major_isoform_gtf(path: &str, records: &[MajorIsoformRecord]) -> Result<()> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    for record in records {
+        let attrs = major_gtf_attributes(record);
+        writeln!(
+            writer,
+            "{}\tCIRI-rs\tcircRNA\t{}\t{}\t{:.3}\t{}\t.\t{}",
+            record.chr, record.start, record.end, record.cov, record.strand, attrs
+        )?;
+        writeln!(
+            writer,
+            "{}\tCIRI-rs\ttranscript\t{}\t{}\t{:.3}\t{}\t.\t{}",
+            record.chr, record.start, record.end, record.cov, record.strand, attrs
+        )?;
+        for (idx, (start, end)) in record.exons.iter().enumerate() {
+            writeln!(
+                writer,
+                "{}\tCIRI-rs\texon\t{}\t{}\t{:.3}\t{}\t.\t{} exon_number \"{}\";",
+                record.chr,
+                start,
+                end,
+                record.cov,
+                record.strand,
+                attrs,
+                idx + 1
+            )?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Formats the stable GTF attributes shared by circRNA/transcript/exon rows.
+fn major_gtf_attributes(record: &MajorIsoformRecord) -> String {
+    format!(
+        "gene_id \"{}\"; transcript_id \"{}\"; circRNA_id \"{}\"; isoform_id \"{}\"; sample_id \"{}\"; source_gene_id \"{}\"; isoform_rank \"1\"; isoform_class \"major\"; isoform_origin \"{}\"; estimate_reason \"{}\"; path_method \"phase_seed_union\"; cov \"{:.3}\"; segment_coverage_pct \"{:.3}\"; bsj_reads \"{}\"; path_score \"{:.3}\"; exon_count \"{}\"; isoform_len \"{}\"; structure_hash \"{:016x}\";",
+        gtf_escape(&record.circ_id),
+        gtf_escape(&record.isoform_id),
+        gtf_escape(&record.circ_id),
+        gtf_escape(&record.isoform_id),
+        gtf_escape(&record.sample_id),
+        gtf_escape(&record.source_gene_id),
+        gtf_escape(&record.isoform_origin),
+        gtf_escape(&record.estimate_reason),
+        record.cov,
+        record.segment_coverage_pct,
+        record.bsj_reads,
+        record.path_score,
+        record.exons.len(),
+        record.isoform_len,
+        record.structure_hash
+    )
+}
+
+/// Escapes double quotes in GTF attribute values.
+fn gtf_escape(value: &str) -> String {
+    value.replace('"', "\\\"")
+}
+
+/// Writes reference-derived FASTA sequences for the selected major isoforms.
+fn write_major_isoform_fasta(
+    path: &str,
+    records: &[MajorIsoformRecord],
+    reference: &HashMap<String, String>,
+) -> Result<()> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    for record in records {
+        if !major_isoform_should_emit_fasta(record) {
+            continue;
+        }
+        let seq = major_isoform_sequence(record, reference)?;
+        writeln!(
+            writer,
+            ">{} circRNA_id={} sample_id={} isoform_origin={} estimate_reason={} cov={:.3} segment_coverage_pct={:.3} bsj_reads={} path_score={:.3} exon_count={} isoform_len={} structure_hash={:016x}",
+            record.isoform_id,
+            record.circ_id,
+            record.sample_id,
+            record.isoform_origin,
+            record.estimate_reason,
+            record.cov,
+            record.segment_coverage_pct,
+            record.bsj_reads,
+            record.path_score,
+            record.exons.len(),
+            record.isoform_len,
+            record.structure_hash
+        )?;
+        for chunk in seq.as_bytes().chunks(80) {
+            writer.write_all(chunk)?;
+            writer.write_all(b"\n")?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Returns whether a major isoform is reliable enough for sequence FASTA output.
+///
+/// The GTF remains the complete audit table, including unresolved estimates.
+/// FASTA is stricter because unresolved placeholders become misleading sequence
+/// records. Mature isoforms are always emitted; estimates need enough direct
+/// segment coverage, and unphased candidates are admitted only when weighted
+/// segment coverage is high enough to make the sequence-ready subset strict.
+fn major_isoform_should_emit_fasta(record: &MajorIsoformRecord) -> bool {
+    if record.isoform_origin == "mature" {
+        return true;
+    }
+    if record.isoform_origin != "estimate" {
+        return false;
+    }
+    if record.estimate_reason.contains("unresolved_long_block") {
+        return false;
+    }
+    if record.estimate_reason.contains("unphased_junction_chain") {
+        return major_isoform_is_trusted_unphased_candidate(record);
+    }
+    if record
+        .estimate_reason
+        .contains("unphased_single_exon_block")
+    {
+        return false;
+    }
+    if record
+        .estimate_reason
+        .contains("low_segment_coverage_unannotated_long_exon")
+    {
+        return false;
+    }
+    if record.segment_coverage_pct < MAJOR_MIN_TRUSTED_ESTIMATE_SEGMENT_COVERAGE_PCT {
+        return false;
+    }
+    true
+}
+
+/// Returns whether an unphased estimate is reliable enough for FASTA.
+///
+/// The candidate still carries `unphased_junction_chain` in the header, but the
+/// coverage requirement keeps this as a high-confidence sequence set rather
+/// than the full audit table.
+fn major_isoform_is_trusted_unphased_candidate(record: &MajorIsoformRecord) -> bool {
+    !record.estimate_reason.contains("unresolved_long_block")
+        && !record
+            .estimate_reason
+            .contains("unphased_single_exon_block")
+        && !record
+            .estimate_reason
+            .contains("low_segment_coverage_unannotated_long_exon")
+        && record.segment_coverage_pct >= MAJOR_MIN_CANDIDATE_SEGMENT_COVERAGE_PCT
+}
+
+/// Extracts a major isoform sequence in transcript orientation.
+fn major_isoform_sequence(
+    record: &MajorIsoformRecord,
+    reference: &HashMap<String, String>,
+) -> Result<String> {
+    let chr_seq = reference
+        .get(&record.chr)
+        .ok_or_else(|| anyhow!("missing reference sequence for {}", record.chr))?;
+    let mut seq = String::with_capacity(record.isoform_len.max(0) as usize);
+    for &(start, end) in &record.exons {
+        if start < 1 || end < start || end as usize > chr_seq.len() {
+            bail!(
+                "invalid major isoform exon coordinate {}:{}-{} for {}",
+                record.chr,
+                start,
+                end,
+                record.isoform_id
+            );
+        }
+        seq.push_str(&chr_seq[(start - 1) as usize..end as usize]);
+    }
+    if record.strand == '-' {
+        Ok(reverse_complement(&seq))
+    } else {
+        Ok(seq)
+    }
 }
 
 /// Returns the 0-based mate bucket used by `<prefix>.segments`.
@@ -7877,6 +10365,28 @@ fn strand_char(flag: i32) -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_scan_state<'a>(reference: &'a HashMap<String, String>, read_len: i32) -> ScanState<'a> {
+        ScanState {
+            circ_by_id: HashMap::new(),
+            junction_read_to_circ: HashMap::new(),
+            mate_bsj_evidence: HashMap::new(),
+            reference,
+            annotation: None,
+            circ_spans_by_chr: HashMap::new(),
+            clusters_by_chr: HashMap::new(),
+            read_len,
+            min_mapq: 10,
+            candidates: Vec::new(),
+            coverage: HashMap::new(),
+            read_mappings: HashMap::new(),
+            seen_junction_reads: HashSet::new(),
+            outward_read_ids: HashSet::new(),
+            prebuilt_segment_records: Vec::new(),
+            segment_groups: HashMap::new(),
+            stats: AsStats::default(),
+        }
+    }
 
     #[test]
     fn annotation_breaks_multi_motif_offset_ties() {
@@ -7970,6 +10480,7 @@ mod tests {
             circ_spans_by_chr: HashMap::new(),
             clusters_by_chr: HashMap::new(),
             read_len: 100,
+            min_mapq: 10,
             candidates: Vec::new(),
             coverage,
             read_mappings: HashMap::new(),
@@ -8148,6 +10659,7 @@ mod tests {
             circ_spans_by_chr: HashMap::new(),
             clusters_by_chr: HashMap::new(),
             read_len: 100,
+            min_mapq: 10,
             candidates: Vec::new(),
             coverage: HashMap::new(),
             read_mappings: HashMap::new(),
@@ -8175,6 +10687,8 @@ mod tests {
         assert_eq!(record.end, "249");
         assert_eq!(record.strand, "NA");
         assert_eq!(record.is_circular, 1);
+        assert_eq!(record.r1_align_strand, "+");
+        assert_eq!(record.r2_align_strand, "NA");
         assert_eq!(record.r1_segments, "200-249:?|<bsj>|100-149:?");
         assert_eq!(record.r1_cigar, "50M50B50M");
         assert_eq!(record.is_r1_bsj, 0);
@@ -8188,7 +10702,7 @@ mod tests {
                 chr: "chr1".to_string(),
                 pos: 100,
                 mapq: 60,
-                cigar: "150M".to_string(),
+                cigar: "1S150M21S".to_string(),
                 seq: "A".repeat(100),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
@@ -8198,7 +10712,7 @@ mod tests {
                 chr: "chr1".to_string(),
                 pos: 200,
                 mapq: 60,
-                cigar: "50M100N50M".to_string(),
+                cigar: "1S50M100N50M21S".to_string(),
                 seq: "A".repeat(100),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
@@ -8225,6 +10739,7 @@ mod tests {
             },
             clusters_by_chr: HashMap::new(),
             read_len: 100,
+            min_mapq: 10,
             candidates: Vec::new(),
             coverage: HashMap::new(),
             read_mappings: HashMap::new(),
@@ -8236,7 +10751,7 @@ mod tests {
         };
 
         assert!(is_outward_pair_group(&records, &state));
-        let record = build_outward_segment_record("read1", &records, None, 100).unwrap();
+        let record = build_outward_segment_record("read1", &records, None, 100, 10).unwrap();
 
         assert_eq!(record.type_name, "outward");
         assert_eq!(record.circ_id, "NA");
@@ -8246,9 +10761,11 @@ mod tests {
         assert_eq!(record.is_circular, 1);
         assert_eq!(record.is_r1_bsj, 0);
         assert_eq!(record.is_r2_bsj, 0);
-        assert_eq!(record.r1_cigar, "150M");
+        assert_eq!(record.r1_align_strand, "-");
+        assert_eq!(record.r2_align_strand, "+");
+        assert_eq!(record.r1_cigar, "150M1S");
         assert_eq!(record.r1_segments, "100-249:?");
-        assert_eq!(record.r2_cigar, "50M100N50M");
+        assert_eq!(record.r2_cigar, "50M100N50M1S");
         assert_eq!(record.r2_segments, "350-399:?|200-249:?");
         assert!(!record.r1_segments.contains("<bsj>"));
         assert!(!record.r2_segments.contains("<bsj>"));
@@ -8264,7 +10781,7 @@ mod tests {
                 chr: "chr1".to_string(),
                 pos: 100,
                 mapq: 60,
-                cigar: "150M".to_string(),
+                cigar: "1S150M21S".to_string(),
                 seq: "A".repeat(100),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
@@ -8274,7 +10791,7 @@ mod tests {
                 chr: "chr1".to_string(),
                 pos: 200,
                 mapq: 60,
-                cigar: "50M100N50M".to_string(),
+                cigar: "1S50M100N50M21S".to_string(),
                 seq: "A".repeat(100),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
@@ -8305,11 +10822,13 @@ mod tests {
             junction_support: None,
         };
 
-        let record = build_outward_segment_record("read1", &records, Some(&correction), 100)
+        let record = build_outward_segment_record("read1", &records, Some(&correction), 100, 10)
             .expect("annotation-supported outward row");
 
         assert_eq!(record.type_name, "outward");
         assert_eq!(record.strand, "+");
+        assert_eq!(record.r1_align_strand, "-");
+        assert_eq!(record.r2_align_strand, "+");
         assert_eq!(record.r1_segments, "100-249:+");
         assert_eq!(record.r2_segments, "350-399:+|200-249:+");
         assert!(!record.r2_segments.contains("<bsj>"));
@@ -8361,6 +10880,7 @@ mod tests {
             },
             clusters_by_chr: HashMap::new(),
             read_len: 100,
+            min_mapq: 10,
             candidates: Vec::new(),
             coverage: HashMap::new(),
             read_mappings: HashMap::new(),
@@ -8372,6 +10892,1148 @@ mod tests {
         };
 
         assert!(!is_outward_pair_group(&records, &state));
+    }
+
+    #[test]
+    fn outward_pair_groups_reject_linear_alternative_pair() {
+        let records = vec![
+            AsAlignment {
+                flag: 0x40 | 0x10,
+                chr: "chr1".to_string(),
+                pos: 100,
+                mapq: 60,
+                cigar: "1S100M21S".to_string(),
+                seq: "A".repeat(122),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 0x80,
+                chr: "chr1".to_string(),
+                pos: 250,
+                mapq: 60,
+                cigar: "1S100M21S".to_string(),
+                seq: "A".repeat(122),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 0x40 | 0x100,
+                chr: "chr1".to_string(),
+                pos: 1000,
+                mapq: 60,
+                cigar: "100M".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 0x80 | 0x10 | 0x100,
+                chr: "chr1".to_string(),
+                pos: 1120,
+                mapq: 60,
+                cigar: "100M".to_string(),
+                seq: "A".repeat(100),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+        ];
+        let reference = HashMap::new();
+        let state = test_scan_state(&reference, 122);
+
+        assert!(!is_outward_pair_group(&records, &state));
+    }
+
+    #[test]
+    fn outward_pair_groups_use_main_mapq_threshold() {
+        let records = vec![
+            AsAlignment {
+                flag: 0x40 | 0x10,
+                chr: "chr1".to_string(),
+                pos: 100,
+                mapq: 9,
+                cigar: "1S100M21S".to_string(),
+                seq: "A".repeat(122),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 0x80,
+                chr: "chr1".to_string(),
+                pos: 250,
+                mapq: 60,
+                cigar: "1S100M21S".to_string(),
+                seq: "A".repeat(122),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+        ];
+        let reference = HashMap::new();
+        let state = test_scan_state(&reference, 122);
+
+        assert!(!is_outward_pair_group(&records, &state));
+    }
+
+    #[test]
+    fn outward_geometry_accepts_unclipped_gap_without_length_cap() {
+        let reverse = AsAlignment {
+            flag: 0x40 | 0x10,
+            chr: "chr1".to_string(),
+            pos: 100,
+            mapq: 60,
+            cigar: "51M".to_string(),
+            seq: "A".repeat(51),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        };
+        let forward = AsAlignment {
+            flag: 0x80,
+            chr: "chr1".to_string(),
+            pos: 1000,
+            mapq: 60,
+            cigar: "101M".to_string(),
+            seq: "A".repeat(101),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        };
+
+        assert!(has_3p_outward_pair_geometry(
+            &reverse,
+            (100, 150),
+            &forward,
+            (1000, 1100)
+        ));
+    }
+
+    #[test]
+    fn outward_geometry_rejects_short_unclipped_outward_length() {
+        let reverse = AsAlignment {
+            flag: 0x40 | 0x10,
+            chr: "chr1".to_string(),
+            pos: 100,
+            mapq: 60,
+            cigar: "51M".to_string(),
+            seq: "A".repeat(51),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        };
+        let forward = AsAlignment {
+            flag: 0x80,
+            chr: "chr1".to_string(),
+            pos: 115,
+            mapq: 60,
+            cigar: "51M".to_string(),
+            seq: "A".repeat(51),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        };
+
+        assert!(!has_3p_outward_pair_geometry(
+            &reverse,
+            (100, 150),
+            &forward,
+            (115, 165)
+        ));
+    }
+
+    #[test]
+    fn outward_geometry_rejects_identical_unclipped_span() {
+        let reverse = AsAlignment {
+            flag: 0x40 | 0x10,
+            chr: "chr1".to_string(),
+            pos: 100,
+            mapq: 60,
+            cigar: "21M".to_string(),
+            seq: "A".repeat(151),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        };
+        let forward = AsAlignment {
+            flag: 0x80,
+            chr: "chr1".to_string(),
+            pos: 100,
+            mapq: 60,
+            cigar: "21M".to_string(),
+            seq: "A".repeat(151),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        };
+
+        assert!(!has_3p_outward_pair_geometry(
+            &reverse,
+            (100, 120),
+            &forward,
+            (100, 120)
+        ));
+    }
+
+    #[test]
+    fn outward_geometry_rejects_mate_5p_clip_overlap_tail() {
+        let reverse = AsAlignment {
+            flag: 0x40 | 0x10,
+            chr: "chr1".to_string(),
+            pos: 100,
+            mapq: 60,
+            cigar: "15S51M30S".to_string(),
+            seq: "A".repeat(96),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        };
+        let forward = AsAlignment {
+            flag: 0x80,
+            chr: "chr1".to_string(),
+            pos: 200,
+            mapq: 60,
+            cigar: "15S51M30S".to_string(),
+            seq: "A".repeat(96),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        };
+
+        assert!(!has_3p_outward_pair_geometry(
+            &reverse,
+            (100, 150),
+            &forward,
+            (100, 150)
+        ));
+    }
+
+    #[test]
+    fn outward_geometry_keeps_identical_span_with_3p_clips() {
+        let reverse = AsAlignment {
+            flag: 0x40 | 0x10,
+            chr: "chr1".to_string(),
+            pos: 100,
+            mapq: 60,
+            cigar: "109S21M21S".to_string(),
+            seq: "A".repeat(151),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        };
+        let forward = AsAlignment {
+            flag: 0x80,
+            chr: "chr1".to_string(),
+            pos: 100,
+            mapq: 60,
+            cigar: "1S21M129S".to_string(),
+            seq: "A".repeat(151),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        };
+
+        assert!(has_3p_outward_pair_geometry(
+            &reverse,
+            (100, 120),
+            &forward,
+            (100, 120)
+        ));
+    }
+
+    #[test]
+    fn major_isoform_sequence_reverse_complements_full_chain() {
+        let mut reference = HashMap::new();
+        reference.insert("chrT".to_string(), "ACCGTTTAGGCC".to_string());
+        let record = MajorIsoformRecord {
+            circ_id: "chrT:1|12".to_string(),
+            isoform_id: "chrT:1|12.major".to_string(),
+            sample_id: "sample".to_string(),
+            chr: "chrT".to_string(),
+            start: 1,
+            end: 12,
+            strand: '-',
+            source_gene_id: "gene".to_string(),
+            exons: vec![(1, 4), (9, 12)],
+            cov: 1.0,
+            segment_coverage_pct: 100.0,
+            path_score: 1.0,
+            bsj_reads: 1,
+            structure_hash: 0,
+            isoform_len: 8,
+            isoform_origin: "mature".to_string(),
+            estimate_reason: "none".to_string(),
+        };
+
+        assert_eq!(
+            major_isoform_sequence(&record, &reference).unwrap(),
+            "GGCCCGGT"
+        );
+    }
+
+    #[test]
+    fn major_isoform_fasta_skips_obvious_unresolved_estimates() {
+        let mature = MajorIsoformRecord {
+            circ_id: "chrT:1|12".to_string(),
+            isoform_id: "chrT:1|12.major".to_string(),
+            sample_id: "sample".to_string(),
+            chr: "chrT".to_string(),
+            start: 1,
+            end: 12,
+            strand: '+',
+            source_gene_id: "gene".to_string(),
+            exons: vec![(1, 12)],
+            cov: 1.0,
+            segment_coverage_pct: 100.0,
+            path_score: 1.0,
+            bsj_reads: 1,
+            structure_hash: 0,
+            isoform_len: 12,
+            isoform_origin: "mature".to_string(),
+            estimate_reason: "none".to_string(),
+        };
+        assert!(major_isoform_should_emit_fasta(&mature));
+
+        let mut usable_estimate = mature.clone();
+        usable_estimate.isoform_origin = "estimate".to_string();
+        usable_estimate.estimate_reason =
+            "gtf_long_block_projection,inferred_internal_block".to_string();
+        usable_estimate.exons = vec![(1, 6), (9, 12)];
+        usable_estimate.isoform_len = 10;
+        usable_estimate.segment_coverage_pct = 100.0;
+        assert!(major_isoform_should_emit_fasta(&usable_estimate));
+
+        let mut weakly_covered = usable_estimate.clone();
+        weakly_covered.segment_coverage_pct = 49.999;
+        assert!(!major_isoform_should_emit_fasta(&weakly_covered));
+
+        let mut unphased_chain = usable_estimate.clone();
+        unphased_chain.estimate_reason =
+            "gtf_long_block_projection,unphased_junction_chain,inferred_internal_block".to_string();
+        unphased_chain.segment_coverage_pct = 100.0;
+        unphased_chain.isoform_len = 10_000;
+        unphased_chain.bsj_reads = 1;
+        assert!(major_isoform_should_emit_fasta(&unphased_chain));
+
+        let mut weak_unphased_chain = unphased_chain.clone();
+        weak_unphased_chain.segment_coverage_pct = 89.999;
+        assert!(!major_isoform_should_emit_fasta(&weak_unphased_chain));
+
+        let mut unresolved_unphased_chain = unphased_chain;
+        unresolved_unphased_chain.estimate_reason =
+            "unresolved_long_block,unphased_junction_chain".to_string();
+        assert!(!major_isoform_should_emit_fasta(&unresolved_unphased_chain));
+
+        let mut unresolved = usable_estimate.clone();
+        unresolved.estimate_reason = "unresolved_long_block,unphased_junction_chain".to_string();
+        assert!(!major_isoform_should_emit_fasta(&unresolved));
+
+        let mut unphased_single = usable_estimate.clone();
+        unphased_single.exons = vec![(1, 100)];
+        unphased_single.isoform_len = 100;
+        unphased_single.estimate_reason = "unphased_single_exon_block".to_string();
+        assert!(!major_isoform_should_emit_fasta(&unphased_single));
+
+        let mut long_annotation_guided = usable_estimate;
+        long_annotation_guided.exons = vec![(1, 6000), (7000, 12050)];
+        long_annotation_guided.isoform_len = 11051;
+        long_annotation_guided.estimate_reason =
+            "gtf_long_block_projection,inferred_internal_block".to_string();
+        assert!(major_isoform_should_emit_fasta(&long_annotation_guided));
+
+        let mut weak_unannotated_long = long_annotation_guided;
+        weak_unannotated_long.estimate_reason =
+            "low_segment_coverage_unannotated_long_exon".to_string();
+        assert!(!major_isoform_should_emit_fasta(&weak_unannotated_long));
+    }
+
+    #[test]
+    fn major_isoforms_are_rebuilt_from_segments_file() {
+        let tmp_prefix = std::env::temp_dir().join(format!(
+            "ciri_major_isoform_segments_{}",
+            std::process::id()
+        ));
+        let segments_path = tmp_prefix.with_extension("segments");
+        let out_prefix = tmp_prefix.to_string_lossy().to_string();
+        std::fs::write(
+            &segments_path,
+            concat!(
+                "read_id\ttype\tcirc_id\tchrom\tstart\tend\tstrand\tis_circular\tis_r1_bsj\tis_r2_bsj\tr1_align_strand\tr2_align_strand\tr1_cigar\tr1_segments\tr2_cigar\tr2_segments\n",
+                "read1\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M49N21M\t280-300:+|<bsj>|100-150:+|200-220:+\tNA\tNA\n",
+                "read2\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t31M49N101M\t120-150:+|200-300:+|<bsj>|100-110:+\tNA\tNA\n",
+                "read3\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M49N21M\t280-300:+|<bsj>|100-150:+|200-220:+\tNA\tNA\n",
+            ),
+        )
+        .unwrap();
+        let circ = CircRecord {
+            id: "chrT:100|300".to_string(),
+            chr: "chrT".to_string(),
+            start: 100,
+            end: 300,
+            junction_reads: vec![
+                "read1".to_string(),
+                "read2".to_string(),
+                "read3".to_string(),
+            ],
+            junction_read_count: "3".to_string(),
+            pcc: "NA".to_string(),
+            non_junction_reads: "0".to_string(),
+            junction_reads_ratio: "1".to_string(),
+            circ_type: "exon".to_string(),
+            gene_id: "geneT".to_string(),
+            strand: "+".to_string(),
+        };
+        let mut reference = HashMap::new();
+        reference.insert("chrT".to_string(), "ACGT".repeat(100));
+
+        let count = build_major_isoforms_from_segments_file(
+            &[circ],
+            segments_path.to_str().unwrap(),
+            &out_prefix,
+            &reference,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(count, 1);
+        let gtf = std::fs::read_to_string(format!("{}.isoforms.gtf", out_prefix)).unwrap();
+        assert!(gtf.contains("\texon\t100\t150\t"));
+        assert!(gtf.contains("\texon\t200\t300\t"));
+        assert!(gtf.contains("isoform_origin \"mature\";"));
+        assert!(gtf.contains("estimate_reason \"none\";"));
+        assert!(gtf.contains("segment_coverage_pct \"100.000\";"));
+        let fasta = std::fs::read_to_string(format!("{}.isoforms.fa", out_prefix)).unwrap();
+        assert!(fasta.contains("isoform_len=152"));
+        assert!(fasta.contains("isoform_origin=mature"));
+        assert!(fasta.contains("estimate_reason=none"));
+        assert!(fasta.contains("segment_coverage_pct=100.000"));
+        let _ = std::fs::remove_file(&segments_path);
+        let _ = std::fs::remove_file(format!("{}.isoforms.gtf", out_prefix));
+        let _ = std::fs::remove_file(format!("{}.isoforms.fa", out_prefix));
+    }
+
+    #[test]
+    fn major_segment_coverage_pct_reports_selected_exon_union() {
+        let exons = vec![(100, 199), (300, 399)];
+        let spans = vec![
+            MajorAlignedSpan {
+                start: 120,
+                end: 160,
+                bsj: 1.0,
+                backward: 0.0,
+                outward: 0.0,
+            },
+            MajorAlignedSpan {
+                start: 150,
+                end: 199,
+                bsj: 0.0,
+                backward: 0.0,
+                outward: 1.0,
+            },
+            MajorAlignedSpan {
+                start: 350,
+                end: 399,
+                bsj: 0.0,
+                backward: 1.0,
+                outward: 0.0,
+            },
+        ];
+
+        assert!((major_segment_coverage_pct(&exons, &spans) - 65.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn major_segment_coverage_pct_respects_fractional_assignment() {
+        let exons = vec![(100, 199)];
+        let spans = vec![MajorAlignedSpan {
+            start: 100,
+            end: 199,
+            bsj: 0.0,
+            backward: 0.25,
+            outward: 0.0,
+        }];
+
+        assert!((major_segment_coverage_pct(&exons, &spans) - 25.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn major_non_bsj_assignment_leaves_internal_reads_mostly_unassigned() {
+        let circ_records = vec![CircRecord {
+            id: "chrT:100|1000".to_string(),
+            chr: "chrT".to_string(),
+            start: 100,
+            end: 1000,
+            junction_reads: Vec::new(),
+            junction_read_count: "1".to_string(),
+            pcc: "NA".to_string(),
+            non_junction_reads: "0".to_string(),
+            junction_reads_ratio: "1".to_string(),
+            circ_type: "exon".to_string(),
+            gene_id: "geneT".to_string(),
+            strand: "+".to_string(),
+        }];
+        let circ_by_id: HashMap<&str, usize> = circ_records
+            .iter()
+            .enumerate()
+            .map(|(idx, circ)| (circ.id.as_str(), idx))
+            .collect();
+        let circ_index_by_chr = build_major_circ_index(&circ_records);
+
+        let boundary = assign_major_circs_from_segments(
+            "backward",
+            "NA",
+            "chrT",
+            "100",
+            "1000",
+            "100-150:+|950-1000:+",
+            "NA",
+            &circ_by_id,
+            &circ_index_by_chr,
+            &circ_records,
+        );
+        assert_eq!(boundary.len(), 1);
+        assert!((boundary[0].weight - 1.0).abs() < 1e-6);
+
+        let internal = assign_major_circs_from_segments(
+            "backward",
+            "NA",
+            "chrT",
+            "450",
+            "550",
+            "450-500:+|520-550:+",
+            "NA",
+            &circ_by_id,
+            &circ_index_by_chr,
+            &circ_records,
+        );
+        assert_eq!(internal.len(), 1);
+        assert!(internal[0].weight < 0.1);
+    }
+
+    #[test]
+    fn major_unannotated_long_exon_filter_requires_complete_annotation_support() {
+        let exons = vec![(100, 2500), (3000, 3100)];
+        assert!(major_has_unannotated_long_exon(
+            &exons,
+            &[(150, 2500), (3000, 3100)]
+        ));
+        assert!(!major_has_unannotated_long_exon(
+            &exons,
+            &[(100, 2500), (3000, 3100)]
+        ));
+
+        let mut reason = "gtf_long_block_projection".to_string();
+        major_append_estimate_reason(&mut reason, "low_segment_coverage_unannotated_long_exon");
+        assert_eq!(
+            reason,
+            "gtf_long_block_projection,low_segment_coverage_unannotated_long_exon"
+        );
+    }
+
+    #[test]
+    fn major_isoform_blocks_project_to_annotation_exons() {
+        let circ = CircRecord {
+            id: "chrT:100|20500".to_string(),
+            chr: "chrT".to_string(),
+            start: 100,
+            end: 20500,
+            junction_reads: Vec::new(),
+            junction_read_count: "3".to_string(),
+            pcc: "NA".to_string(),
+            non_junction_reads: "0".to_string(),
+            junction_reads_ratio: "1".to_string(),
+            circ_type: "exon".to_string(),
+            gene_id: "geneT".to_string(),
+            strand: "+".to_string(),
+        };
+        let mut annotation = Annotation::new();
+        annotation.gene_exon_map.insert(
+            "geneT".to_string(),
+            vec![(80, 150), (220, 260), (20450, 20520)],
+        );
+
+        let annotation_exons = major_annotation_exons_for_circ(&circ, Some(&annotation));
+        assert_eq!(
+            annotation_exons,
+            vec![(100, 150), (220, 260), (20450, 20500)]
+        );
+        assert_eq!(
+            major_exons_from_edges(
+                circ.start,
+                circ.end,
+                '+',
+                &[],
+                &annotation_exons,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashMap::new(),
+                &[],
+                true,
+            )
+            .exons,
+            vec![(100, 150), (220, 260), (20450, 20500)]
+        );
+        let build = major_exons_from_edges(
+            circ.start,
+            circ.end,
+            '+',
+            &[],
+            &annotation_exons,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            true,
+        );
+        assert_eq!(build.origin(), "estimate");
+        assert_eq!(
+            build.estimate_reason(),
+            "gtf_long_block_projection,inferred_internal_block"
+        );
+    }
+
+    #[test]
+    fn major_isoform_prefers_transcript_consistent_annotation_chain() {
+        let circ = CircRecord {
+            id: "chrT:120|420".to_string(),
+            chr: "chrT".to_string(),
+            start: 120,
+            end: 420,
+            junction_reads: Vec::new(),
+            junction_read_count: "3".to_string(),
+            pcc: "NA".to_string(),
+            non_junction_reads: "0".to_string(),
+            junction_reads_ratio: "1".to_string(),
+            circ_type: "exon".to_string(),
+            gene_id: "geneT".to_string(),
+            strand: "+".to_string(),
+        };
+        let mut annotation = Annotation::new();
+        annotation.gene_exon_map.insert(
+            "geneT".to_string(),
+            vec![(100, 180), (120, 150), (220, 250), (300, 500), (390, 420)],
+        );
+        annotation.gene_transcript_exon_map.insert(
+            "geneT".to_string(),
+            vec![
+                vec![(100, 180), (300, 500)],
+                vec![(120, 150), (220, 250), (390, 420)],
+            ],
+        );
+
+        assert_eq!(
+            major_annotation_exons_for_circ(&circ, Some(&annotation)),
+            vec![(120, 150), (220, 250), (390, 420)]
+        );
+    }
+
+    #[test]
+    fn major_isoform_uses_read_anchored_hybrid_annotation_estimate() {
+        let circ = CircRecord {
+            id: "chrT:100|1534".to_string(),
+            chr: "chrT".to_string(),
+            start: 100,
+            end: 1534,
+            junction_reads: Vec::new(),
+            junction_read_count: "2".to_string(),
+            pcc: "NA".to_string(),
+            non_junction_reads: "0".to_string(),
+            junction_reads_ratio: "1".to_string(),
+            circ_type: "exon".to_string(),
+            gene_id: "geneT".to_string(),
+            strand: "+".to_string(),
+        };
+        let mut annotation = Annotation::new();
+        annotation.gene_exon_map.insert(
+            "geneT".to_string(),
+            vec![(100, 267), (100, 1397), (1406, 1534), (1477, 1534)],
+        );
+        annotation.gene_transcript_exon_map.insert(
+            "geneT".to_string(),
+            vec![vec![(100, 267), (1406, 1534)], vec![(100, 1397)]],
+        );
+        let spans = vec![
+            MajorAlignedSpan {
+                start: 100,
+                end: 199,
+                bsj: 1.0,
+                backward: 0.0,
+                outward: 0.0,
+            },
+            MajorAlignedSpan {
+                start: 248,
+                end: 415,
+                bsj: 1.0,
+                backward: 0.0,
+                outward: 0.0,
+            },
+            MajorAlignedSpan {
+                start: 1465,
+                end: 1534,
+                bsj: 1.0,
+                backward: 0.0,
+                outward: 0.0,
+            },
+        ];
+
+        let annotation_exons =
+            major_projection_annotation_exons_for_circ(&circ, Some(&annotation), &spans);
+        assert_eq!(annotation_exons, vec![(100, 1397), (1406, 1534)]);
+
+        let build = major_exons_from_edges(
+            circ.start,
+            circ.end,
+            '+',
+            &[],
+            &annotation_exons,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &spans,
+            true,
+        );
+        assert_eq!(build.exons, vec![(100, 1397), (1406, 1534)]);
+        assert_eq!(build.origin(), "estimate");
+        assert_eq!(
+            build.estimate_reason(),
+            "gtf_long_block_projection,inferred_internal_block"
+        );
+    }
+
+    #[test]
+    fn major_isoform_infers_unphased_short_blocks_from_annotation() {
+        let annotation_exons = vec![(100, 150), (220, 260), (450, 500)];
+        let build = major_exons_from_edges(
+            100,
+            500,
+            '+',
+            &[],
+            &annotation_exons,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            true,
+        );
+        assert_eq!(build.exons, vec![(100, 150), (220, 260), (450, 500)]);
+        assert_eq!(build.origin(), "estimate");
+        assert_eq!(
+            build.estimate_reason(),
+            "gtf_long_block_projection,inferred_internal_block"
+        );
+    }
+
+    #[test]
+    fn major_isoform_uses_exclusion_to_avoid_annotation_over_split() {
+        let annotation_exons = vec![(100, 150), (220, 260), (450, 500)];
+        let spans = vec![MajorAlignedSpan {
+            start: 100,
+            end: 500,
+            bsj: 1.0,
+            backward: 0.0,
+            outward: 0.0,
+        }];
+        let build = major_exons_from_edges(
+            100,
+            500,
+            '+',
+            &[],
+            &annotation_exons,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &spans,
+            true,
+        );
+        assert_eq!(build.exons, vec![(100, 500)]);
+        assert_eq!(build.origin(), "mature");
+        assert_eq!(build.estimate_reason(), "none");
+    }
+
+    #[test]
+    fn major_isoform_marks_uncovered_single_exon_as_estimate() {
+        let spans = vec![
+            MajorAlignedSpan {
+                start: 100,
+                end: 160,
+                bsj: 1.0,
+                backward: 0.0,
+                outward: 0.0,
+            },
+            MajorAlignedSpan {
+                start: 340,
+                end: 500,
+                bsj: 1.0,
+                backward: 0.0,
+                outward: 0.0,
+            },
+        ];
+        let build = major_exons_from_edges(
+            100,
+            500,
+            '+',
+            &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &spans,
+            true,
+        );
+        assert_eq!(build.exons, vec![(100, 500)]);
+        assert_eq!(build.origin(), "estimate");
+        assert_eq!(build.estimate_reason(), "unphased_single_exon_block");
+    }
+
+    #[test]
+    fn major_isoform_keeps_covered_single_exon_mature() {
+        let spans = vec![
+            MajorAlignedSpan {
+                start: 100,
+                end: 260,
+                bsj: 1.0,
+                backward: 0.0,
+                outward: 0.0,
+            },
+            MajorAlignedSpan {
+                start: 261,
+                end: 500,
+                bsj: 0.0,
+                backward: 1.0,
+                outward: 0.0,
+            },
+        ];
+        let build = major_exons_from_edges(
+            100,
+            500,
+            '+',
+            &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &spans,
+            true,
+        );
+        assert_eq!(build.exons, vec![(100, 500)]);
+        assert_eq!(build.origin(), "mature");
+        assert_eq!(build.estimate_reason(), "none");
+    }
+
+    #[test]
+    fn major_isoform_marks_annotation_only_single_exon_as_estimate() {
+        let build = major_exons_from_edges(
+            100,
+            500,
+            '+',
+            &[],
+            &[(100, 500)],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            true,
+        );
+        assert_eq!(build.exons, vec![(100, 500)]);
+        assert_eq!(build.origin(), "estimate");
+        assert_eq!(build.estimate_reason(), "unphased_single_exon_block");
+    }
+
+    #[test]
+    fn major_isoform_rejects_clipped_annotation_single_exon_as_mature() {
+        let build = major_exons_from_edges(
+            100,
+            400,
+            '+',
+            &[],
+            &[(100, 400)],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            true,
+        );
+        assert_eq!(build.exons, vec![(100, 400)]);
+        assert_eq!(build.origin(), "estimate");
+        assert_eq!(build.estimate_reason(), "unphased_single_exon_block");
+    }
+
+    #[test]
+    fn major_isoform_uses_read_supported_junction_inside_unphased_block() {
+        let edge = MajorEdge {
+            donor_end: 150,
+            acceptor_start: 450,
+            strand: '+',
+        };
+        let mut support = HashMap::new();
+        support.insert(
+            edge,
+            MajorEdgeSupport {
+                bsj: 1.0,
+                backward: 0.0,
+                outward: 0.0,
+            },
+        );
+        let build = major_exons_from_edges(
+            100,
+            500,
+            '+',
+            &[],
+            &[],
+            &support,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            false,
+        );
+        assert_eq!(build.exons, vec![(100, 150), (450, 500)]);
+        assert_eq!(build.origin(), "estimate");
+        assert_eq!(
+            build.estimate_reason(),
+            "unphased_junction_chain,inferred_internal_block"
+        );
+    }
+
+    #[test]
+    fn major_isoform_marks_unphased_junction_chain_as_estimate() {
+        let edges = vec![
+            MajorEdge {
+                donor_end: 150,
+                acceptor_start: 220,
+                strand: '+',
+            },
+            MajorEdge {
+                donor_end: 260,
+                acceptor_start: 450,
+                strand: '+',
+            },
+        ];
+        let build = major_exons_from_edges(
+            100,
+            500,
+            '+',
+            &edges,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+            false,
+        );
+        assert_eq!(build.exons, vec![(100, 150), (220, 260), (450, 500)]);
+        assert_eq!(build.origin(), "estimate");
+        assert_eq!(build.estimate_reason(), "unphased_junction_chain");
+    }
+
+    #[test]
+    fn major_isoform_requires_bsj_boundary_phasing_for_single_internal_edge() {
+        let edge = MajorEdge {
+            donor_end: 150,
+            acceptor_start: 450,
+            strand: '+',
+        };
+        let no_boundary_support = HashMap::new();
+        let no_boundary_exclusion = HashMap::new();
+        assert!(!major_chain_has_adjacent_link_support(
+            &[edge],
+            &no_boundary_support,
+            &no_boundary_exclusion
+        ));
+
+        let mut boundary_support = HashMap::new();
+        boundary_support.insert(
+            MajorJunctionLink::new(MajorJunction::Bsj, MajorJunction::Edge(edge)),
+            MajorLinkSupport {
+                bsj: 0.0,
+                backward: 0.0,
+                outward: 1.0,
+            },
+        );
+        assert!(!major_chain_has_adjacent_link_support(
+            &[edge],
+            &boundary_support,
+            &no_boundary_exclusion
+        ));
+
+        boundary_support.insert(
+            MajorJunctionLink::new(MajorJunction::Bsj, MajorJunction::Edge(edge)),
+            MajorLinkSupport {
+                bsj: 1.0,
+                backward: 0.0,
+                outward: 0.0,
+            },
+        );
+        assert!(!major_chain_has_adjacent_link_support(
+            &[edge],
+            &boundary_support,
+            &no_boundary_exclusion
+        ));
+        boundary_support.insert(
+            MajorJunctionLink::new(MajorJunction::Edge(edge), MajorJunction::Bsj),
+            MajorLinkSupport {
+                bsj: 0.0,
+                backward: 1.0,
+                outward: 0.0,
+            },
+        );
+        assert!(major_chain_has_adjacent_link_support(
+            &[edge],
+            &boundary_support,
+            &no_boundary_exclusion
+        ));
+        let mut boundary_exclusion = HashMap::new();
+        boundary_exclusion.insert(
+            MajorJunctionLink::new(MajorJunction::Bsj, MajorJunction::Edge(edge)),
+            MajorLinkSupport {
+                bsj: 1.0,
+                backward: 0.0,
+                outward: 0.0,
+            },
+        );
+        assert!(!major_chain_has_adjacent_link_support(
+            &[edge],
+            &boundary_support,
+            &boundary_exclusion
+        ));
+    }
+
+    #[test]
+    fn major_segment_junction_chain_keeps_bsj_boundary_tokens() {
+        let circ = CircRecord {
+            id: "chrT:100|500".to_string(),
+            chr: "chrT".to_string(),
+            start: 100,
+            end: 500,
+            junction_reads: Vec::new(),
+            junction_read_count: "1".to_string(),
+            pcc: "NA".to_string(),
+            non_junction_reads: "0".to_string(),
+            junction_reads_ratio: "1".to_string(),
+            circ_type: "exon".to_string(),
+            gene_id: "geneT".to_string(),
+            strand: "+".to_string(),
+        };
+        let junctions = major_segment_junction_chain("480-500:+|<bsj>|100-150:+|450-470:+", &circ);
+        assert_eq!(
+            junctions,
+            vec![
+                MajorJunction::Bsj,
+                MajorJunction::Edge(MajorEdge {
+                    donor_end: 150,
+                    acceptor_start: 450,
+                    strand: '+',
+                })
+            ]
+        );
+        assert_eq!(
+            major_adjacent_junction_links(&junctions),
+            vec![MajorJunctionLink::new(
+                MajorJunction::Bsj,
+                MajorJunction::Edge(MajorEdge {
+                    donor_end: 150,
+                    acceptor_start: 450,
+                    strand: '+',
+                })
+            )]
+        );
+    }
+
+    #[test]
+    fn major_segment_reused_overlap_excludes_mature_phasing() {
+        let circ = CircRecord {
+            id: "chr18:29234877|29255341".to_string(),
+            chr: "chr18".to_string(),
+            start: 29234877,
+            end: 29255341,
+            junction_reads: Vec::new(),
+            junction_read_count: "1".to_string(),
+            pcc: "NA".to_string(),
+            non_junction_reads: "0".to_string(),
+            junction_reads_ratio: "1".to_string(),
+            circ_type: "exon".to_string(),
+            gene_id: "NA".to_string(),
+            strand: "-".to_string(),
+        };
+        let reused = "29255287-29255344:-|<bsj>|29236698-29236725:-|29255273-29255337:-";
+        assert!(major_segment_has_reused_overlap(reused, &circ));
+
+        let edge = MajorEdge {
+            donor_end: 29236725,
+            acceptor_start: 29255273,
+            strand: '-',
+        };
+        let mut support = HashMap::new();
+        support.insert(
+            MajorJunctionLink::new(MajorJunction::Bsj, MajorJunction::Edge(edge)),
+            MajorLinkSupport {
+                bsj: 1.0,
+                backward: 0.0,
+                outward: 0.0,
+            },
+        );
+        support.insert(
+            MajorJunctionLink::new(MajorJunction::Edge(edge), MajorJunction::Bsj),
+            MajorLinkSupport {
+                bsj: 1.0,
+                backward: 0.0,
+                outward: 0.0,
+            },
+        );
+        let mut exclusion = HashMap::new();
+        exclusion.insert(
+            MajorJunctionLink::new(MajorJunction::Bsj, MajorJunction::Edge(edge)),
+            MajorLinkSupport {
+                bsj: 1.0,
+                backward: 0.0,
+                outward: 0.0,
+            },
+        );
+        assert!(!major_chain_has_adjacent_link_support(
+            &[edge],
+            &support,
+            &exclusion
+        ));
+    }
+
+    #[test]
+    fn major_isoform_filters_chimeric_mate_before_graph_support() {
+        let tmp_prefix = std::env::temp_dir().join(format!(
+            "ciri_major_isoform_chimeric_{}",
+            std::process::id()
+        ));
+        let segments_path = tmp_prefix.with_extension("segments");
+        let out_prefix = tmp_prefix.to_string_lossy().to_string();
+        std::fs::write(
+            &segments_path,
+            concat!(
+                "read_id\ttype\tcirc_id\tchrom\tstart\tend\tstrand\tis_circular\tis_r1_bsj\tis_r2_bsj\tr1_align_strand\tr2_align_strand\tr1_cigar\tr1_segments\tr2_cigar\tr2_segments\n",
+                "read1\tbsj\tchrT:100|300\tchrT\t100\t300\t-\t1\t1\t1\t+\t-\t58M80B21M69N51M\t246-303:-|<bsj>|150-170:-|240-290:-\t21M69N61M109B31M\t150-170:-|240-300:-|<bsj>|100-130:-\n",
+            ),
+        )
+        .unwrap();
+        let circ = CircRecord {
+            id: "chrT:100|300".to_string(),
+            chr: "chrT".to_string(),
+            start: 100,
+            end: 300,
+            junction_reads: vec!["read1".to_string()],
+            junction_read_count: "1".to_string(),
+            pcc: "NA".to_string(),
+            non_junction_reads: "0".to_string(),
+            junction_reads_ratio: "1".to_string(),
+            circ_type: "exon".to_string(),
+            gene_id: "NA".to_string(),
+            strand: "-".to_string(),
+        };
+        let mut reference = HashMap::new();
+        reference.insert("chrT".to_string(), "ACGT".repeat(100));
+
+        let count = build_major_isoforms_from_segments_file(
+            &[circ],
+            segments_path.to_str().unwrap(),
+            &out_prefix,
+            &reference,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(count, 1);
+        let gtf = std::fs::read_to_string(format!("{}.isoforms.gtf", out_prefix)).unwrap();
+        assert!(gtf.contains("\texon\t100\t170\t"));
+        assert!(gtf.contains("\texon\t240\t300\t"));
+        assert!(gtf.contains("isoform_origin \"estimate\";"));
+        assert!(gtf.contains("estimate_reason \"unphased_junction_chain\";"));
+        let _ = std::fs::remove_file(&segments_path);
+        let _ = std::fs::remove_file(format!("{}.isoforms.gtf", out_prefix));
+        let _ = std::fs::remove_file(format!("{}.isoforms.fa", out_prefix));
     }
 
     #[test]
@@ -8422,6 +12084,7 @@ mod tests {
                 map
             },
             read_len: 150,
+            min_mapq: 10,
             candidates: Vec::new(),
             coverage: HashMap::new(),
             read_mappings: HashMap::new(),
@@ -8937,6 +12600,8 @@ mod tests {
                 is_circular: 1,
                 is_r1_bsj: 0,
                 is_r2_bsj: 0,
+                r1_align_strand: "NA".to_string(),
+                r2_align_strand: "NA".to_string(),
                 r1_cigar: "NA".to_string(),
                 r1_segments: "NA".to_string(),
                 r2_cigar: "NA".to_string(),
@@ -8953,6 +12618,8 @@ mod tests {
                 is_circular: 1,
                 is_r1_bsj: 0,
                 is_r2_bsj: 0,
+                r1_align_strand: "NA".to_string(),
+                r2_align_strand: "NA".to_string(),
                 r1_cigar: "NA".to_string(),
                 r1_segments: "NA".to_string(),
                 r2_cigar: "NA".to_string(),
@@ -8969,6 +12636,8 @@ mod tests {
                 is_circular: 1,
                 is_r1_bsj: 1,
                 is_r2_bsj: 0,
+                r1_align_strand: "NA".to_string(),
+                r2_align_strand: "NA".to_string(),
                 r1_cigar: "NA".to_string(),
                 r1_segments: "NA".to_string(),
                 r2_cigar: "NA".to_string(),
