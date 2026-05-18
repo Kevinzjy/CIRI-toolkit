@@ -10253,6 +10253,15 @@ fn major_isoform_should_emit_fasta(record: &MajorIsoformRecord) -> bool {
     if record.isoform_origin != "estimate" {
         return false;
     }
+    if record
+        .estimate_reason
+        .contains("low_segment_coverage_unannotated_long_exon")
+    {
+        return false;
+    }
+    if record.segment_coverage_pct >= MAJOR_MIN_CANDIDATE_SEGMENT_COVERAGE_PCT {
+        return true;
+    }
     if record.estimate_reason.contains("unresolved_long_block") {
         return false;
     }
@@ -10262,12 +10271,6 @@ fn major_isoform_should_emit_fasta(record: &MajorIsoformRecord) -> bool {
     if record
         .estimate_reason
         .contains("unphased_single_exon_block")
-    {
-        return false;
-    }
-    if record
-        .estimate_reason
-        .contains("low_segment_coverage_unannotated_long_exon")
     {
         return false;
     }
@@ -11210,17 +11213,23 @@ mod tests {
         let mut unresolved_unphased_chain = unphased_chain;
         unresolved_unphased_chain.estimate_reason =
             "unresolved_long_block,unphased_junction_chain".to_string();
-        assert!(!major_isoform_should_emit_fasta(&unresolved_unphased_chain));
+        assert!(major_isoform_should_emit_fasta(&unresolved_unphased_chain));
 
         let mut unresolved = usable_estimate.clone();
         unresolved.estimate_reason = "unresolved_long_block,unphased_junction_chain".to_string();
+        unresolved.segment_coverage_pct = 89.999;
         assert!(!major_isoform_should_emit_fasta(&unresolved));
 
         let mut unphased_single = usable_estimate.clone();
         unphased_single.exons = vec![(1, 100)];
         unphased_single.isoform_len = 100;
         unphased_single.estimate_reason = "unphased_single_exon_block".to_string();
+        unphased_single.segment_coverage_pct = 89.999;
         assert!(!major_isoform_should_emit_fasta(&unphased_single));
+
+        let mut covered_unphased_single = unphased_single.clone();
+        covered_unphased_single.segment_coverage_pct = 98.0;
+        assert!(major_isoform_should_emit_fasta(&covered_unphased_single));
 
         let mut long_annotation_guided = usable_estimate;
         long_annotation_guided.exons = vec![(1, 6000), (7000, 12050)];

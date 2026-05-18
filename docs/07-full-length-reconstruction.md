@@ -45,7 +45,7 @@ isoforms -> parse <prefix>.segments
 - 主流程在写完 `<prefix>.out` 后默认继续执行 segments 后处理。
 - segments 阶段输出 confirmed BSJ reads、`type=backward` 和 `type=outward` 的 read-level segments。
 - isoforms 阶段只输出每个 circRNA 的 major isoform；多 isoform candidate/search space 暂不作为用户最终输出。
-- 正式用户输出包括 `<prefix>.out`、`<prefix>.bsj`、`<prefix>.segments`、`<prefix>.isoforms.gtf` 和 `<prefix>.isoforms.fa`；`.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj` 和 `.part_XXXX.tmp` 都是内部临时协议。
+- 正式用户输出包括 `<prefix>.out`、`<prefix>.bsj`、`<prefix>.segments`、`<prefix>.isoforms.gtf`、`<prefix>.isoforms.fa` 和 IGV review sidecar；`.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj` 和 `.part_XXXX.tmp` 都是内部临时协议。
 
 ## 2. 为什么先做 segments，不直接做 full-length
 
@@ -609,10 +609,18 @@ isoform 输出必须建立在 read-level segments 稳定的前提上。当前单
 
 ## 11. 当前 major isoform 输出协议
 
-当前 Rust 主流程在 `<prefix>.segments` 写出后默认重新读取该文件，执行 circ-local segment graph reconstruction，并写出：
+当前 Rust 主流程在 `<prefix>.out` 写出后生成 BSJ BEDPE review track；在 `<prefix>.segments` 写出后默认重新读取该文件，执行 circ-local segment graph reconstruction，并写出：
 
 - `<prefix>.isoforms.gtf`
 - `<prefix>.isoforms.fa`
+- `<prefix>.bedpe`
+- `<prefix>.segments.bam`
+- `<prefix>.segments.bam.bai`
+
+其中 IGV sidecar 只用于人工 review：
+
+- `<prefix>.bedpe` 在 `<prefix>.out` 写出时同步生成，每个 circRNA 一条 BSJ anchor pair；它只展示已识别 BSJ，不考虑内部结构，score 使用原始 `#junction_reads`；
+- `<prefix>.segments.bam` 在 `<prefix>.segments` 写出时同步生成坐标排序 synthetic alignment，并同步写出 `<prefix>.segments.bam.bai`；internal junction 用 `N` CIGAR，遇到 `<bsj>` / `B` marker 时拆成同 read 的多条 alignment，`YC`/`RG`/`ZT`/`CI` tags 记录颜色、read group、read type 和 circRNA 来源。
 
 每个 Summary-confirmed circRNA 输出一个 `isoform_class "major"` 结构。GTF 包含 `circRNA`、`transcript` 和 `exon` feature；核心 attributes 包括：
 
@@ -742,11 +750,27 @@ CLI 的 `--continue` 也遵守这个边界：已有 `<prefix>.segments` 时只�
 
 ## 13. IGV 可视化规划
 
-当前 major isoform 功能已经可以作为第一版可用输出，但后续结构改进很难只靠表格判断。建议新增一个独立的 visualization post-processing 工具，从 `<prefix>.segments`、`<prefix>.out` 和 `<prefix>.isoforms.gtf` 生成 IGV 友好的 sidecar tracks。该工具不进入核心 CIRI3 parity 路径，也不改变 `.out/.bsj/.segments/.isoforms.*`。
+当前 major isoform 功能已经可以作为第一版可用输出，但后续结构改进很难只靠表格判断。当前主流程已默认生成两个最小 IGV review sidecar：`<prefix>.bedpe` 和 `<prefix>.segments.bam/.bai`。它们不进入核心 CIRI3 parity 路径，也不改变 `.out/.bsj/.segments/.isoforms.*`。
 
 IGV 可直接加载 BAM、BED、GTF、BEDPE 和 interact 等 data tracks；IGV/igv.js 的 splice-junction / sashimi 类视图也适合表达普通 exon-exon junction。BSJ 的特殊性在于它不是线性 genome 上的普通 junction，因此不能只依赖 IGV 自动从 BAM 里推断 splice junction，需要显式写出 circRNA-aware tracks。
 
-建议输出四类 track：
+当前已实现 v1 track：
+
+1. `<prefix>.bedpe`
+   - 从 `.out` 生成；
+   - 每条 Summary-confirmed circRNA 一条 BEDPE；
+   - 左 anchor 为 circ start，右 anchor 为 circ end；
+   - name 为 `circ_id`，score 为原始 BSJ read count；
+   - 不表达内部结构，只用于快速查看已识别 BSJ 位置和 cluster。
+2. `<prefix>.segments.bam` / `<prefix>.segments.bam.bai`
+   - 从 `.segments` 生成坐标排序 synthetic BAM；
+   - 每条 read/mate chain 生成一个或多个 alignment；
+   - 普通 internal `N` junction 表现为 CIGAR `N`；
+   - `<bsj>` / `B` marker 会切开当前 mate chain，生成同 read 的下一条 `partN` alignment；
+   - `YC` tag 固定按 read type 写入 RGB，`RG` tag 设为 `bsj/backward/outward`，`ZT`/`CI` tags 保留 read type 和 circRNA 来源；
+   - BAI index 作为大数据 IGV review 的主入口。
+
+后续可继续补充四类 track：
 
 1. `*.segments.reads.bed`
    - 每个 retained segment block 写一条 BED block 或 BED12 item；
@@ -756,7 +780,7 @@ IGV 可直接加载 BAM、BED、GTF、BEDPE 和 interact 等 data tracks；IGV/i
    - 普通 internal `N` junction 写成 splice-junction BED / BED12；
    - score 使用支持 read 数或加权 support；
    - annotated / novel / exclusive conflict 用不同 itemRgb 或 name tag 标记。
-3. `*.segments.bsj.bedpe` 或 `*.segments.bsj.interact`
+3. `*.segments.bedpe` 或 `*.segments.bsj.interact`
    - 每条 BSJ 写成两个 anchor interval 的 pairwise arc；
    - 左 anchor 对应 circ start 侧，右 anchor 对应 circ end 侧；
    - score 使用 BSJ reads，color 按 `mature`、`sequence_high`、`structure_unresolved` 分层；
@@ -779,7 +803,7 @@ BSJ 关系的推荐表达方式是“线性 exon / segment track + BSJ arc track
 后续实现顺序建议：
 
 1. 先做 `ciri visualize --segments <prefix>.segments --isoforms <prefix>.isoforms.gtf --out <prefix>.igv` 的只读工具；
-2. v1 只输出 `isoforms.review.gtf`、`bsj.bedpe/interact` 和 `junctions.bed`，不生成 BAM；
+2. v1 输出 `isoforms.review.gtf`、`bsj.bedpe/interact`、`junctions.bed` 和 indexed synthetic BAM；
 3. v2 增加 per-circ read-list 和可选 mini-BAM extraction；
 4. v3 再考虑 igv.js HTML report，把多个 track 和目标 circRNA loci 打包成一个可分享的 review 页面。
 

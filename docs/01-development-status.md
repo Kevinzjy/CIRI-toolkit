@@ -34,7 +34,7 @@ CIRI-toolkit 是 CIRI3（Java）的 Rust 复现版本，目标是在保持判定
 - `tests/chr1` BAM / SAM 基线继续保持 circ/read/read-assignment/FSJ 四层 100% 对齐。
 - `<prefix>.bsj1` 和 `<prefix>.bsj2` 已升级为 mate-level BSJ 中间文件，包含 `mate_label` 与 `priority`；`Summary` 只消费 `priority=1` 行，最终 `<prefix>.bsj` 保留 `priority=0` 行供后续内部 splice site 识别使用。
 - 当前运行路径不再生成额外 `<prefix>.scan1.tmp`、`<prefix>.scan2.tmp` 或 `<prefix>.bsj.raw.tmp`。
-- 当前正式用户输出为 `<prefix>.out`、`<prefix>.bsj` 和 `<prefix>.segments`；`.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj` 以及 `.part_XXXX.tmp` shard 文件均为内部临时文件，默认成功运行后删除，`--debug` 时保留。
+- 当前正式用户输出为 `<prefix>.out`、`<prefix>.bsj`、`<prefix>.segments`、major isoform 文件和 IGV review sidecar；`.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj` 以及 `.part_XXXX.tmp` shard 文件均为内部临时文件，默认成功运行后删除，`--debug` 时保留。
 - 单端测序数据的专项验证已完成，当前输出与 Java 基线完全一致。
 - 大规模 hg38 验证表明：当 Rust 与 Java 使用一致的参考 FASTA / GTF 版本时，`BSJ reads` 与 `FSJ counts` 已完成全量对齐。
 - 当前推荐的 hg38 对齐口径为：
@@ -86,9 +86,9 @@ python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-r
 
 ## 后续开发计划
 - 高优先级功能点：在当前 `priority` 协议基础上继续推进真正的 paired-end R1/R2 BSJ 决策。当前默认路径仍采用 CIRI3 read-pair first-hit 语义；后续更合理的方向是先做 mate-level candidate 收集，再做 pair-level 决策，最后仍按 read-pair-level 计数。R1/R2 支持同一 BSJ 时应记录一致支持，支持不同 BSJ 时应显式标记冲突或 ambiguity。
-- 当前 CIRI-AS-style read-level segments reconstruction 和 major isoform 输出已进入可用的第一版：以 Summary confirmed BSJ、Scan1/Scan2 sidecar evidence 和 non-BSJ topology sidecar 为输入，默认输出 `<prefix>.segments`、`<prefix>.isoforms.gtf` 和可信度更严格的 `<prefix>.isoforms.fa`。
+- 当前 CIRI-AS-style read-level segments reconstruction 和 major isoform 输出已进入可用的第一版：以 Summary confirmed BSJ、Scan1/Scan2 sidecar evidence 和 non-BSJ topology sidecar 为输入，默认输出 `<prefix>.segments`、`<prefix>.isoforms.gtf`、可信度更严格的 `<prefix>.isoforms.fa`，以及用于 IGV review 的 `<prefix>.bedpe` / `<prefix>.segments.bam`。
 - 当前默认后处理不依赖 RO remap，不新增 circ seed，不改变 `priority=1` 主流程证据和 `.out`；isoform 阶段从已写出的 `<prefix>.segments` 重新解析，方便 `--continue` 调试和后续多样本整合。
-- 后续结构改进优先补一个 IGV visualization sidecar：把 segment blocks、internal junctions、BSJ closure arcs 和 confidence tiers 拆成可叠加 track，用于人工 review 高支持但结构仍 unresolved 的候选。
+- IGV visualization sidecar 当前先提供两个最小 track：`.bedpe` 在 `.out` 写出时展示识别到的 BSJ anchor pair，`.segments.bam/.bai` 在 `.segments` 写出时以合成 alignment 展示 bsj/backward/outward read 的 R1/R2 aligned blocks。BAM 中 internal junction 用 `N` CIGAR，`<bsj>` / `B` marker 拆成同 read 的多条 alignment，并写入 `YC` 与 `RG` tags 供 IGV 按固定 RGB 或 read group 着色。后续再补 internal junction arcs、confidence tier tracks 和 per-circ mini-BAM/read-list。
 - CIRI-AS / CIRI-full 尚未经过本项目同等级别的严格验证和性能优化，后续不以完整复刻其所有历史输出为目标；CIRI-AS 主要提供内部结构识别思路，CIRI-full/RO 暂作为未来 side evidence 风险清单。
 - CIRI-AS sidecar 的 splice signal 阶段已明确采用 annotation-aware motif / strand / offset tie-break：当 annotation exon boundary 支持某个解释时，优先于 Perl v1.2 的 `AC/CT elsif AG/GT` 与 hash-order offset 行为；这是有意偏离 Perl 输出、追求稳定和边界可解释性的设计选择。
 - CIRI-AS sidecar 的 splice signal 阶段、annotation-aware motif / strand / offset tie-break 与 read-group 识别逻辑继续保留，用于支撑 `<prefix>.segments` 的 best-chain 选择和 segment 边界解释。

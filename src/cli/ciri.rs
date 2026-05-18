@@ -7,9 +7,13 @@
 use anyhow::{bail, Result};
 use chrono::Local;
 use clap::Parser;
-use std::fs::File;
+use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::env;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
+use std::process::Command;
 use std::time::Instant;
 
 use crate::annotation::Annotation;
@@ -26,6 +30,16 @@ use crate::utils::{
     segments1_path_for_output, segments2_path_for_output, segments_non_bsj_path_for_output,
     trace_path_for_output,
 };
+
+const IGV_BSJ_COLOR: &str = "220,53,69";
+const IGV_BACKWARD_COLOR: &str = "25,118,210";
+const IGV_OUTWARD_COLOR: &str = "245,124,0";
+
+#[derive(Debug, Clone, Copy)]
+struct IgvSegmentsBamStats {
+    segment_rows: usize,
+    segment_bam_written: bool,
+}
 
 /// Parsed command-line arguments for the end-to-end pipeline.
 ///
@@ -44,7 +58,7 @@ struct Args {
     in_sam: String,
 
     /// Output prefix; final outputs include `.out`, `.bsj`, `.segments`,
-    /// `.isoforms.gtf`, and `.isoforms.fa` sidecars.
+    /// `.isoforms.gtf`, `.isoforms.fa`, and IGV review sidecars.
     #[arg(short = 'o', long = "out")]
     out_prefix: String,
 
@@ -169,6 +183,600 @@ fn write_display_bsj(final_bsj: &str, bsj1_path: &str, bsj2_path: &str) -> Resul
     Ok(())
 }
 
+/// Writes the `.out`-scoped BEDPE track and records the sidecar in the run log.
+fn write_and_log_bsj_bedpe(
+    log_writer: &mut BufWriter<File>,
+    out_prefix: &str,
+    result_output: &str,
+) -> Result<()> {
+    let bedpe_path = format!("{}.bedpe", out_prefix);
+    let rows = write_bsj_bedpe_from_out(result_output, &bedpe_path)?;
+    log_info(
+        log_writer,
+        "BSJ BEDPE output",
+        &format!("{} ({} BSJs)", bedpe_path, rows),
+    )?;
+    Ok(())
+}
+
+/// Converts Summary-confirmed circRNA sites into a BEDPE BSJ arc track.
+///
+/// The BEDPE track intentionally ignores internal structure: each `.out` row
+/// becomes one pair connecting the left and right BSJ anchors. BED coordinates
+/// are 0-based half-open, while CIRI `.out` coordinates are 1-based closed.
+fn write_bsj_bedpe_from_out(out_path: &str, bedpe_path: &str) -> Result<usize> {
+    let file = File::open(out_path)?;
+    let reader = BufReader::new(file);
+    let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(bedpe_path)?);
+    let mut rows = 0usize;
+    for line_result in reader.lines() {
+        let line = line_result?;
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() < 5 {
+            continue;
+        }
+        let Ok(start) = cols[2].parse::<i32>() else {
+            continue;
+        };
+        let Ok(end) = cols[3].parse::<i32>() else {
+            continue;
+        };
+        if start < 1 || end < start {
+            continue;
+        }
+        let score = cols
+            .get(4)
+            .copied()
+            .filter(|value| value.parse::<i64>().is_ok())
+            .unwrap_or("0");
+        let strand = cols.get(10).copied().unwrap_or(".");
+        writeln!(
+            writer,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            cols[1],
+            start - 1,
+            start,
+            cols[1],
+            end - 1,
+            end,
+            cols[0],
+            score,
+            strand,
+            strand
+        )?;
+        rows += 1;
+    }
+    writer.flush()?;
+    Ok(rows)
+}
+
+/// Writes the `.segments`-scoped synthetic BAM/BAI track and records the result.
+fn write_and_log_segments_bam(
+    log_writer: &mut BufWriter<File>,
+    segments_output: &str,
+    out_prefix: &str,
+    reference_lengths: &HashMap<String, usize>,
+    threads: usize,
+) -> Result<()> {
+    let bam_path = format!("{}.segments.bam", out_prefix);
+    let stats = write_segments_review_tracks_from_segments(
+        segments_output,
+        &bam_path,
+        out_prefix,
+        reference_lengths,
+        threads,
+    )?;
+    let message = if stats.segment_bam_written {
+        format!("{} ({} segment rows) + .bai", bam_path, stats.segment_rows)
+    } else {
+        format!(
+            "{} skipped (samtools not found; {} segment rows parsed)",
+            bam_path, stats.segment_rows
+        )
+    };
+    log_info(log_writer, "Segments BAM output", &message)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IgvSegmentsColumns {
+    read_id: usize,
+    type_name: usize,
+    circ_id: usize,
+    chrom: usize,
+    r1_segments: usize,
+    r2_segments: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct IgvChromSortKey {
+    group: u8,
+    rank: u32,
+    suffix: String,
+}
+
+#[derive(Debug, Clone)]
+struct IgvSegmentRow {
+    chrom_key: IgvChromSortKey,
+    chrom: String,
+    chrom_start: i32,
+    chrom_end: i32,
+    name: String,
+    sam_line: Option<String>,
+}
+
+/// Converts read-level segment chains into an indexed BAM review track.
+///
+/// Each R1/R2 chain is split at explicit `<bsj>` markers so BSJ-crossing pieces
+/// render as separate IGV alignments. Within each piece, ordinary internal
+/// junctions remain CIGAR `N` gaps. Rows are coordinate-sorted before BAM
+/// conversion so IGV region loading can use the generated BAI index.
+fn write_segments_review_tracks_from_segments(
+    segments_path: &str,
+    bam_path: &str,
+    out_prefix: &str,
+    reference_lengths: &HashMap<String, usize>,
+    threads: usize,
+) -> Result<IgvSegmentsBamStats> {
+    let file = File::open(segments_path)?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("empty segments file: {}", segments_path))?;
+    let columns = igv_segments_columns(&header, segments_path)?;
+    let mut rows = Vec::new();
+    for line_result in lines {
+        let line = line_result?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        let Some(type_name) = cols.get(columns.type_name).copied() else {
+            continue;
+        };
+        if !matches!(type_name, "bsj" | "backward" | "outward") {
+            continue;
+        }
+        let Some(read_id) = cols.get(columns.read_id).copied() else {
+            continue;
+        };
+        let Some(circ_id) = cols.get(columns.circ_id).copied() else {
+            continue;
+        };
+        let Some(chrom) = cols.get(columns.chrom).copied() else {
+            continue;
+        };
+        let color = igv_segment_color(type_name);
+        for (mate_label, segments) in [
+            ("R1", cols.get(columns.r1_segments).copied().unwrap_or("NA")),
+            ("R2", cols.get(columns.r2_segments).copied().unwrap_or("NA")),
+        ] {
+            push_one_segments_alignment_chain(
+                &mut rows, chrom, read_id, type_name, circ_id, mate_label, segments, color,
+            )?;
+        }
+    }
+    rows.sort_by(compare_igv_segment_rows);
+    let row_count = rows.len();
+    let segment_bam_written = write_segments_bam_from_sorted_rows(
+        &rows,
+        bam_path,
+        out_prefix,
+        reference_lengths,
+        threads,
+    )?;
+    Ok(IgvSegmentsBamStats {
+        segment_rows: row_count,
+        segment_bam_written,
+    })
+}
+
+/// Resolves the public `<prefix>.segments` columns needed by IGV export.
+fn igv_segments_columns(header: &str, path: &str) -> Result<IgvSegmentsColumns> {
+    let headers: Vec<&str> = header.split('\t').collect();
+    let idx = |name: &str| -> Result<usize> {
+        headers
+            .iter()
+            .position(|field| *field == name)
+            .ok_or_else(|| anyhow::anyhow!("missing `{}` column in {}", name, path))
+    };
+    Ok(IgvSegmentsColumns {
+        read_id: idx("read_id")?,
+        type_name: idx("type")?,
+        circ_id: idx("circ_id")?,
+        chrom: idx("chrom")?,
+        r1_segments: idx("r1_segments")?,
+        r2_segments: idx("r2_segments")?,
+    })
+}
+
+/// Appends one mate chain as one or more synthetic alignments split at BSJ markers.
+fn push_one_segments_alignment_chain(
+    rows: &mut Vec<IgvSegmentRow>,
+    chrom: &str,
+    read_id: &str,
+    type_name: &str,
+    circ_id: &str,
+    mate_label: &str,
+    segments: &str,
+    color: &str,
+) -> Result<()> {
+    if segments == "NA" || segments.is_empty() {
+        return Ok(());
+    }
+    let mut part = 1usize;
+    let mut blocks: Vec<(i32, i32, char)> = Vec::new();
+    for token in segments.split('|') {
+        if token == "<bsj>" {
+            if push_segments_alignment_part(
+                rows,
+                chrom,
+                read_id,
+                type_name,
+                circ_id,
+                mate_label,
+                part,
+                color,
+                &mut blocks,
+            )? {
+                part += 1;
+            }
+            continue;
+        }
+        if let Some((start, end, strand)) = parse_igv_segment_token(token) {
+            blocks.push((start, end, strand));
+        }
+    }
+    push_segments_alignment_part(
+        rows,
+        chrom,
+        read_id,
+        type_name,
+        circ_id,
+        mate_label,
+        part,
+        color,
+        &mut blocks,
+    )?;
+    Ok(())
+}
+
+/// Appends one synthetic alignment part and clears the accumulated segment blocks.
+fn push_segments_alignment_part(
+    rows: &mut Vec<IgvSegmentRow>,
+    chrom: &str,
+    read_id: &str,
+    type_name: &str,
+    circ_id: &str,
+    mate_label: &str,
+    part: usize,
+    color: &str,
+    blocks: &mut Vec<(i32, i32, char)>,
+) -> Result<bool> {
+    if blocks.is_empty() {
+        return Ok(false);
+    }
+    blocks.retain(|(start, end, _)| *start >= 1 && *end >= *start);
+    if blocks.is_empty() {
+        return Ok(false);
+    }
+    blocks.sort_by_key(|(start, end, _)| (*start, *end));
+    let chrom_start = blocks.iter().map(|(start, _, _)| *start).min().unwrap() - 1;
+    let chrom_end = blocks.iter().map(|(_, end, _)| *end).max().unwrap();
+    let strand = igv_bed12_strand(blocks);
+    let name = format!(
+        "{}|{}|{}|{}|part{}",
+        read_id, type_name, circ_id, mate_label, part
+    );
+    rows.push(IgvSegmentRow {
+        chrom_key: igv_chrom_sort_key(chrom),
+        chrom: chrom.to_string(),
+        chrom_start,
+        chrom_end,
+        name: name.clone(),
+        sam_line: synthetic_segments_sam_line(
+            chrom,
+            chrom_start,
+            name.as_str(),
+            type_name,
+            circ_id,
+            mate_label,
+            part,
+            color,
+            strand,
+            blocks,
+        ),
+    });
+    blocks.clear();
+    Ok(true)
+}
+
+/// Returns a human-genome-friendly chromosome key for coordinate sorting.
+///
+/// IGV accepts generic BED files, but review sessions here usually use hg38.
+/// Putting `chr1..chr22, chrX, chrY, chrM/MT` before alternate contigs makes
+/// the sidecar easier to scan while still keeping non-standard contigs sorted.
+fn igv_chrom_sort_key(chrom: &str) -> IgvChromSortKey {
+    let core = chrom.strip_prefix("chr").unwrap_or(chrom);
+    if let Ok(rank) = core.parse::<u32>() {
+        return IgvChromSortKey {
+            group: 0,
+            rank,
+            suffix: String::new(),
+        };
+    }
+    match core {
+        "X" => IgvChromSortKey {
+            group: 0,
+            rank: 23,
+            suffix: String::new(),
+        },
+        "Y" => IgvChromSortKey {
+            group: 0,
+            rank: 24,
+            suffix: String::new(),
+        },
+        "M" | "MT" => IgvChromSortKey {
+            group: 0,
+            rank: 25,
+            suffix: String::new(),
+        },
+        _ => IgvChromSortKey {
+            group: 1,
+            rank: 0,
+            suffix: chrom.to_string(),
+        },
+    }
+}
+
+/// Orders synthetic alignment rows by coordinate, with the query name as tie-breaker.
+fn compare_igv_segment_rows(left: &IgvSegmentRow, right: &IgvSegmentRow) -> Ordering {
+    left.chrom_key
+        .cmp(&right.chrom_key)
+        .then_with(|| left.chrom_start.cmp(&right.chrom_start))
+        .then_with(|| left.chrom_end.cmp(&right.chrom_end))
+        .then_with(|| left.name.cmp(&right.name))
+}
+
+/// Builds a synthetic SAM alignment line from one segment row.
+///
+/// The sequence is artificial because `<prefix>.segments` only carries mapped
+/// blocks, not full read bases. IGV still renders the splice structure from
+/// RNAME/POS/CIGAR, while tags retain segment provenance and color.
+fn synthetic_segments_sam_line(
+    chrom: &str,
+    chrom_start: i32,
+    name: &str,
+    type_name: &str,
+    circ_id: &str,
+    mate_label: &str,
+    part: usize,
+    color: &str,
+    strand: char,
+    blocks: &[(i32, i32, char)],
+) -> Option<String> {
+    let (cigar, query_len) = synthetic_segments_cigar(blocks)?;
+    if query_len == 0 {
+        return None;
+    }
+    let flag = if strand == '-' { 16 } else { 0 };
+    let mapq = igv_segment_mapq(type_name);
+    let seq = "N".repeat(query_len);
+    Some(format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t*\tRG:Z:{}\tYC:Z:{}\tZT:Z:{}\tCI:Z:{}\tML:Z:{}\tPT:i:{}\n",
+        name,
+        flag,
+        chrom,
+        chrom_start + 1,
+        mapq,
+        cigar,
+        seq,
+        type_name,
+        color,
+        type_name,
+        circ_id,
+        mate_label,
+        part
+    ))
+}
+
+/// Converts sorted segment blocks into a splice-aware CIGAR string.
+fn synthetic_segments_cigar(blocks: &[(i32, i32, char)]) -> Option<(String, usize)> {
+    let mut cigar = String::new();
+    let mut query_len = 0usize;
+    let mut prev_end0: Option<i32> = None;
+    for &(start, end, _) in blocks {
+        if start < 1 || end < start {
+            return None;
+        }
+        let start0 = start - 1;
+        if let Some(prev) = prev_end0 {
+            let gap = start0 - prev;
+            if gap < 0 {
+                return None;
+            }
+            if gap > 0 {
+                cigar.push_str(&format!("{}N", gap));
+            }
+        }
+        let len = (end - start + 1) as usize;
+        cigar.push_str(&format!("{}M", len));
+        query_len += len;
+        prev_end0 = Some(end);
+    }
+    Some((cigar, query_len))
+}
+
+/// Returns a synthetic MAPQ that keeps segment classes visually separable.
+fn igv_segment_mapq(type_name: &str) -> u8 {
+    match type_name {
+        "bsj" => 60,
+        "backward" => 45,
+        "outward" => 30,
+        _ => 0,
+    }
+}
+
+/// Writes a coordinate-sorted synthetic BAM and BAI from already sorted rows.
+///
+/// This uses `samtools` when available because the repo does not yet own a
+/// native BAI writer. The SAM temp is deleted after successful conversion so the
+/// indexed BAM is the durable high-performance IGV artifact.
+fn write_segments_bam_from_sorted_rows(
+    rows: &[IgvSegmentRow],
+    bam_path: &str,
+    out_prefix: &str,
+    reference_lengths: &HashMap<String, usize>,
+    threads: usize,
+) -> Result<bool> {
+    let Some(samtools) = find_samtools() else {
+        return Ok(false);
+    };
+    let sam_path = format!("{}.segments.sam.tmp", out_prefix);
+    write_segments_sam_from_sorted_rows(rows, &sam_path, reference_lengths)?;
+    let view_threads = threads.max(1).to_string();
+    let status = Command::new(&samtools)
+        .arg("view")
+        .arg("-@")
+        .arg(&view_threads)
+        .arg("-b")
+        .arg("-o")
+        .arg(bam_path)
+        .arg(&sam_path)
+        .status()?;
+    if !status.success() {
+        bail!("samtools view failed while creating {}", bam_path);
+    }
+    let status = Command::new(&samtools)
+        .arg("index")
+        .arg("-@")
+        .arg(&view_threads)
+        .arg(bam_path)
+        .status()?;
+    if !status.success() {
+        bail!("samtools index failed while creating {}.bai", bam_path);
+    }
+    let _ = fs::remove_file(&sam_path);
+    Ok(true)
+}
+
+/// Writes sorted SAM records used as the conversion source for the review BAM.
+fn write_segments_sam_from_sorted_rows(
+    rows: &[IgvSegmentRow],
+    sam_path: &str,
+    reference_lengths: &HashMap<String, usize>,
+) -> Result<()> {
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, File::create(sam_path)?);
+    writeln!(writer, "@HD\tVN:1.6\tSO:coordinate")?;
+    for (chrom, len) in igv_bam_reference_lengths(rows, reference_lengths) {
+        writeln!(writer, "@SQ\tSN:{}\tLN:{}", chrom, len)?;
+    }
+    writeln!(
+        writer,
+        "@RG\tID:bsj\tSM:CIRI_segments\tDS:back-spliced junction read segments"
+    )?;
+    writeln!(
+        writer,
+        "@RG\tID:backward\tSM:CIRI_segments\tDS:backward read segments"
+    )?;
+    writeln!(
+        writer,
+        "@RG\tID:outward\tSM:CIRI_segments\tDS:outward-facing read segments"
+    )?;
+    writeln!(writer, "@PG\tID:CIRI-rs-segments\tPN:CIRI-rs\tVN:0.1.1")?;
+    for row in rows {
+        if let Some(line) = &row.sam_line {
+            writer.write_all(line.as_bytes())?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Returns reference lengths for all contigs touched by the synthetic rows.
+fn igv_bam_reference_lengths(
+    rows: &[IgvSegmentRow],
+    reference_lengths: &HashMap<String, usize>,
+) -> Vec<(String, usize)> {
+    let mut lengths: HashMap<String, usize> = HashMap::new();
+    for row in rows {
+        let observed_len = usize::try_from(row.chrom_end.max(1)).unwrap_or(1);
+        let len = reference_lengths
+            .get(row.chrom.as_str())
+            .copied()
+            .unwrap_or(observed_len)
+            .max(observed_len);
+        lengths
+            .entry(row.chrom.clone())
+            .and_modify(|current| *current = (*current).max(len))
+            .or_insert(len);
+    }
+    let mut entries: Vec<_> = lengths.into_iter().collect();
+    entries
+        .sort_by(|(left, _), (right, _)| igv_chrom_sort_key(left).cmp(&igv_chrom_sort_key(right)));
+    entries
+}
+
+/// Finds a `samtools` executable for optional BAM/BAI review-track generation.
+fn find_samtools() -> Option<String> {
+    if let Ok(path) = env::var("SAMTOOLS") {
+        if samtools_is_usable(&path) {
+            return Some(path);
+        }
+    }
+    if samtools_is_usable("samtools") {
+        return Some("samtools".to_string());
+    }
+    None
+}
+
+/// Checks whether a candidate `samtools` command can be executed.
+fn samtools_is_usable(command: &str) -> bool {
+    Command::new(command)
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Parses a `start-end:strand` segment token from `<prefix>.segments`.
+fn parse_igv_segment_token(token: &str) -> Option<(i32, i32, char)> {
+    let (range, strand_text) = token.rsplit_once(':')?;
+    let (start, end) = range.split_once('-')?;
+    let strand = strand_text.chars().next().unwrap_or('.');
+    Some((start.parse().ok()?, end.parse().ok()?, strand))
+}
+
+/// Returns the synthetic alignment strand when all blocks agree, otherwise `.`.
+fn igv_bed12_strand(blocks: &[(i32, i32, char)]) -> char {
+    let mut strand = None;
+    for &(_, _, current) in blocks {
+        if !matches!(current, '+' | '-') {
+            return '.';
+        }
+        match strand {
+            Some(previous) if previous != current => return '.',
+            Some(_) => {}
+            None => strand = Some(current),
+        }
+    }
+    strand.unwrap_or('.')
+}
+
+/// Returns a stable RGB color for one segment type.
+fn igv_segment_color(type_name: &str) -> &'static str {
+    match type_name {
+        "bsj" => IGV_BSJ_COLOR,
+        "backward" => IGV_BACKWARD_COLOR,
+        "outward" => IGV_OUTWARD_COLOR,
+        _ => "128,128,128",
+    }
+}
+
 /// Loads inputs, runs Scan1 -> Scan2 -> Summary, and writes outputs.
 ///
 /// The current `ciri` entry keeps the historical direct CIRI3-style arguments
@@ -258,6 +866,7 @@ pub fn main() -> Result<()> {
                 "Continue",
                 "Resuming from completed .segments; rebuilding isoforms only...",
             )?;
+            write_and_log_bsj_bedpe(&mut log_writer, &args.out_prefix, &result_output)?;
             let major_isoforms = rebuild_major_isoforms_from_segments(
                 &result_output,
                 &segments_output,
@@ -278,6 +887,13 @@ pub fn main() -> Result<()> {
                 "Isoforms summary",
                 &format!("{} major isoforms", major_isoforms),
             )?;
+            write_and_log_segments_bam(
+                &mut log_writer,
+                &segments_output,
+                &args.out_prefix,
+                &fasta.chr_len_map,
+                args.threads,
+            )?;
             log_info(
                 &mut log_writer,
                 "Total runtime",
@@ -292,6 +908,7 @@ pub fn main() -> Result<()> {
                 "Continue",
                 "Resuming from completed .out/.bsj; rebuilding segments and isoforms...",
             )?;
+            write_and_log_bsj_bedpe(&mut log_writer, &args.out_prefix, &result_output)?;
             let mut segment_progress_log =
                 |label: &str, message: &str| log_info(&mut log_writer, label, message);
             let segment_summary = run_ciri_as(AsConfig {
@@ -331,6 +948,13 @@ pub fn main() -> Result<()> {
                 &mut log_writer,
                 "Isoforms summary",
                 &format!("{} major isoforms", segment_summary.major_isoforms),
+            )?;
+            write_and_log_segments_bam(
+                &mut log_writer,
+                &segments_output,
+                &args.out_prefix,
+                &fasta.chr_len_map,
+                args.threads,
             )?;
             log_info(
                 &mut log_writer,
@@ -452,6 +1076,7 @@ pub fn main() -> Result<()> {
     write_display_bsj(&bsj_output, &bsj1_output, &bsj2_output)?;
 
     log_info(&mut log_writer, "Output file", &result_output)?;
+    write_and_log_bsj_bedpe(&mut log_writer, &args.out_prefix, &result_output)?;
     log_info(
         &mut log_writer,
         "Running segments",
@@ -506,6 +1131,13 @@ pub fn main() -> Result<()> {
         &mut log_writer,
         "Isoforms summary",
         &format!("{} major isoforms", segment_summary.major_isoforms),
+    )?;
+    write_and_log_segments_bam(
+        &mut log_writer,
+        &segments_output,
+        &args.out_prefix,
+        &fasta.chr_len_map,
+        args.threads,
     )?;
 
     log_info(

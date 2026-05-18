@@ -36,7 +36,7 @@
 - CIRI-AS-style full-length reconstruction 的阶段性设计写入 `07-full-length-reconstruction.md`；RO side evidence 设计保留在 `05-ro-feature-plan.md`；独立模拟器与 truth 输出设计写入 `06-simulation-truth-design.md`。
 - CIRI-AS / CIRI-full 相关实现若有意偏离上游历史输出，必须同步写入对应拆解文档，说明偏离原因、验证口径和对主 CIRI3 parity 的隔离方式。
 - 避免跨文档重复维护同一检查清单。
-- 正式用户输出协议当前限定为 `<prefix>.out`、`<prefix>.bsj`、`<prefix>.segments`、`<prefix>.isoforms.gtf` 和 `<prefix>.isoforms.fa`；`.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj` 及 `.part_XXXX.tmp` 都是内部临时文件。
+- 正式用户输出协议当前限定为 `<prefix>.out`、`<prefix>.bsj`、`<prefix>.segments`、`<prefix>.isoforms.gtf`、`<prefix>.isoforms.fa`、`<prefix>.bedpe`、`<prefix>.segments.bam` 和 `<prefix>.segments.bam.bai`；`.bedpe` 在 `.out` 写出时同步生成，`.segments.bam/.bai` 在 `.segments` 写出时同步生成并作为大数据 IGV review 主入口；`.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj` 及 `.part_XXXX.tmp` 都是内部临时文件。
 - 多线程临时文件统一使用 `<merged-path>.part_XXXX.tmp` 命名，默认成功运行后删除；只有 `--debug` 才保留。
 - `--continue` 是普通命令的附加执行模式，不改变必填参数；它只从 `<prefix>.segments` 或 `<prefix>.out + <prefix>.bsj` 这两类合并完成的断点恢复，`.part_XXXX.tmp` 和其他 shard-local 临时文件不作为断点。
 - 所有一次性探针脚本、临时分析产物和手工测试输出统一放在 `tmp/`，不要散落在 `tests/` 或项目根目录。

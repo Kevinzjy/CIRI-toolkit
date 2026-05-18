@@ -105,8 +105,12 @@ ciri \
 - read-level circRNA segment 解释：`<prefix>.segments`
 - major circRNA isoform 结构：`<prefix>.isoforms.gtf`
 - major circRNA isoform 序列：`<prefix>.isoforms.fa`
+- IGV BSJ arc track：`<prefix>.bedpe`
+- IGV read segment track：`<prefix>.segments.bam` / `<prefix>.segments.bam.bai`
 
 内部临时文件（如 `<prefix>.bsj1`、`<prefix>.bsj2`、`<prefix>.segments1`、`<prefix>.segments2`、`<prefix>.segments.non_bsj.part_XXXX.tmp`）默认在成功运行后删除；需要排查时可用 `--debug` 保留。
+
+`<prefix>.bedpe` 在 `.out` 写出后同步生成，每个 circRNA 一条 BSJ anchor pair，不表达内部结构，score 使用原始 `#junction_reads`。`<prefix>.segments.bam` 在 `.segments` 写出后生成合成 alignment track，并同步写出 `.bai`，适合作为大数据 IGV review 的主入口；internal junction 用 `N` CIGAR 表达，遇到 `<bsj>` / `B` marker 时拆成同 read 的多条 alignment，`YC`/`RG`/`ZT`/`CI` tags 记录颜色、read group、read type 和 circRNA 来源。IGV 中可对该 track 选择 `Color alignments by -> tag -> YC` 使用固定 RGB，或选择按 read group 区分 `bsj/backward/outward`。
 
 `--continue` 只使用已合并、可校验的断点文件，不把 `.part_XXXX.tmp` 或其他 shard-local 临时文件当作可恢复状态。
 

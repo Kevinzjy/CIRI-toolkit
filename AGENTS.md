@@ -80,7 +80,7 @@
   - `docs/00-index.md`
 
 ## 临时文件规范
-- 当前正式用户输出限定为 `<prefix>.out`、`<prefix>.bsj` 和 `<prefix>.segments`；`.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj` 以及 `.part_XXXX.tmp` shard 文件都是内部临时文件。
+- 当前正式用户输出限定为 `<prefix>.out`、`<prefix>.bsj`、`<prefix>.segments`、`<prefix>.isoforms.gtf`、`<prefix>.isoforms.fa`、`<prefix>.bedpe`、`<prefix>.segments.bam` 和 `<prefix>.segments.bam.bai`；`.bedpe` 在 `.out` 写出时同步生成，`.segments.bam/.bai` 在 `.segments` 写出时同步生成并作为大数据 IGV review 主入口；`.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj` 以及 `.part_XXXX.tmp` shard 文件都是内部临时文件。
 - 所有多进程/多线程 shard 临时文件统一使用合并后文件名加 `.part_XXXX.tmp` 后缀，例如 `<prefix>.segments.non_bsj.part_0001.tmp`。
 - 默认成功运行后删除内部临时文件；只有 CLI `--debug` 才保留。
 - 所有临时脚本输出、探针产物、一次性依赖下载统一放在 `tmp/` 目录下。

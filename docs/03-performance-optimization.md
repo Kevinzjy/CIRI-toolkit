@@ -90,7 +90,7 @@ python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-r
 - 多进程 / 多线程临时文件统一使用 `<merged-path>.part_XXXX.tmp` 命名。
 - 临时文件只能作为 shard-local spill、bounded merge 或 debug artifact 使用，不应成为正式输出协议。
 - 默认成功运行后删除内部临时文件；用户显式传入 `--debug` 时保留。
-- 正式用户输出当前限定为 `<prefix>.out`、`<prefix>.bsj` 和 `<prefix>.segments`。
+- 正式用户输出当前限定为 `<prefix>.out`、`<prefix>.bsj`、`<prefix>.segments`、`<prefix>.isoforms.gtf`、`<prefix>.isoforms.fa`、`<prefix>.bedpe`、`<prefix>.segments.bam` 和 `<prefix>.segments.bam.bai`；`.bedpe` 跟随 `.out` 写出，`.segments.bam/.bai` 跟随 `.segments` 写出并作为大数据 IGV review 主入口。
 
 ## Scan2 专项记录（2026-05）
 
