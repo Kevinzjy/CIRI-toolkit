@@ -39,7 +39,7 @@ whole-genome / hg38 复核时，还需要先锁定：
 使用统一脚本一次性看四层指标：
 
 ```bash
-python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.result \
+python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI.result \
   --show-read-ids --show-read-assignments
 ```
 
@@ -66,14 +66,14 @@ python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-r
 ```bash
 ./target/release/ciri \
   -i tests/chr1/test.bam \
-  -o tests/chr1/CIRI-rs \
+  -o tests/chr1/CIRI \
   -r tests/chr1/chr1.fa \
   -a tests/chr1/chr1.gtf \
   --trace "simulate:7037,simulate:7050" \
   -t 16
 ```
 
-详细 trace 会写到 `tests/chr1/CIRI-rs.trace.log`。
+详细 trace 会写到 `tests/chr1/CIRI.trace.log`。
 
 兼容旧入口：
 
@@ -95,7 +95,7 @@ CIRI_TRACE_READS="simulate:398600" \
 CIRI_TRACE_ALL_CANDS=1 \
 ./target/release/ciri \
   -i tests/chr1/test.bam \
-  -o tests/chr1/CIRI-rs.trace_all \
+  -o tests/chr1/CIRI.trace_all \
   -r tests/chr1/chr1.fa \
   -a tests/chr1/chr1.gtf \
   -t 16

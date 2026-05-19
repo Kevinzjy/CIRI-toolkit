@@ -8649,18 +8649,18 @@ fn write_major_isoform_gtf(path: &str, records: &[MajorIsoformRecord]) -> Result
         let attrs = major_gtf_attributes(record);
         writeln!(
             writer,
-            "{}\tCIRI-rs\tcircRNA\t{}\t{}\t{:.3}\t{}\t.\t{}",
+            "{}\tCIRI\tcircRNA\t{}\t{}\t{:.3}\t{}\t.\t{}",
             record.chr, record.start, record.end, record.cov, record.strand, attrs
         )?;
         writeln!(
             writer,
-            "{}\tCIRI-rs\ttranscript\t{}\t{}\t{:.3}\t{}\t.\t{}",
+            "{}\tCIRI\ttranscript\t{}\t{}\t{:.3}\t{}\t.\t{}",
             record.chr, record.start, record.end, record.cov, record.strand, attrs
         )?;
         for (idx, (start, end)) in record.exons.iter().enumerate() {
             writeln!(
                 writer,
-                "{}\tCIRI-rs\texon\t{}\t{}\t{:.3}\t{}\t.\t{} exon_number \"{}\";",
+                "{}\tCIRI\texon\t{}\t{}\t{:.3}\t{}\t.\t{} exon_number \"{}\";",
                 record.chr,
                 start,
                 end,
@@ -9619,6 +9619,9 @@ mod tests {
         assert_eq!(summary.fasta_isoforms, 1);
         assert_eq!(summary.fasta_circ_rnas, 1);
         let gtf = std::fs::read_to_string(format!("{}.isoforms.gtf", out_prefix)).unwrap();
+        assert!(gtf.contains("\tCIRI\tcircRNA\t"));
+        let legacy_source = format!("{}-{}", "CIRI", "rs");
+        assert!(!gtf.contains(&legacy_source));
         assert!(gtf.contains("\texon\t100\t150\t"));
         assert!(gtf.contains("\texon\t200\t300\t"));
         assert!(gtf.contains("isoform_origin \"mature\";"));

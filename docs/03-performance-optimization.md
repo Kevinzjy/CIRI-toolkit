@@ -25,7 +25,7 @@
 参考命令：
 
 ```bash
-python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.result \
+python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI.result \
   --show-read-ids --show-read-assignments
 ```
 
@@ -108,7 +108,7 @@ python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-r
 ```bash
 target/release/ciri \
   -i ./bam/RNA015434_S1.bam \
-  -o ./CIRI-rs.ciri \
+  -o ./CIRI.ciri \
   -r /data/public/database/gencode/hg38/_BWAindex/hg38.fa \
   -a /data/public/database/gencode/hg38/gencode.v44.annotation.gtf \
   -t 16 -s 0 --perf

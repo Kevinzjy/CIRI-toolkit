@@ -52,7 +52,7 @@ CIRI-toolkit 是 CIRI3（Java）的 Rust 复现版本，目标是在保持判定
 统一校验命令：
 
 ```bash
-python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-rs.result \
+python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI.result \
   --show-read-ids --show-read-assignments
 ```
 

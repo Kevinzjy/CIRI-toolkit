@@ -71,7 +71,7 @@ struct Args {
     #[arg(short = 'm', long = "mapq", default_value_t = 10)]
     min_mapq: i32,
 
-    /// Stringency level (0, 1, 2). CIRI-rs defaults to 0 to retain candidate
+    /// Stringency level (0, 1, 2). CIRI defaults to 0 to retain candidate
     /// circRNAs for downstream segment/isoform filtering; Java CIRI3 defaults
     /// to 2.
     #[arg(short = 's', long = "stringency", default_value_t = 0)]
@@ -81,7 +81,7 @@ struct Args {
     #[arg(long = "max-span", default_value_t = 200000)]
     max_span: i32,
 
-    /// Min spanning distance of circRNAs. CIRI-rs defaults to 50 to retain
+    /// Min spanning distance of circRNAs. CIRI defaults to 50 to retain
     /// short candidate circRNAs for downstream filtering; Java CIRI3 defaults
     /// to 140.
     #[arg(long = "min-span", default_value_t = 50)]
@@ -675,7 +675,11 @@ fn write_segments_sam_from_sorted_rows(
         writer,
         "@RG\tID:outward\tSM:CIRI_segments\tDS:outward-facing read segments"
     )?;
-    writeln!(writer, "@PG\tID:CIRI-rs-segments\tPN:CIRI-rs\tVN:0.1.1")?;
+    writeln!(
+        writer,
+        "@PG\tID:CIRI\tPN:CIRI\tVN:{}",
+        env!("CARGO_PKG_VERSION")
+    )?;
     for row in rows {
         if let Some(line) = &row.sam_line {
             writer.write_all(line.as_bytes())?;
