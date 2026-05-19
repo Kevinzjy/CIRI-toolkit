@@ -1,34 +1,36 @@
-# CIRI-AS 功能拆解与 Rust 接入计划
+# CIRI-AS 功能拆解与历史参考
 
-本文档记录 `vendor/CIRI-AS/CIRI_AS_v1.2.pl` 的功能边界、数据契约和算法阶段。当前 CIRI-toolkit 不计划完整复刻 CIRI-AS 的全部输出；该文档主要用于保留上游思路、数据风险和可复用证据类型，为后续 circRNA full-length structure / isoform usage 功能提供参考。
+本文档记录 `vendor/CIRI-AS/CIRI_AS_v1.2.pl` 的功能边界、数据契约和算法阶段。当前 CIRI-toolkit 已经实现自己的 `<prefix>.segments -> major isoform` 后处理路线，不再按 CIRI-AS 输出协议继续开发，也不计划完整复刻 Perl 脚本的历史文件。
+
+本文件作为历史参考保留，主要用于解释仍被当前 segments/isoform 逻辑复用的局部思想：circ-local read 重扫、alignment-chain 解释、annotation-aware splice boundary 校正，以及 read-level evidence 如何进入后续 isoform usage。
 
 ## 1. 定位
 
 CIRI-AS 是 CIRI3 之后的扩展分析阶段，用于识别 circRNA 内部组成和可变剪接事件。它不替代 `Scan1 -> Scan2 -> Summary` 的 BSJ 检测逻辑，而是基于最终 circRNA 结果和同一份比对文件重新扫描 reads。
 
-当前新的实现口径为：
+当前实现口径为：
 
 - 不要求 CIRI-AS 与 Perl 脚本 100% parity。
 - CIRI-AS v1.2 未按 CIRI3 主流程同等级别严格验证；Rust 实现允许在文档记录清楚的前提下修正不稳定或生物学上较弱的启发式。
 - 不复刻未被后续使用的历史中间文件。
-- 保留对 full-length isoform reconstruction 有价值的思路：
+- 只保留对当前 segments、major isoform 和后续 usage 有价值的思路：
   - circ 区间内 read 重新扫描。
   - 内部 splice junction 识别。
-  - exon boundary / cirexon 候选构建。
+  - exon boundary / candidate junction 解释。
   - GTF annotation 辅助。
   - read-level evidence 到 isoform usage 的映射。
-- 当前第一阶段开发优先级转向 `docs/07-full-length-reconstruction.md` 中的 CIRI-AS-style internal structure / full-length reconstruction。RO sidecar 和 remap 暂不作为前置依赖，后续只作为可能的 side evidence 增量接入。
+- 当前活跃开发路线以 `docs/07-full-length-reconstruction.md` 为准：已实现 read-level segments 与单样本 major isoform，下一阶段是 multi-isoform usage 和 multi-sample integration。
 
-推荐的 Rust pipeline 边界为：
+当前 Rust pipeline 边界为：
 
 ```text
-Scan1 -> Scan2 -> Summary -> CIRI-AS
+Scan1 -> Scan2 -> Summary -> segments -> major isoform -> future usage/multi-sample
 ```
 
 其中：
 
 - `Scan1 -> Scan2 -> Summary` 继续负责 circRNA BSJ 识别、FSJ 计数、stringency 过滤和最终 `.out`。
-- CIRI-AS 思路将被拆解进新的 isoform reconstruction 模块，而不是以旧脚本输出为直接目标。
+- CIRI-AS 思路中仍有用的局部规则已经拆解进 segments / isoform reconstruction 模块，而不是以旧脚本输出为直接目标。
 - 任何 AS/isoform 扩展默认不改变主 `.out`，也不回写 Scan1/Scan2/Summary 的核心判定结果。
 
 ## 2. 上游脚本输入输出
@@ -52,11 +54,14 @@ ciri \
   -a <anno.gtf>
 ```
 
-当前实现不再使用独立的 `--as` / `--as-out` 入口，而是在主流程写完 `<prefix>.out` 后默认继续执行 CIRI-AS-style second sweep。
+当前实现不再使用独立的 `--as` / `--as-out` 入口，而是在主流程写完 `<prefix>.out` 后默认继续执行 segments 后处理，并从完成的 `<prefix>.segments` 重新解析 major isoform。
 
 当前正式输出：
 
-- `<prefix>.segments`：当前正式输出。记录 `type=bsj/backward/forward` 兼容协议下的 read-level segment chain；`v1` 先只输出 `bsj` 与 `backward`。
+- `<prefix>.segments`：read-level segment chain，当前包含 `type=bsj/backward/outward`。
+- `<prefix>.isoforms.gtf`：每个 Summary-confirmed circRNA 的 major isoform 审计记录。
+- `<prefix>.isoforms.fa`：高可信 major isoform sequence candidate。
+- `<prefix>.bedpe` 与 `<prefix>.segments.bam/.bai`：IGV review sidecar。
 
 当前保留但暂不作为主输出的内容：
 
@@ -68,7 +73,7 @@ ciri \
 - `_AS.list`
 - `_coverage.list` / `_jav.list` / `_library_length.list`
 
-这些旧输出对应的实现和设计说明仍保留在本文档后续章节中，作为 future full-length reconstruction 的参考，而不是当前默认交付物。
+这些旧输出对应的设计说明仍保留在本文档后续章节中，作为历史参考，而不是当前默认交付物或后续必须实现的协议。
 
 ## 3. 重要兼容问题
 
@@ -530,31 +535,24 @@ tmp/ciri_as_gold/
 - AS 阶段先比较候选数、motif validated 数、典型 read 的坐标解释；
 - `_splice.list` 可与 Perl CIRI-AS 作为参考对照，但不要求 100% parity；若差异来自 annotation-aware tie-break 或 Perl hash 顺序，应记录为有意偏离。
 
-### Phase 5：cirexon 输出
+### Phase 5：cirexon 输出（历史方案，当前不再实现）
 
-目标（已实现第一版）：
+历史目标：
 
 - 实现 circ strand 推断；
 - 实现 candidate exon 构造；
 - 实现 exon coverage validation；
 - 输出 `<prefix>.list`。
 
-当前 Rust 实现会在 AS sidecar 扫描时同时记录：
-
-- circ cluster 内的全局 alignment coverage；
-- Summary `junction_reads_ID` 对应 BSJ reads 的 mapping range；
-- splice cluster 对 candidate exon start/end 的 BSJ 支持；
-- junction-read-only coverage 和跨 splice site read 数。
-
-`.list` 生成逻辑已覆盖 CIRI-AS v1.2 的主干规则：按 circ 内 splice clusters 构造 candidate exon，使用 `exon_coverage_validation_single` 风格的 coverage/U-test 过滤，输出 `cirexonN`、support count、coverage median 与 `ICF/non_ICF`。暂未实现 intron-retention rescue、`_jav.list` mapping dump、insert-length correction，也不把 non-BSJ supporting reads 计入 `.list` 的 BSJ start/end support。
+当前 Rust 主线已删除旧 cirexon/list writer。内部结构推断改由 `<prefix>.segments` parser、circ-local graph、annotation-guided block projection 和 read-supported junction/exclusive evidence 完成。若后续需要输出 candidate exon 审计，也应作为新的 isoform usage sidecar 设计，而不是恢复 CIRI-AS `.list` 协议。
 
 验证：
 
 - 比较 cirexon start/end、support read、coverage median、ICF。
 
-### Phase 6：full-length isoform path 输出
+### Phase 6：full-length isoform path 输出（已由 major isoform 路线替代）
 
-目标（当前优先级）：
+历史目标：
 
 - 从 validated cirexon 构建 circ-local exon graph；
 - 以 Summary confirmed BSJ start/end 为硬锚点；
@@ -563,36 +561,46 @@ tmp/ciri_as_gold/
 - 枚举从 circ start 到 circ end 的 anchored full-length path；
 - 输出 `<prefix>.isoforms`、`<prefix>.isoform_summary` 与 `<prefix>.fa`。
 
+当前实现状态：
+
+- 不输出 CIRI-AS `.isoforms/.isoform_summary/.fa`。
+- 默认输出 `<prefix>.isoforms.gtf` 和高可信 `<prefix>.isoforms.fa`。
+- 每个 circRNA 先输出一个 major isoform；GTF 保留 mature/estimate、coverage、structure_hash 和 FASTA eligibility 审计字段。
+- 下一阶段扩展 candidate isoform search space 与 usage 计算，但输出协议另行设计，不复刻 Perl 文件格式。
+
 验证：
 
 - 比较同一 circ 下 isoform 数量、exon chain、junction chain 和 FASTA 长度；
 - 使用 simulator truth 时优先比较 `exon_chain` 和 `isoform_len`，暂不比较 AS event type。
 
-### Phase 7：isoform usage / side evidence
+### Phase 7：isoform usage / side evidence（当前下一阶段）
 
 目标：
 
-- 为 isoform path 增加 read assignment / usage 估计；
-- 接入 mate-link、boundary clip、RO-like side evidence；
-- 保持 `path_tier = anchored/candidate` 与 `bsj_supported = yes/no` 的证据分层。
+- 在当前 `<prefix>.segments -> circ-local graph` 上建立候选 isoform search space；
+- 为候选 isoform 增加 read assignment / fractional usage 估计；
+- 输出 per-sample support、usage、confidence tier、structure_hash 和 major/minor 状态；
+- 为 multi-sample integration 预留结构合并、major isoform switching 和样本间 usage 比较。
 
 验证：
 
 - 比较 isoform-level read assignment；
-- candidate path 不得回写主流程 BSJ 判断。
+- candidate path 不得回写主流程 BSJ 判断；
+- 使用 simulator truth 同时评估 major accuracy、minor recovery、usage rank correlation 和 false sequence candidate rate。
 
 ## 8. 验证策略
 
-新增 CIRI-AS 后应保持两类验证分离：
+新增 segments/isoform/usage 后应保持两类验证分离：
 
 1. CIRI3 主流程 parity：
    - `scripts/ciri_result_diff.py` 继续用于 `.out`；
    - `circ/read/read-assignment/FSJ` 必须保持零差异。
 
-2. CIRI-AS 对照：
-   - 新增 AS 专用比较脚本，例如 `tests/analyze_as_diff.py`；
-   - 分别比较 splice、cirexon、AS event、PSI；
-   - CIRI-AS v1.2 输出只作为参考，不作为强制 parity oracle。
+2. segments / isoform / usage 对照：
+   - `scripts/ciri_segments_eval.py` 继续用于 simulator read-level segments 对照；
+   - major isoform 继续比较 exon chain、junction chain、FASTA length 和 truth major/exact-any；
+   - 后续 usage 模块再增加 isoform-level assignment、minor recovery 和 usage rank correlation；
+   - CIRI-AS v1.2 输出只作为历史参考，不作为强制 parity oracle。
 
 建议 AS diff 分层：
 
@@ -610,11 +618,11 @@ PSI-level:
   raw PSI / corrected PSI with exact or formatted-string comparison
 ```
 
-第一版应优先保证 structural event 完全一致，再比较 PSI。
+当前优先保证 `<prefix>.segments` 与 simulator `.reads.tsv` 的 read-level 解释稳定，再比较 major isoform 和未来 usage。
 
 ## 9. 性能与内存注意事项
 
-CIRI-AS 的热点预计在：
+历史 CIRI-AS 路线的热点包括：
 
 - 重扫 BAM/SAM；
 - per-base coverage 统计；
@@ -622,7 +630,7 @@ CIRI-AS 的热点预计在：
 - circ 内 exon path 构建；
 - insert length normalization。
 
-第一版不要提前做复杂优化。建议先使用直观 HashMap 结构完成行为验证与典型 read 对照，之后再考虑：
+当前主线不再实现旧 CIRI-AS writer。后续 usage/multi-sample 若新增大数据路径，仍应遵守同一原则：先用可验证的结构完成行为验证，再针对全量 BAM/SAM 或多样本规模做内存上界优化。
 
 - 用 interval index 替代 per-base `circ_cluster_range`；
 - coverage 改为分 chromosome sparse vector 或 run-length structure；
@@ -632,22 +640,21 @@ CIRI-AS 的热点预计在：
 
 ## 10. 开发红线
 
-- CIRI-AS 必须是可选阶段，默认不改变现有 CIRI3 输出。
+- segments / isoform / usage 必须是 Summary 后处理或 sidecar 阶段，默认不改变现有 CIRI3 `.out/.bsj` 判定。
 - 不允许为了 AS 改动 Scan1/Scan2/Summary 已对齐逻辑，除非有独立回归证明主流程零差异。
 - 迁移初期以 Perl 脚本的证据链和坐标系统为参考；遇到 Perl hash 顺序、未利用 annotation boundary 等不稳定或弱启发式时，允许采用更稳定的 Rust 规则，但必须在本文档记录。
 - 坐标系统必须文档化：Perl 逻辑使用 1-based genomic coordinate 和 inclusive end。
 - CIGAR helper、splice signal 检查、coverage validation、AS classification 都需要 targeted unit tests。
 - 临时文件、probe 输出、golden 生成脚本统一放入 `tmp/` 或明确的测试目录，不散落到仓库根目录。
 
-## 11. 未决问题
+## 11. 当前未决问题
 
-后续开发前需要进一步确认：
+旧 CIRI-AS 输出命名、corrected PSI、AS event taxonomy 和 `.list/.isoform_summary` 兼容性不再是当前路线问题。后续开发前需要进一步确认的是：
 
-- 第一版已决定直接支持 BAM/SAM，并以相同 read-group 语义保证两种输入的 CIRI-AS sidecar 输出一致。
-- 单端数据是否直接禁用 AS，还是输出不含 corrected PSI 的部分结果。
-- GFF 支持是否保留。当前 CIRI-toolkit 主流程主要使用 GTF，第一版可优先只支持 GTF。
-- corrected PSI 是否作为 v1 必需项，还是第二阶段实现。
-- CIRI-AS 输出是否使用 Perl 原始命名，还是统一加 `.as` 命名空间。
+- multi-isoform usage sidecar 的文件名、字段和是否需要单独 FASTA eligibility 表；
+- backward/outward reads 在多个 circRNA 和多个 isoform 之间的 fractional assignment 规则；
+- multi-sample integration 的输入列表格式、sample metadata 字段和 structure merge key；
+- 是否在 usage 阶段引入新的 weak evidence，例如 boundary clip 或 per-circ mini-BAM review 结果。
 
 ---
-最后更新：2026-04-30
+最后更新：2026-05-19

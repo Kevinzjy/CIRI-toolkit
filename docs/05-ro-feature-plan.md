@@ -1,6 +1,8 @@
-# RO feature 与 circRNA 全长结构识别计划
+# RO feature 与 circRNA 全长结构识别历史设计
 
-本文档记录 CIRI-toolkit 后续引入 RO（Reverse Overlap）feature 的设计计划。当前目标不是完整复刻 CIRI-AS / CIRI-full 的全部输出，而是提取其中对 CIRI-toolkit 有价值的思路：先在 `Scan1` 过程中识别 paired-end reads 的 RO 序列，输出 `.ro.fq`，再为后续 RO remap、二次扫描和 circRNA isoform reconstruction 提供证据。
+本文档记录早期讨论过的 RO（Reverse Overlap）feature 设计。当前 CIRI-toolkit 已经实现基于 `<prefix>.segments` 的 major isoform 全长识别，后续活跃路线是 multi-isoform usage 计算和 multi-sample integration；不再沿 CIRI-AS / CIRI-full / RO remap 路线开发，也不计划完整复刻这些历史输出。
+
+本文件仅作为历史参考和风险清单保留。除非后续明确重启 RO side evidence，否则不应把这里的阶段计划视为当前 roadmap。
 
 ## 1. 当前设计口径
 
@@ -428,10 +430,13 @@ RO1 实现必须遵守仓库 `AGENTS.md` 的 Rust 注释规范，并额外满足
 
 ## 16. 当前结论
 
-下一步最合理的开发切入点是：
+本文档中的 RO detector / remap 路线当前已归档，不再作为下一步开发切入点。历史上建议过的切入点是：
 
 ```text
 Scan1 sidecar RO detector + .ro.fq/.ro.tsv output
 ```
 
-这一步足够小，不会破坏当前 CIRI3 parity；同时又能为后续 RO remap、second scanning 和 isoform usage 分析打下可验证的中间层。
+这一步当时的优点是足够小，不会破坏 CIRI3 parity；但当前 major isoform 已经通过 `<prefix>.segments` 路线落地，下一阶段应优先推进 multi-isoform usage 和 multi-sample integration。若未来重新启用 RO，只能作为 sidecar evidence 重新评估，不能替代当前 `<prefix>.segments -> isoform graph` 边界。
+
+---
+最后更新：2026-05-19

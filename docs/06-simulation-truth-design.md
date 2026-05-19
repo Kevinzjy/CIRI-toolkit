@@ -1,10 +1,10 @@
 # `ciri-simulator` answer 输出设计
 
-本文档定义 CIRI-toolkit 中独立模拟器 `ciri-simulator` 的输入、随机采样模型、FASTQ 输出和结构化 answer TSV 协议。模拟器直接读取 FASTA/GTF，生成压缩 paired FASTQ，并输出 isoform 层与 read-pair 层的标准答案，服务后续 CIRI-AS-style internal structure / full-length isoform reconstruction 验证。
+本文档定义 CIRI-toolkit 中独立模拟器 `ciri-simulator` 的输入、随机采样模型、FASTQ 输出和结构化 answer TSV 协议。模拟器直接读取 FASTA/GTF，生成压缩 paired FASTQ，并输出 isoform 层与 read-pair 层的标准答案，服务当前 segments、major isoform，以及后续 multi-isoform usage / multi-sample integration 验证。
 
 ## 1. 设计目标
 
-`ciri-simulator` 的 answer 协议按 full-length reconstruction 的验证需求设计：
+`ciri-simulator` 的 answer 协议按 read-level segments、major isoform 和后续 usage 的验证需求设计：
 
 - 两张答案文件承担不同职责：circRNA/isoform 汇总一张表，read pair 逐条来源一张表。
 - circRNA 层一行一个 circRNA，直接包含该 circ 下所有模拟 isoform 结构与 reads/BSJ reads 计数。
@@ -403,7 +403,8 @@ RO debug 输出如果恢复，应继续遵守三层口径：
 后续扩展：
 
 1. 增加更小的 synthetic reference/GTF fixture，用于专门覆盖负链、共享 exon、全 transcript 被过滤、跨多个 exon 和跨 BSJ 的边界 case。
-2. 按第 6 节补充 `<prefix>.ro_debug.tsv`，用于 RO detector 评估；该文件仍保持 debug side output，不进入正式 answer 文件集合。
+2. 补充 multi-isoform usage truth 汇总字段，用于评估 minor isoform recovery、usage rank correlation 和 major isoform switching。
+3. 如未来重新评估 RO side evidence，再按第 6 节补充 `<prefix>.ro_debug.tsv`；该文件仍保持 debug side output，不进入正式 answer 文件集合。
 
 ---
-最后更新：2026-05-03
+最后更新：2026-05-19

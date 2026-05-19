@@ -39,8 +39,6 @@ use crate::utils::{
 const MIN_INTRON: i32 = 70;
 const MIN_EXON_LENGTH: i32 = 20;
 const MAX_EXON_LENGTH: i32 = 2000;
-const MAX_ISOFORM_PATHS_PER_CIRC: usize = 1024;
-const Z_ALPHA: f64 = 1.6449;
 const MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH: i32 = 10;
 const INTERNAL_SPLICE_CORRECTION_WINDOW: i32 = 4;
 const PARTIAL_LOCAL_SPLICE_CORRECTION_WINDOW: i32 = 16;
@@ -57,7 +55,6 @@ const OUTWARD_MIN_TERMINAL_CLIP: i32 = 19;
 const OUTWARD_MIN_PAIR_OFFSET: i32 = 19;
 const MAPQ_UNI: i32 = 0;
 const MAPQ_BOTH: i32 = 0;
-const STRINGENCY: usize = 1;
 /// Maximum unspliced graph block kept as a single mature exon in isoform output.
 ///
 /// This follows the CIRI-AS exon-length scale instead of a permissive genomic
@@ -212,8 +209,24 @@ pub struct SegmentRunSummary {
     pub backward_segments: usize,
     /// Non-BSJ pair-orientation rows.
     pub outward_segments: usize,
-    /// Major isoforms written to `<prefix>.isoforms.gtf/.fa`.
-    pub major_isoforms: usize,
+}
+
+/// User-facing counts produced by the major-isoform reconstruction stage.
+///
+/// The GTF is the complete per-circRNA audit output, while FASTA is stricter
+/// and contains only sequence-ready isoforms. Keeping both counts visible helps
+/// users distinguish "reconstructed structure exists" from "trusted sequence
+/// was emitted".
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IsoformRunSummary {
+    /// Isoform records written to `<prefix>.isoforms.gtf`.
+    pub total_isoforms: usize,
+    /// Distinct circRNAs represented by GTF isoform records.
+    pub circ_rnas: usize,
+    /// Sequence records written to `<prefix>.isoforms.fa`.
+    pub fasta_isoforms: usize,
+    /// Distinct circRNAs represented by FASTA sequence records.
+    pub fasta_circ_rnas: usize,
 }
 
 /// Compact alignment representation for CIRI-AS read-group matching.
@@ -326,10 +339,8 @@ struct ParsedAlignment {
 #[derive(Debug, Clone)]
 struct MateChain {
     chrom: String,
-    order_strand: char,
     token_strand: char,
     blocks: Vec<SegmentBlock>,
-    token_spans: Vec<(i32, i32)>,
     tokens: Vec<String>,
     cigar: String,
     is_bsj: bool,
@@ -351,117 +362,9 @@ struct CircRecord {
     chr: String,
     start: i32,
     end: i32,
-    junction_reads: Vec<String>,
     junction_read_count: String,
-    pcc: String,
-    non_junction_reads: String,
-    junction_reads_ratio: String,
-    circ_type: String,
     gene_id: String,
     strand: String,
-}
-
-/// Genomic interval contributed by one alignment record of a junction read.
-///
-/// CIRI-AS uses these intervals twice: first to build junction-read-only
-/// coverage inside a circRNA, and later to ask whether a junction read spans an
-/// internal splice site by at least six bases on both sides. The read-coordinate
-/// fields mirror Perl `MSID_start` so paired-end AS quantification can be added
-/// without rescanning SAM/BAM.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct ReadMapping {
-    chr: String,
-    start: i32,
-    end: i32,
-    reverse: usize,
-    mapq: i32,
-    read_start: i32,
-    read_end: i32,
-}
-
-/// Boundary support used while building candidate cirexons.
-///
-/// Perl stores the circRNA outer boundaries as strings (`start`/`end`) in the
-/// same hashes as numeric splice support. A small enum keeps that output
-/// contract explicit while avoiding string-to-number coercion in Rust.
-#[derive(Debug, Clone, Copy)]
-enum BoundarySupport {
-    Count(usize),
-    CircStart,
-    CircEnd,
-}
-
-impl BoundarySupport {
-    /// Numeric contribution used by CIRI-AS candidate-exon generation.
-    fn numeric(self) -> usize {
-        match self {
-            Self::Count(count) => count,
-            Self::CircStart | Self::CircEnd => 0,
-        }
-    }
-
-    /// Legacy text written in the support columns of `<prefix>.list`.
-    fn as_output(self) -> String {
-        match self {
-            Self::Count(count) => count.to_string(),
-            Self::CircStart => "start".to_string(),
-            Self::CircEnd => "end".to_string(),
-        }
-    }
-}
-
-/// One validated cirexon row ready for CIRI-AS `.list` output.
-#[derive(Debug, Clone)]
-struct CirexonRecord {
-    circ_id: String,
-    chr: String,
-    circ_start: i32,
-    circ_end: i32,
-    strand: String,
-    junction_read_count: String,
-    pcc: String,
-    non_junction_reads: String,
-    junction_reads_ratio: String,
-    circ_type: String,
-    gene_id: String,
-    cirexon_id: String,
-    start: i32,
-    end: i32,
-    start_support: String,
-    end_support: String,
-    coverage_median: i32,
-    is_icf: bool,
-}
-
-/// One reconstructed full-length circRNA isoform path.
-///
-/// The first implementation deliberately reports path structure rather than AS
-/// event taxonomy. Each record is anchored to one Summary-confirmed BSJ and is
-/// therefore allowed to become sequence output without changing the baseline
-/// CIRI3 circRNA calls.
-#[derive(Debug, Clone)]
-struct IsoformRecord {
-    circ_id: String,
-    isoform_id: String,
-    chr: String,
-    start: i32,
-    end: i32,
-    strand: String,
-    path_tier: String,
-    bsj_supported: String,
-    gene_id: String,
-    exons: Vec<(i32, i32)>,
-    junctions: Vec<(i32, i32)>,
-    isoform_len: i32,
-    bsj_seed_reads: usize,
-    internal_split_reads: usize,
-    boundary_clip_reads: usize,
-    anomalous_pair_reads: usize,
-    annotation_supported_junctions: usize,
-    de_novo_supported_junctions: usize,
-    score: i32,
-    rank: usize,
 }
 
 /// One internal splice edge used by the major-isoform graph.
@@ -676,13 +579,6 @@ struct MajorSegmentsColumns {
     r2_segments: usize,
 }
 
-/// Validation result from the CIRI-AS coverage filter.
-#[derive(Debug, Clone, Copy)]
-struct CoverageValidation {
-    code: i32,
-    median: i32,
-}
-
 /// CircRNA locus cluster used to define local splice-repair search windows.
 ///
 /// Perl CIRI-AS materializes every covered base into a hash. Rust keeps compact
@@ -745,30 +641,6 @@ struct PositiveCandidate {
     adjust2: i32,
     strand_hint: i32,
     cigars: [Option<String>; 3],
-}
-
-/// Final non-redundant splice cluster written to `_splice.list`.
-#[derive(Debug, Clone)]
-struct SpliceCluster {
-    chr: String,
-    site1: i32,
-    site2: i32,
-    reads: Vec<usize>,
-    cigar_counts: [usize; 3],
-}
-
-/// Summary counters reported in the CIRI-AS sidecar log.
-#[derive(Debug, Default)]
-struct AsStats {
-    junction_reads_loaded: usize,
-    junction_reads_seen: usize,
-    known_candidates: usize,
-    add_candidates: usize,
-    motif_validated: usize,
-    final_splice_clusters: usize,
-    final_cirexons: usize,
-    final_isoforms: usize,
-    final_segments: usize,
 }
 
 /// Runs the post-Summary read-level circRNA segments phase.
@@ -844,15 +716,10 @@ pub fn run_ciri_as(mut config: AsConfig<'_>) -> Result<SegmentRunSummary> {
         read_len,
         min_mapq: config.min_mapq,
         candidates: Vec::new(),
-        coverage: HashMap::new(),
-        read_mappings: HashMap::new(),
-        seen_junction_reads: HashSet::new(),
         outward_read_ids: HashSet::new(),
         prebuilt_segment_records: Vec::new(),
         segment_groups: HashMap::new(),
-        stats: AsStats::default(),
     };
-    state.stats.junction_reads_loaded = state.junction_read_to_circ.len();
     log_segments_profile(profile, "build_scan_state", phase_started);
 
     let phase_started = profile.then(Instant::now);
@@ -861,8 +728,8 @@ pub fn run_ciri_as(mut config: AsConfig<'_>) -> Result<SegmentRunSummary> {
     } else {
         log_segments_user_progress(
             &mut config,
-            "Segments finalize",
-            "Loading Scan2 non-BSJ read topology sidecar...",
+            "Scanning exons 1/4",
+            "Determining non-BSJ read topology...",
         )?;
         let non_bsj_paths = config.non_bsj_segment_evidence_paths.clone();
         let out_prefix = config.out_prefix;
@@ -873,8 +740,8 @@ pub fn run_ciri_as(mut config: AsConfig<'_>) -> Result<SegmentRunSummary> {
             || {
                 log_segments_user_progress(
                     &mut config,
-                    "Segments finalize",
-                    "Preparing streamed non-BSJ segment shards...",
+                    "Scanning exons 2/4",
+                    "Preparing non-BSJ segments...",
                 )
             },
         )?)
@@ -885,8 +752,6 @@ pub fn run_ciri_as(mut config: AsConfig<'_>) -> Result<SegmentRunSummary> {
     let segments = if config.segment_evidence_paths.is_empty() {
         scan_alignment_groups(config.input_path, &mut state)?;
         validate_splice_motifs(&mut state.candidates, config.reference, config.annotation)?;
-        state.stats.motif_validated = state.candidates.len();
-        state.stats.junction_reads_seen = state.seen_junction_reads.len();
         build_segment_records(&state)?
     } else {
         let rescan_group_shard_paths = if let Some(paths) = non_bsj_rescan_group_indexes {
@@ -900,12 +765,10 @@ pub fn run_ciri_as(mut config: AsConfig<'_>) -> Result<SegmentRunSummary> {
         };
         log_segments_user_progress(
             &mut config,
-            "Segments finalize",
-            "Collecting junction support from retained segment shards...",
+            "Scanning exons 3/4",
+            "Collecting junction support from retained segments...",
         )?;
         let phase_started = profile.then(Instant::now);
-        state.stats.motif_validated = state.candidates.len();
-        state.stats.junction_reads_seen = state.segment_groups.len();
         let keep_temp_files = config.keep_temp_files;
         let records = build_sidecar_segment_records(
             &mut state,
@@ -915,8 +778,8 @@ pub fn run_ciri_as(mut config: AsConfig<'_>) -> Result<SegmentRunSummary> {
             || {
                 log_segments_user_progress(
                     &mut config,
-                    "Segments finalize",
-                    "Correcting ambiguous segment rows with junction support...",
+                    "Scanning exons 4/4",
+                    "Correcting ambiguous segments with junction support...",
                 )
             },
         )?;
@@ -924,7 +787,6 @@ pub fn run_ciri_as(mut config: AsConfig<'_>) -> Result<SegmentRunSummary> {
         records
     };
     log_segments_profile(profile, "build_segments", phase_started);
-    state.stats.final_segments = segments.len();
     let summary = segment_run_summary(&segments);
     drop(state);
     let phase_started = profile.then(Instant::now);
@@ -932,22 +794,6 @@ pub fn run_ciri_as(mut config: AsConfig<'_>) -> Result<SegmentRunSummary> {
     write_segments(&segments_path, &segments)?;
     log_segments_profile(profile, "write_segments", phase_started);
     drop(segments);
-    log_segments_user_progress(
-        &mut config,
-        "Running isoforms",
-        "Selecting major circRNA isoforms from .segments graph...",
-    )?;
-    let phase_started = profile.then(Instant::now);
-    let major_isoforms = build_major_isoforms_from_segments_file(
-        &circ_records,
-        &segments_path,
-        config.out_prefix,
-        config.reference,
-        config.annotation,
-    )?;
-    log_segments_profile(profile, "write_major_isoforms", phase_started);
-    let mut summary = summary;
-    summary.major_isoforms = major_isoforms;
     Ok(summary)
 }
 
@@ -963,7 +809,7 @@ pub fn rebuild_major_isoforms_from_segments(
     out_prefix: &str,
     reference: &HashMap<String, String>,
     annotation: Option<&Annotation>,
-) -> Result<usize> {
+) -> Result<IsoformRunSummary> {
     let (circ_records, _junction_read_to_circ) = load_circ_records(circ_path)?;
     build_major_isoforms_from_segments_file(
         &circ_records,
@@ -1073,13 +919,9 @@ struct ScanState<'a> {
     read_len: i32,
     min_mapq: i32,
     candidates: Vec<PositiveCandidate>,
-    coverage: HashMap<String, HashMap<i32, u32>>,
-    read_mappings: HashMap<String, [Vec<ReadMapping>; 2]>,
-    seen_junction_reads: HashSet<String>,
     outward_read_ids: HashSet<String>,
     prebuilt_segment_records: Vec<SegmentRecord>,
     segment_groups: HashMap<String, Vec<AsAlignment>>,
-    stats: AsStats,
 }
 
 /// Read-only inputs shared by parallel segments BAM shards.
@@ -1109,7 +951,6 @@ struct SegmentScanAccum {
     segment_groups: HashMap<String, Vec<AsAlignment>>,
     outward_read_ids: HashSet<String>,
     prebuilt_segment_records: Vec<SegmentRecord>,
-    add_candidates: usize,
 }
 
 /// Path for one shard-local segments rescan spill.
@@ -1190,10 +1031,6 @@ fn load_circ_records(path: &str) -> Result<(Vec<CircRecord>, HashMap<String, Str
     let start_idx = idx("circRNA_start")?;
     let end_idx = idx("circRNA_end")?;
     let junc_count_idx = idx("#junction_reads")?;
-    let pcc_idx = idx("SM_MS_SMS")?;
-    let non_junc_idx = idx("#non_junction_reads")?;
-    let ratio_idx = idx("junction_reads_ratio")?;
-    let type_idx = idx("circRNA_type")?;
     let gene_idx = idx("gene_id")?;
     let strand_idx = idx("strand")?;
     let read_ids_idx = idx("junction_reads_ID")?;
@@ -1228,12 +1065,7 @@ fn load_circ_records(path: &str) -> Result<(Vec<CircRecord>, HashMap<String, Str
             chr,
             start,
             end,
-            junction_reads,
             junction_read_count: get(junc_count_idx)?.to_string(),
-            pcc: get(pcc_idx)?.to_string(),
-            non_junction_reads: get(non_junc_idx)?.to_string(),
-            junction_reads_ratio: get(ratio_idx)?.to_string(),
-            circ_type: get(type_idx)?.to_string(),
             gene_id: get(gene_idx)?.to_string(),
             strand: get(strand_idx)?.to_string(),
         });
@@ -1630,7 +1462,7 @@ fn spill_grouped_non_bsj_segment_evidence_mmap(
         );
     }
     let pb = segment_scan_progress_bar(path)?;
-    pb.set_message("non-BSJ sidecar");
+    pb.set_message("");
     let ranges = line_aligned_shard_ranges(&mmap, rayon::current_num_threads().max(1));
     let shard_paths = ranges
         .into_par_iter()
@@ -1642,7 +1474,13 @@ fn spill_grouped_non_bsj_segment_evidence_mmap(
         })
         .collect::<Result<Vec<_>>>()?;
     pb.set_position(mmap.len() as u64);
-    pb.finish_with_message("");
+
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")?
+            .progress_chars("#>-"),
+    );
+    pb.finish_with_message("Completed");
     Ok(shard_paths)
 }
 
@@ -1671,7 +1509,7 @@ fn spill_grouped_non_bsj_segment_evidence_shards(
             )?
             .progress_chars("#>-"),
     );
-    pb.set_message("non-BSJ sidecar shards");
+    pb.set_message("");
 
     let shard_paths = paths
         .par_iter()
@@ -1683,7 +1521,13 @@ fn spill_grouped_non_bsj_segment_evidence_shards(
         })
         .collect::<Result<Vec<_>>>()?;
     pb.set_position(total_bytes);
-    pb.finish_with_message("");
+
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")?
+            .progress_chars("#>-"),
+    );
+    pb.finish_with_message("Completed");
     Ok(shard_paths)
 }
 
@@ -1848,7 +1692,7 @@ fn spill_legacy_non_bsj_segment_evidence(
         File::open(path).with_context(|| format!("open non-BSJ segment evidence {}", path))?;
     let mut reader = BufReader::new(file);
     let pb = segment_scan_progress_bar(path)?;
-    pb.set_message("legacy non-BSJ sidecar");
+    pb.set_message("");
     let paths = SegmentScanShardPaths::new(out_prefix, shard_idx);
     let mut writer = SegmentScanShardWriter::new(&paths)?;
     let mut last_progress_pos = 0_u64;
@@ -1961,7 +1805,12 @@ fn spill_legacy_non_bsj_segment_evidence(
     if total > last_progress_pos {
         pb.inc(total - last_progress_pos);
     }
-    pb.finish_with_message("");
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")?
+            .progress_chars("#>-"),
+    );
+    pb.finish_with_message("Completed");
     Ok(vec![paths])
 }
 
@@ -2224,7 +2073,7 @@ where
                     .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")?
                     .progress_chars("#>-"),
             );
-            pb.finish_with_message("");
+            pb.finish_with_message("Completed");
         } else {
             pb.abandon();
         }
@@ -2461,7 +2310,6 @@ fn merge_segment_scan_accum(state: &mut ScanState, accum: SegmentScanAccum) {
         &mut state.segment_groups,
         &mut state.outward_read_ids,
         &mut state.prebuilt_segment_records,
-        &mut state.stats,
         accum,
     );
 }
@@ -2478,13 +2326,11 @@ fn merge_segment_scan_accum_fields(
     segment_groups: &mut HashMap<String, Vec<AsAlignment>>,
     outward_read_ids: &mut HashSet<String>,
     prebuilt_segment_records: &mut Vec<SegmentRecord>,
-    stats: &mut AsStats,
     accum: SegmentScanAccum,
 ) {
     candidates.extend(accum.candidates);
     outward_read_ids.extend(accum.outward_read_ids);
     prebuilt_segment_records.extend(accum.prebuilt_segment_records);
-    stats.add_candidates += accum.add_candidates;
     for (read_id, records) in accum.segment_groups {
         segment_groups.entry(read_id).or_insert(records);
     }
@@ -2866,7 +2712,7 @@ fn scan_backward_bam_groups_parallel(
             )?
             .progress_chars("#>-"),
     );
-    pb.finish_with_message("");
+    pb.finish_with_message("Completed");
 
     Ok(shard_paths)
 }
@@ -3127,13 +2973,10 @@ fn process_group(read_id: &str, records: &[AsAlignment], state: &mut ScanState) 
     if records.is_empty() {
         return Ok(());
     }
-    record_cluster_coverage(records, state);
     if state.junction_read_to_circ.contains_key(read_id) {
-        state.seen_junction_reads.insert(read_id.to_string());
         state
             .segment_groups
             .insert(read_id.to_string(), records.to_vec());
-        record_mapping_detail(read_id, records, state);
         mapping_check1(read_id, records, true, state)?;
     } else if records.len() > 2 && overlaps_any_circ_cluster(records, state) {
         state
@@ -3187,7 +3030,6 @@ fn process_backward_group(
             .segment_groups
             .entry(read_id.to_string())
             .or_insert_with(|| records.to_vec());
-        accum.add_candidates += candidates.len();
         accum.candidates.append(&mut candidates);
     }
     accum.prebuilt_segment_records.extend(segment_records);
@@ -3714,88 +3556,9 @@ fn local_clip_distance_to_group(
         .unwrap_or(i32::MAX / 4)
 }
 
-/// Adds all alignment coverage that overlaps CIRI-AS circRNA locus clusters.
-///
-/// This mirrors the Perl scan-time `%coverage` population. Only the portion
-/// anchored by a cluster boundary is counted, including the ±`MIN_INTRON` flank
-/// that CIRI-AS uses when judging candidate exon edges against local background.
-fn record_cluster_coverage(records: &[AsAlignment], state: &mut ScanState) {
-    for record in records {
-        if record.mapq < MAPQ_THRES {
-            continue;
-        }
-        let msid = msid(&record.cigar, state.read_len);
-        if msid.ref_len < 0 {
-            continue;
-        }
-        let map_end = record.pos + msid.ref_len - 1;
-        let Some((loci_start, loci_end)) = coverage_locus(record, map_end, state) else {
-            continue;
-        };
-        if loci_start > loci_end {
-            continue;
-        }
-        let chr_cov = state.coverage.entry(record.chr.clone()).or_default();
-        for pos in loci_start..=loci_end {
-            *chr_cov.entry(pos).or_insert(0) += 1;
-        }
-    }
-}
-
-/// Returns the clipped locus range counted for one alignment.
-///
-/// Perl tests the alignment start first and the alignment end second against a
-/// per-base cluster range. Preserving that order matters for reads that touch
-/// both sides of a cluster because the first branch chooses a different clipped
-/// interval than the second branch.
-fn coverage_locus(record: &AsAlignment, map_end: i32, state: &ScanState) -> Option<(i32, i32)> {
-    let clusters = state.clusters_by_chr.get(&record.chr)?;
-    if let Some(cluster) = clusters
-        .iter()
-        .find(|cluster| point_in_cluster_range(record.pos, cluster))
-    {
-        return Some((record.pos, map_end.min(cluster.end)));
-    }
-    if let Some(cluster) = clusters
-        .iter()
-        .find(|cluster| point_in_cluster_range(map_end, cluster))
-    {
-        return Some((cluster.start, map_end));
-    }
-    None
-}
-
 /// Tests membership in Perl's materialized `circ_cluster_range` hash.
 fn point_in_cluster_range(pos: i32, cluster: &CircCluster) -> bool {
     pos >= cluster.start - MIN_INTRON && pos <= cluster.end + MIN_INTRON
-}
-
-/// Records junction-read mapping intervals for cirexon validation.
-///
-/// CIRI-AS only stores this detail for reads that were listed in the circRNA
-/// Summary table. Non-BSJ reads may support `_splice.list`, but they are not
-/// allowed to provide direct start/end BSJ support for `.list` cirexons.
-fn record_mapping_detail(read_id: &str, records: &[AsAlignment], state: &mut ScanState) {
-    let mut by_reverse: [Vec<ReadMapping>; 2] = [Vec::new(), Vec::new()];
-    for record in records {
-        let Some(msid) = msid_start(&record.cigar, state.read_len) else {
-            continue;
-        };
-        if msid.ref_len <= 0 {
-            continue;
-        }
-        let reverse = if record.flag & 0x10 != 0 { 1 } else { 0 };
-        by_reverse[reverse].push(ReadMapping {
-            chr: record.chr.clone(),
-            start: record.pos,
-            end: record.pos + msid.ref_len - 1,
-            reverse,
-            mapq: record.mapq,
-            read_start: msid.clip1,
-            read_end: msid.clip1 + msid.clip2 - 1,
-        });
-    }
-    state.read_mappings.insert(read_id.to_string(), by_reverse);
 }
 
 /// True if any alignment start/end falls inside a clustered circRNA locus.
@@ -4224,11 +3987,6 @@ fn mapping_check2(
                 state.read_len,
             ) {
                 candidate_chr.get_or_insert_with(|| candidate.chr.clone());
-                if from_bsj {
-                    state.stats.known_candidates += 1;
-                } else {
-                    state.stats.add_candidates += 1;
-                }
                 state.candidates.push(candidate);
             }
         }
@@ -4514,129 +4272,6 @@ fn msid(cigar: &str, read_len: i32) -> Msid {
     }
 }
 
-/// Mirrors CIRI-AS `MSID_start` for read-coordinate bookkeeping.
-///
-/// `MSID` and `MSID_start` look similar but their second and third fields have
-/// different meanings. The splice detector needs clip offsets, while cirexon
-/// path/coverage reporting needs read start/end coordinates. Keeping this as a
-/// separate routine prevents accidental reuse of the wrong coordinate system.
-fn msid_start(cigar: &str, read_len: i32) -> Option<Msid> {
-    if cigar == "*" || cigar.is_empty() {
-        return None;
-    }
-    let mut counts = Vec::new();
-    let mut styles = Vec::new();
-    let mut number = String::new();
-    for ch in cigar.chars() {
-        if ch.is_ascii_digit() {
-            number.push(ch);
-        } else {
-            counts.push(number.parse::<i32>().unwrap_or(0));
-            number.clear();
-            styles.push(if ch == 'H' { 'S' } else { ch });
-        }
-    }
-    if counts.is_empty() {
-        return None;
-    }
-    if counts.len() == 1 {
-        return Some(if cigar == format!("{}M", read_len) {
-            Msid {
-                kind: 0,
-                clip1: 1,
-                clip2: read_len,
-                ref_len: read_len,
-            }
-        } else {
-            Msid {
-                kind: 0,
-                clip1: 0,
-                clip2: 0,
-                ref_len: -1,
-            }
-        });
-    }
-
-    let result = match counts.len() {
-        2 => match (styles[0], styles[1]) {
-            ('M', 'S') => Msid {
-                kind: 1,
-                clip1: 1,
-                clip2: counts[0],
-                ref_len: counts[0],
-            },
-            ('S', 'M') => Msid {
-                kind: -1,
-                clip1: counts[0] + 1,
-                clip2: counts[1],
-                ref_len: counts[1],
-            },
-            _ => return None,
-        },
-        3 => match (styles[0], styles[1], styles[2]) {
-            ('S', _, 'S') => Msid {
-                kind: 10,
-                clip1: counts[0] + 1,
-                clip2: counts[1],
-                ref_len: counts[1],
-            },
-            ('M', 'D', 'M') => Msid {
-                kind: 0,
-                clip1: 1,
-                clip2: read_len,
-                ref_len: read_len + counts[1],
-            },
-            ('M', 'I', 'M') => Msid {
-                kind: 0,
-                clip1: 1,
-                clip2: read_len,
-                ref_len: read_len - counts[1],
-            },
-            _ => return None,
-        },
-        _ if styles[0] == 'M' && *styles.last().unwrap() == 'S' => {
-            let (m_sum, d_sum, i_sum) =
-                sum_mdi(&styles[..styles.len() - 1], &counts[..counts.len() - 1]);
-            Msid {
-                kind: 1,
-                clip1: 1,
-                clip2: m_sum + i_sum,
-                ref_len: m_sum + d_sum,
-            }
-        }
-        _ if styles[0] == 'S' && *styles.last().unwrap() == 'M' => {
-            let (m_sum, d_sum, i_sum) = sum_mdi(&styles[1..], &counts[1..]);
-            Msid {
-                kind: -1,
-                clip1: counts[0] + 1,
-                clip2: m_sum + i_sum,
-                ref_len: m_sum + d_sum,
-            }
-        }
-        _ if styles[0] == 'M' && *styles.last().unwrap() == 'M' => {
-            let (m_sum, d_sum, _) = sum_mdi(&styles, &counts);
-            Msid {
-                kind: 0,
-                clip1: 1,
-                clip2: read_len,
-                ref_len: m_sum + d_sum,
-            }
-        }
-        _ if styles[0] == 'S' && *styles.last().unwrap() == 'S' => {
-            let (m_sum, d_sum, i_sum) =
-                sum_mdi(&styles[1..styles.len() - 1], &counts[1..counts.len() - 1]);
-            Msid {
-                kind: 10,
-                clip1: counts[0] + 1,
-                clip2: m_sum + i_sum,
-                ref_len: m_sum + d_sum,
-            }
-        }
-        _ => return None,
-    };
-    Some(result)
-}
-
 /// Returns an invalid `MSID` sentinel.
 fn invalid_msid(ref_len: i32) -> Msid {
     Msid {
@@ -4659,22 +4294,6 @@ fn sum_md(styles: &[char], counts: &[i32]) -> (i32, i32) {
         }
     }
     (m_sum, d_sum)
-}
-
-/// Sums reference/read-consuming CIGAR operations for `MSID_start`.
-fn sum_mdi(styles: &[char], counts: &[i32]) -> (i32, i32, i32) {
-    let mut m_sum = 0;
-    let mut d_sum = 0;
-    let mut i_sum = 0;
-    for (style, count) in styles.iter().zip(counts) {
-        match style {
-            'M' => m_sum += count,
-            'D' => d_sum += count,
-            'I' => i_sum += count,
-            _ => {}
-        }
-    }
-    (m_sum, d_sum, i_sum)
 }
 
 /// Applies CIRI-AS splice-signal motif checking and coordinate adjustment.
@@ -4924,1092 +4543,6 @@ fn annotation_offset_score(
     score
 }
 
-/// Clusters motif-validated splice candidates using the CIRI-AS two-pass rule.
-fn cluster_candidates(candidates: &[PositiveCandidate]) -> Vec<SpliceCluster> {
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-    let mut sorted: Vec<usize> = (0..candidates.len()).collect();
-    sorted.sort_by(|&a, &b| {
-        candidates[a]
-            .chr
-            .cmp(&candidates[b].chr)
-            .then(candidates[a].site2.cmp(&candidates[b].site2))
-    });
-
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    for idx in sorted {
-        let same_group = groups.last().and_then(|g| g.last()).is_some_and(|&prev| {
-            candidates[idx].chr == candidates[prev].chr
-                && candidates[idx].site2 - candidates[prev].site2 <= 3
-        });
-        if same_group {
-            groups.last_mut().unwrap().push(idx);
-        } else {
-            groups.push(vec![idx]);
-        }
-    }
-
-    let mut clusters = Vec::new();
-    for mut group in groups {
-        group.sort_by_key(|&idx| candidates[idx].site1);
-        let mut current: Vec<usize> = Vec::new();
-        for idx in group {
-            let same_cluster = current.last().is_some_and(|&prev| {
-                candidates[idx].chr == candidates[prev].chr
-                    && candidates[idx].site1 - candidates[prev].site1 <= 3
-            });
-            if same_cluster {
-                current.push(idx);
-            } else {
-                push_cluster(&mut clusters, candidates, &current);
-                current = vec![idx];
-            }
-        }
-        push_cluster(&mut clusters, candidates, &current);
-    }
-    clusters
-}
-
-/// Finalizes one candidate cluster if it passes CIRI-AS stringency.
-fn push_cluster(
-    clusters: &mut Vec<SpliceCluster>,
-    candidates: &[PositiveCandidate],
-    current: &[usize],
-) {
-    if current.is_empty() {
-        return;
-    }
-    let median_idx = current[(current.len() - 1) / 2];
-    let mut cigar_counts = [0usize; 3];
-    for slot in 0..3 {
-        let mut seen = HashSet::new();
-        for &idx in current {
-            if let Some(cigar) = &candidates[idx].cigars[slot] {
-                seen.insert(cigar.clone());
-            }
-        }
-        cigar_counts[slot] = seen.len();
-    }
-    if cigar_counts.iter().sum::<usize>() >= STRINGENCY {
-        clusters.push(SpliceCluster {
-            chr: candidates[median_idx].chr.clone(),
-            site1: candidates[median_idx].site1,
-            site2: candidates[median_idx].site2,
-            reads: current.to_vec(),
-            cigar_counts,
-        });
-    }
-}
-
-/// Writes the CIRI-AS `_splice.list` table.
-fn write_splice_list(
-    path: &str,
-    clusters: &[SpliceCluster],
-    candidates: &[PositiveCandidate],
-    read_to_circ: &HashMap<String, String>,
-) -> Result<()> {
-    let mut writer = BufWriter::new(File::create(path)?);
-    writeln!(
-        writer,
-        "ID\tchr\tsplice_start\tsplice_end\t#supporting_reads\tSM_MS_SMS\tjunction_reads_ID"
-    )?;
-    for cluster in clusters {
-        write!(
-            writer,
-            "{}:{}|{}\t{}\t{}\t{}\t{}\t{}_{}_{}\t",
-            cluster.chr,
-            cluster.site1,
-            cluster.site2,
-            cluster.chr,
-            cluster.site1,
-            cluster.site2,
-            cluster.reads.len(),
-            cluster.cigar_counts[0],
-            cluster.cigar_counts[1],
-            cluster.cigar_counts[2]
-        )?;
-        for &idx in &cluster.reads {
-            let candidate = &candidates[idx];
-            let circ = read_to_circ
-                .get(&candidate.read_id)
-                .map(String::as_str)
-                .unwrap_or("");
-            write!(writer, "{}({}),", candidate.read_id, circ)?;
-        }
-        writeln!(writer)?;
-    }
-    Ok(())
-}
-
-/// Predicts CIRI-AS cirexons from validated splice clusters and coverage.
-///
-/// This is the first `.list` implementation stage. It ports the deterministic
-/// exon-candidate and coverage-validation path from CIRI-AS v1.2, but leaves
-/// intron-retention rescue and AS path classification for the next stage so the
-/// cirexon table can be validated independently.
-fn predict_cirexons(
-    state: &ScanState,
-    splice_clusters: &[SpliceCluster],
-    reference: &HashMap<String, String>,
-    annotation: Option<&Annotation>,
-) -> (Vec<CirexonRecord>, Vec<IsoformRecord>) {
-    let mut circ_by_chr: BTreeMap<&str, Vec<&CircRecord>> = BTreeMap::new();
-    for circ in state.circ_by_id.values() {
-        circ_by_chr.entry(circ.chr.as_str()).or_default().push(circ);
-    }
-    let mut clusters_by_chr: BTreeMap<&str, Vec<&SpliceCluster>> = BTreeMap::new();
-    for cluster in splice_clusters {
-        clusters_by_chr
-            .entry(cluster.chr.as_str())
-            .or_default()
-            .push(cluster);
-    }
-    for clusters in clusters_by_chr.values_mut() {
-        clusters.sort_by_key(|cluster| (cluster.site2, cluster.site1));
-    }
-
-    let mut cirexons = Vec::new();
-    let mut isoforms = Vec::new();
-    for (chr, mut circs) in circ_by_chr {
-        circs.sort_by_key(|circ| (circ.start, circ.end));
-        let chr_clusters = clusters_by_chr.get(chr).map(Vec::as_slice).unwrap_or(&[]);
-        for circ in circs {
-            let Some(strand) = infer_circ_strand(circ, reference, annotation) else {
-                continue;
-            };
-            let in_circ: Vec<&SpliceCluster> = chr_clusters
-                .iter()
-                .copied()
-                .filter(|cluster| {
-                    cluster.site2 >= circ.start
-                        && cluster.site2 <= circ.end
-                        && cluster.site1 < circ.end
-                        && cluster.site2 > circ.start
-                })
-                .collect();
-            if in_circ.is_empty() {
-                continue;
-            }
-            let junction_context = build_junction_context(circ, state);
-            let Some(cirexon_context) =
-                build_cirexon_context(circ, &in_circ, &junction_context, state)
-            else {
-                continue;
-            };
-            let known_exons = known_exons_for_circ(circ, annotation);
-            let mut validated = validate_candidate_cirexons(
-                circ,
-                &strand,
-                &cirexon_context,
-                &junction_context,
-                state,
-                &known_exons,
-                annotation.is_some(),
-            );
-            validated.sort_by_key(|record| (record.start, record.end));
-            let mut circ_isoforms =
-                build_full_length_isoforms(circ, &strand, &validated, &cirexon_context, annotation);
-            isoforms.append(&mut circ_isoforms);
-            append_ordered_cirexons(&mut cirexons, &mut validated, &strand);
-        }
-    }
-    (cirexons, isoforms)
-}
-
-/// Junction-read intervals and per-base coverage for one circRNA.
-struct JunctionContext {
-    mappings: Vec<ReadMapping>,
-    coverage: HashMap<i32, u32>,
-}
-
-/// CIRI-AS splice-derived boundary state for one circRNA.
-struct CirexonContext {
-    supporting_start: BTreeMap<i32, BoundarySupport>,
-    supporting_end: BTreeMap<i32, BoundarySupport>,
-    splice_read_start: HashMap<i32, usize>,
-    splice_read_end: HashMap<i32, usize>,
-    splice_links: HashMap<(i32, i32), usize>,
-    splice_across_count: HashMap<i32, usize>,
-}
-
-/// Builds mapping intervals for BSJ reads assigned to one circRNA.
-fn build_junction_context(circ: &CircRecord, state: &ScanState) -> JunctionContext {
-    let mut mappings = Vec::new();
-    let mut coverage = HashMap::new();
-    for read in &circ.junction_reads {
-        let Some(by_reverse) = state.read_mappings.get(read) else {
-            continue;
-        };
-        for bucket in by_reverse {
-            for mapping in bucket {
-                if mapping.chr == circ.chr
-                    && mapping.start >= circ.start - 6
-                    && mapping.end <= circ.end + 6
-                {
-                    mappings.push(mapping.clone());
-                    for pos in mapping.start..=mapping.end {
-                        *coverage.entry(pos).or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-    }
-    mappings.sort_by_key(|mapping| (mapping.start, mapping.end));
-    JunctionContext { mappings, coverage }
-}
-
-/// Builds candidate exon boundary support from splice clusters inside a circRNA.
-fn build_cirexon_context(
-    circ: &CircRecord,
-    splice_clusters: &[&SpliceCluster],
-    junction_context: &JunctionContext,
-    state: &ScanState,
-) -> Option<CirexonContext> {
-    let mut supporting_start: BTreeMap<i32, BoundarySupport> = BTreeMap::new();
-    let mut supporting_end: BTreeMap<i32, BoundarySupport> = BTreeMap::new();
-    let mut splice_read_start: HashMap<i32, usize> = HashMap::new();
-    let mut splice_read_end: HashMap<i32, usize> = HashMap::new();
-    let mut splice_links: HashMap<(i32, i32), usize> = HashMap::new();
-    let mut splice_across_count: HashMap<i32, usize> = HashMap::new();
-    let mut any_bsj_supported_splice = false;
-
-    for cluster in splice_clusters {
-        supporting_start
-            .entry(cluster.site1)
-            .or_insert(BoundarySupport::Count(0));
-        supporting_end
-            .entry(cluster.site2)
-            .or_insert(BoundarySupport::Count(0));
-        *splice_read_start.entry(cluster.site1).or_insert(0) += cluster.reads.len();
-        *splice_read_end.entry(cluster.site2).or_insert(0) += cluster.reads.len();
-
-        let mut bsj_support = 0usize;
-        for &idx in &cluster.reads {
-            let candidate = &state.candidates[idx];
-            if state
-                .junction_read_to_circ
-                .get(&candidate.read_id)
-                .is_some_and(|id| id == &circ.id)
-            {
-                bsj_support += 1;
-            }
-        }
-        if bsj_support > 0 {
-            any_bsj_supported_splice = true;
-            supporting_start.insert(cluster.site1, BoundarySupport::Count(bsj_support));
-            supporting_end.insert(cluster.site2, BoundarySupport::Count(bsj_support));
-            splice_links.insert((cluster.site2, cluster.site1), bsj_support);
-        }
-
-        for site in [cluster.site2, cluster.site1] {
-            splice_across_count
-                .entry(site)
-                .or_insert_with(|| count_mappings_across_site(&junction_context.mappings, site));
-        }
-    }
-
-    supporting_start.insert(circ.start, BoundarySupport::CircStart);
-    supporting_end.insert(circ.end, BoundarySupport::CircEnd);
-
-    if any_bsj_supported_splice {
-        Some(CirexonContext {
-            supporting_start,
-            supporting_end,
-            splice_read_start,
-            splice_read_end,
-            splice_links,
-            splice_across_count,
-        })
-    } else {
-        None
-    }
-}
-
-/// Counts junction-read alignments that span a splice site by six bases.
-fn count_mappings_across_site(mappings: &[ReadMapping], site: i32) -> usize {
-    mappings
-        .iter()
-        .filter(|mapping| mapping.start <= site - 6 && mapping.end >= site + 6)
-        .count()
-}
-
-/// Validates candidate cirexons using CIRI-AS coverage and support rules.
-fn validate_candidate_cirexons(
-    circ: &CircRecord,
-    strand: &str,
-    context: &CirexonContext,
-    junction_context: &JunctionContext,
-    state: &ScanState,
-    known_exons: &[(i32, i32)],
-    has_annotation: bool,
-) -> Vec<CirexonRecord> {
-    let starts: Vec<i32> = context.supporting_start.keys().copied().collect();
-    let ends: Vec<i32> = context.supporting_end.keys().copied().collect();
-    let mut candidates: Vec<(i32, i32, i32)> = Vec::new();
-    for (i, start) in starts.iter().enumerate() {
-        for (j, end) in ends.iter().enumerate() {
-            let start_support = context.supporting_start[start].numeric();
-            let end_support = context.supporting_end[end].numeric();
-            if *end >= *start + MIN_EXON_LENGTH - 1
-                && *end <= *start + MAX_EXON_LENGTH - 1
-                && (start_support + end_support > 0 || i == 0 || j + 1 == ends.len())
-            {
-                candidates.push((*start, *end, *end - *start + 1));
-            }
-        }
-    }
-    candidates.sort_by_key(|&(start, end, length)| (length, start, end));
-
-    let mut validated = Vec::new();
-    let mut validated_starts: HashSet<i32> = HashSet::new();
-    let mut validated_ends: HashSet<i32> = HashSet::new();
-    for (start, end, _) in candidates {
-        if validated_starts.contains(&start) && validated_ends.contains(&end) {
-            continue;
-        }
-        let start_support = context.supporting_start[&start];
-        let end_support = context.supporting_end[&end];
-        if validated_starts.contains(&start) && end_support.numeric() == 0 {
-            continue;
-        }
-        if validated_ends.contains(&end) && start_support.numeric() == 0 {
-            continue;
-        }
-        let validation = exon_coverage_validation_single(
-            &circ.chr,
-            start,
-            end,
-            start_support,
-            end_support,
-            *context.splice_read_start.get(&start).unwrap_or(&0),
-            *context.splice_read_end.get(&end).unwrap_or(&0),
-            *context.splice_across_count.get(&start).unwrap_or(&0),
-            *context.splice_across_count.get(&end).unwrap_or(&0),
-            &junction_context.coverage,
-            state,
-        );
-        if validation.code >= 1 {
-            validated_starts.insert(start);
-            validated_ends.insert(end);
-            let is_icf = has_annotation
-                && !known_exons.iter().any(|&(known_start, known_end)| {
-                    known_start <= start + 6 && known_end >= end - 6
-                });
-            validated.push(CirexonRecord {
-                circ_id: circ.id.clone(),
-                chr: circ.chr.clone(),
-                circ_start: circ.start,
-                circ_end: circ.end,
-                strand: strand.to_string(),
-                junction_read_count: circ.junction_read_count.clone(),
-                pcc: circ.pcc.clone(),
-                non_junction_reads: circ.non_junction_reads.clone(),
-                junction_reads_ratio: circ.junction_reads_ratio.clone(),
-                circ_type: circ.circ_type.clone(),
-                gene_id: circ.gene_id.clone(),
-                cirexon_id: String::new(),
-                start,
-                end,
-                start_support: start_support.as_output(),
-                end_support: end_support.as_output(),
-                coverage_median: validation.median,
-                is_icf,
-            });
-        }
-    }
-    validated
-}
-
-/// Builds full-length anchored isoform paths from validated cirexons.
-///
-/// The goal here is not CIRI-AS event classification. We use the same exon graph
-/// ingredients, but stop at concrete exon-chain reconstruction: nodes are
-/// validated cirexons, explicit edges are BSJ-read-supported internal splices,
-/// and the only fallback edge is the nearest downstream neighbouring exon used
-/// by CIRI-AS when no splice link exists for a node.
-fn build_full_length_isoforms(
-    circ: &CircRecord,
-    strand: &str,
-    validated: &[CirexonRecord],
-    context: &CirexonContext,
-    annotation: Option<&Annotation>,
-) -> Vec<IsoformRecord> {
-    if validated.is_empty() {
-        return Vec::new();
-    }
-    let mut exons: Vec<CirexonRecord> = validated.to_vec();
-    exons.sort_by_key(|record| (record.start, record.end));
-    let links = build_isoform_links(&exons, context);
-    let starts: Vec<usize> = exons
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, exon)| (exon.start == circ.start).then_some(idx))
-        .collect();
-    if starts.is_empty() {
-        return Vec::new();
-    }
-
-    let mut paths = Vec::new();
-    for start_idx in starts {
-        let mut path = Vec::new();
-        enumerate_isoform_paths(start_idx, &exons, &links, &mut path, &mut paths);
-        if paths.len() >= MAX_ISOFORM_PATHS_PER_CIRC {
-            break;
-        }
-    }
-    if paths.is_empty() {
-        return Vec::new();
-    }
-
-    let mut records = Vec::new();
-    for path in paths {
-        let path_exons: Vec<(i32, i32)> = path
-            .iter()
-            .map(|&idx| (exons[idx].start, exons[idx].end))
-            .collect();
-        let mut transcript_exons = path_exons.clone();
-        if strand == "-" {
-            transcript_exons.reverse();
-        }
-        let junctions: Vec<(i32, i32)> = path_exons
-            .windows(2)
-            .map(|pair| (pair[0].1, pair[1].0))
-            .collect();
-        let internal_split_reads = junctions
-            .iter()
-            .map(|junction| context.splice_links.get(junction).copied().unwrap_or(0))
-            .sum::<usize>();
-        let annotation_supported_junctions = junctions
-            .iter()
-            .filter(|&&(end, start)| junction_has_annotation(circ, end, start, annotation))
-            .count();
-        let de_novo_supported_junctions = junctions
-            .len()
-            .saturating_sub(annotation_supported_junctions);
-        let isoform_len = transcript_exons
-            .iter()
-            .map(|(start, end)| end - start + 1)
-            .sum::<i32>();
-        let icf_penalty = path
-            .iter()
-            .filter(|&&idx| exons[idx].is_icf)
-            .count()
-            .saturating_mul(2) as i32;
-        let bsj_seed_reads = circ.junction_read_count.parse::<usize>().unwrap_or(0);
-        let score = bsj_seed_reads as i32
-            + (internal_split_reads as i32 * 10)
-            + (annotation_supported_junctions as i32 * 3)
-            - (de_novo_supported_junctions as i32)
-            - icf_penalty;
-        records.push(IsoformRecord {
-            circ_id: circ.id.clone(),
-            isoform_id: String::new(),
-            chr: circ.chr.clone(),
-            start: circ.start,
-            end: circ.end,
-            strand: strand.to_string(),
-            path_tier: "anchored".to_string(),
-            bsj_supported: "yes".to_string(),
-            gene_id: circ.gene_id.clone(),
-            exons: transcript_exons,
-            junctions,
-            isoform_len,
-            bsj_seed_reads,
-            internal_split_reads,
-            boundary_clip_reads: 0,
-            anomalous_pair_reads: 0,
-            annotation_supported_junctions,
-            de_novo_supported_junctions,
-            score,
-            rank: 0,
-        });
-    }
-
-    records.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then(a.exons.len().cmp(&b.exons.len()))
-            .then(a.exon_chain().cmp(&b.exon_chain()))
-    });
-    records.dedup_by(|a, b| a.exons == b.exons);
-    for (idx, record) in records.iter_mut().enumerate() {
-        record.rank = idx + 1;
-        record.isoform_id = format!("{}.isoform{}", circ.id, idx + 1);
-    }
-    records
-}
-
-/// Builds graph edges between validated cirexons for full-length path search.
-fn build_isoform_links(
-    exons: &[CirexonRecord],
-    context: &CirexonContext,
-) -> HashMap<usize, Vec<(usize, usize)>> {
-    let mut links: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
-    for (idx, exon) in exons.iter().enumerate() {
-        let mut explicit = Vec::new();
-        for (next_idx, next) in exons.iter().enumerate().skip(idx + 1) {
-            if next.start <= exon.end {
-                continue;
-            }
-            if let Some(&support) = context.splice_links.get(&(exon.end, next.start)) {
-                explicit.push((next_idx, support));
-            }
-        }
-        if !explicit.is_empty() {
-            links.insert(idx, explicit);
-            continue;
-        }
-        if let Some(first_next_start) = exons
-            .iter()
-            .skip(idx + 1)
-            .filter(|next| next.start > exon.end)
-            .map(|next| next.start)
-            .min()
-        {
-            let neighbours = exons
-                .iter()
-                .enumerate()
-                .skip(idx + 1)
-                .filter_map(|(next_idx, next)| {
-                    (next.start == first_next_start).then_some((next_idx, 0))
-                })
-                .collect::<Vec<_>>();
-            if !neighbours.is_empty() {
-                links.insert(idx, neighbours);
-            }
-        }
-    }
-    links
-}
-
-/// Depth-first path enumeration with a hard cap per circRNA.
-fn enumerate_isoform_paths(
-    idx: usize,
-    exons: &[CirexonRecord],
-    links: &HashMap<usize, Vec<(usize, usize)>>,
-    path: &mut Vec<usize>,
-    paths: &mut Vec<Vec<usize>>,
-) {
-    if paths.len() >= MAX_ISOFORM_PATHS_PER_CIRC {
-        return;
-    }
-    if path.contains(&idx) {
-        return;
-    }
-    path.push(idx);
-    if exons[idx].end == exons[idx].circ_end {
-        paths.push(path.clone());
-        path.pop();
-        return;
-    }
-    if let Some(nexts) = links.get(&idx) {
-        for &(next_idx, _) in nexts {
-            enumerate_isoform_paths(next_idx, exons, links, path, paths);
-            if paths.len() >= MAX_ISOFORM_PATHS_PER_CIRC {
-                break;
-            }
-        }
-    }
-    path.pop();
-}
-
-/// True when a path junction is supported by annotated exon boundaries.
-fn junction_has_annotation(
-    circ: &CircRecord,
-    exon_end: i32,
-    next_start: i32,
-    annotation: Option<&Annotation>,
-) -> bool {
-    let Some(annotation) = annotation else {
-        return false;
-    };
-    let end_key = format!("{}\t{}", circ.chr, exon_end);
-    let start_key = format!("{}\t{}", circ.chr, next_start);
-    annotation.chr_exon_end_map.contains_key(&end_key)
-        && annotation.chr_exon_start_map.contains_key(&start_key)
-}
-
-impl IsoformRecord {
-    /// Formats exon coordinates in transcript order for `.isoforms`.
-    fn exon_chain(&self) -> String {
-        self.exons
-            .iter()
-            .map(|(start, end)| format!("{}:{}!{}", start, end, self.strand))
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-
-    /// Formats internal splice junctions in genomic order for debugging.
-    fn junction_chain(&self) -> String {
-        if self.junctions.is_empty() {
-            return "NA".to_string();
-        }
-        self.junctions
-            .iter()
-            .map(|(end, start)| format!("{}:{}", end, start))
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-}
-
-/// Ports CIRI-AS `exon_coverage_validation_single` return-code semantics.
-fn exon_coverage_validation_single(
-    chr: &str,
-    start: i32,
-    end: i32,
-    tag_start: BoundarySupport,
-    tag_end: BoundarySupport,
-    tag_start2: usize,
-    tag_end2: usize,
-    start_across: usize,
-    end_across: usize,
-    junction_coverage: &HashMap<i32, u32>,
-    state: &ScanState,
-) -> CoverageValidation {
-    let length = end - start + 1;
-    let last_group = (end - start) / (MIN_INTRON - 5);
-    let mut total_cov0 = 0usize;
-    let mut max_junc_gap = 0usize;
-    let mut cont_junc_cov0 = 0usize;
-    let mut junc_cov0_count = 0usize;
-    let mut u_pre = vec![0.0; last_group as usize + 1];
-    let mut u_after = vec![0.0; last_group as usize + 1];
-    let mut u_pre_total = 0.0;
-    let mut u_after_total = 0.0;
-    let mut cov_all = Vec::with_capacity(length.max(0) as usize);
-
-    for pos in start..=end {
-        let group = ((pos - start) / (MIN_INTRON - 5)) as usize;
-        let cov = coverage_at(state, chr, pos);
-        if cov == 0 {
-            total_cov0 += 1;
-        }
-        if junction_coverage.get(&pos).copied().unwrap_or(0) > 0 {
-            cont_junc_cov0 = 0;
-        } else {
-            junc_cov0_count += 1;
-            cont_junc_cov0 += 1;
-            max_junc_gap = max_junc_gap.max(cont_junc_cov0);
-        }
-        for flank in 6..=MIN_INTRON {
-            let pre = coverage_at(state, chr, start - flank);
-            if cov > pre {
-                u_pre[group] += 1.0;
-                u_pre_total += 1.0;
-            } else if cov == pre {
-                u_pre[group] += 0.5;
-                u_pre_total += 0.5;
-            }
-            let after = coverage_at(state, chr, end + flank);
-            if cov > after {
-                u_after[group] += 1.0;
-                u_after_total += 1.0;
-            } else if cov == after {
-                u_after[group] += 0.5;
-                u_after_total += 0.5;
-            }
-        }
-        cov_all.push(cov);
-    }
-
-    if last_group > 0 {
-        let tail_start = end - MIN_INTRON + 6;
-        let tail_end = end - (end - start) % (MIN_INTRON - 5) - 1;
-        for pos in tail_start..=tail_end {
-            let cov = coverage_at(state, chr, pos);
-            for flank in 6..=MIN_INTRON {
-                let pre = coverage_at(state, chr, start - flank);
-                if cov > pre {
-                    *u_pre.last_mut().unwrap() += 1.0;
-                } else if cov == pre {
-                    *u_pre.last_mut().unwrap() += 0.5;
-                }
-                let after = coverage_at(state, chr, end + flank);
-                if cov > after {
-                    *u_after.last_mut().unwrap() += 1.0;
-                } else if cov == after {
-                    *u_after.last_mut().unwrap() += 0.5;
-                }
-            }
-        }
-    }
-    let sample_size = if last_group > 0 {
-        MIN_INTRON - 5
-    } else {
-        length
-    };
-    let mut decline_pre = 0usize;
-    let mut decline_after = 0usize;
-    for idx in 0..=last_group as usize {
-        if z_calculation(u_pre[idx], sample_size, MIN_INTRON - 5) <= Z_ALPHA {
-            decline_pre += 1;
-        }
-        if z_calculation(u_after[idx], sample_size, MIN_INTRON - 5) <= Z_ALPHA {
-            decline_after += 1;
-        }
-    }
-    cov_all.sort_unstable();
-    let median = cov_all[(cov_all.len() - 1) / 2] as i32;
-    let z_pre_total = z_calculation(u_pre_total, length, MIN_INTRON - 5);
-    let z_after_total = z_calculation(u_after_total, length, MIN_INTRON - 5);
-
-    let code = if matches!(tag_start, BoundarySupport::Count(0)) && start_across > 0 {
-        0
-    } else if matches!(tag_end, BoundarySupport::Count(0)) && end_across > 0 {
-        -1
-    } else if total_cov0 > 0 {
-        -2
-    } else if tag_start2 < 2 && !matches!(tag_start, BoundarySupport::CircStart) && decline_pre > 0
-    {
-        -3
-    } else if tag_end2 < 2 && !matches!(tag_end, BoundarySupport::CircEnd) && decline_after > 0 {
-        -4
-    } else if tag_start2 < 2
-        && !matches!(tag_start, BoundarySupport::CircStart)
-        && z_pre_total <= Z_ALPHA
-    {
-        -8
-    } else if tag_end2 < 2
-        && !matches!(tag_end, BoundarySupport::CircEnd)
-        && z_after_total <= Z_ALPHA
-    {
-        -9
-    } else if (junc_cov0_count as f64) / (length as f64) <= 0.2 {
-        1
-    } else if !matches!(tag_start, BoundarySupport::Count(0))
-        && !matches!(tag_end, BoundarySupport::Count(0))
-        && max_junc_gap < MIN_INTRON as usize
-    {
-        2
-    } else {
-        -10
-    };
-    CoverageValidation { code, median }
-}
-
-/// Mann-Whitney-style Z score used by CIRI-AS coverage validation.
-fn z_calculation(wxy: f64, n: i32, m: i32) -> f64 {
-    let n = n as f64;
-    let m = m as f64;
-    let wy = wxy + n * (n + 1.0) / 2.0;
-    let total = n + m;
-    (wy - n * (total + 1.0) / 2.0) / (m * n * (total + 1.0) / 12.0).sqrt()
-}
-
-/// Returns all known annotation exons that can explain a circRNA interval.
-fn known_exons_for_circ(circ: &CircRecord, annotation: Option<&Annotation>) -> Vec<(i32, i32)> {
-    let Some(annotation) = annotation else {
-        return Vec::new();
-    };
-    circ.gene_id
-        .split(',')
-        .filter_map(|gene| annotation.gene_exon_map.get(gene))
-        .flat_map(|exons| exons.iter().copied())
-        .filter(|&(start, end)| start >= circ.start && end <= circ.end)
-        .collect()
-}
-
-/// Infers circRNA strand from Summary, splice motifs, then annotation.
-fn infer_circ_strand(
-    circ: &CircRecord,
-    reference: &HashMap<String, String>,
-    annotation: Option<&Annotation>,
-) -> Option<String> {
-    if circ.strand == "+" || circ.strand == "-" {
-        return Some(circ.strand.clone());
-    }
-    let seq = reference.get(&circ.chr)?;
-    let start_2bp = perl_substr(seq, circ.start - 3, 2).to_ascii_uppercase();
-    let end_2bp = perl_substr(seq, circ.end, 2).to_ascii_uppercase();
-    if start_2bp.contains("AG") && end_2bp.contains("GT") {
-        Some("+".to_string())
-    } else if start_2bp.contains("AC") && end_2bp.contains("CT") {
-        Some("-".to_string())
-    } else if start_2bp.contains("AG") || end_2bp.contains("GT") {
-        Some("+".to_string())
-    } else if start_2bp.contains("AC") || end_2bp.contains("CT") {
-        Some("-".to_string())
-    } else {
-        annotation.and_then(|anno| {
-            let start_key = format!("{}\t{}", circ.chr, circ.start);
-            let end_key = format!("{}\t{}", circ.chr, circ.end);
-            anno.chr_exon_start_map
-                .get(&start_key)
-                .or_else(|| anno.chr_exon_end_map.get(&end_key))
-                .and_then(|value| value.split('\t').nth(1))
-                .map(str::to_string)
-        })
-    }
-}
-
-/// Appends validated cirexons in CIRI-AS strand-aware `cirexonN` order.
-fn append_ordered_cirexons(
-    out: &mut Vec<CirexonRecord>,
-    validated: &mut [CirexonRecord],
-    strand: &str,
-) {
-    if validated.is_empty() {
-        return;
-    }
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    for idx in 0..validated.len() {
-        if idx == 0 || validated[idx].start > validated[idx - 1].end {
-            groups.push(vec![idx]);
-        } else {
-            groups.last_mut().unwrap().push(idx);
-        }
-    }
-    let group_order: Vec<usize> = if strand == "-" {
-        (0..groups.len()).rev().collect()
-    } else {
-        (0..groups.len()).collect()
-    };
-    for (display_idx, group_idx) in group_order.into_iter().enumerate() {
-        for &record_idx in &groups[group_idx] {
-            let mut record = validated[record_idx].clone();
-            record.cirexon_id = format!("cirexon{}", display_idx + 1);
-            out.push(record);
-        }
-    }
-}
-
-/// Returns global CIRI-AS coverage at one genomic position.
-fn coverage_at(state: &ScanState, chr: &str, pos: i32) -> u32 {
-    state
-        .coverage
-        .get(chr)
-        .and_then(|chr_cov| chr_cov.get(&pos).copied())
-        .unwrap_or(0)
-}
-
-/// Writes the `.list` table used by CIRI-AS cirexon output.
-fn write_cirexon_list(path: &str, records: &[CirexonRecord]) -> Result<()> {
-    let mut writer = BufWriter::new(File::create(path)?);
-    writeln!(
-        writer,
-        "circRNA_id\tchr\tstart\tend\tstrand\t#junction_reads\tPCC(MS_SM_SMS)\t#non_junction_reads\tjunction_reads_ratio\tcircRNA_type\tgene_id\tcirexon_id\tcirexon_start\tcirexon_end\t#start_supporting_BSJ_read\t#end_supporting_BSJ_read\tsequencing_depth_median\tif_ICF"
-    )?;
-    for record in records {
-        writeln!(
-            writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            record.circ_id,
-            record.chr,
-            record.circ_start,
-            record.circ_end,
-            record.strand,
-            record.junction_read_count,
-            record.pcc,
-            record.non_junction_reads,
-            record.junction_reads_ratio,
-            record.circ_type,
-            record.gene_id,
-            record.cirexon_id,
-            record.start,
-            record.end,
-            record.start_support,
-            record.end_support,
-            record.coverage_median,
-            if record.is_icf { "ICF" } else { "non_ICF" }
-        )?;
-    }
-    Ok(())
-}
-
-/// Writes the `_AS.list` header used by CIRI-AS alternative-splicing output.
-fn write_as_header(path: &str) -> Result<()> {
-    let mut writer = BufWriter::new(File::create(path)?);
-    writeln!(
-        writer,
-        "circRNA_id\talternatively_spliced_exon\tAS_type\tpsi_estimation_without_correction\tpsi_estimation_after_correction"
-    )?;
-    Ok(())
-}
-
-/// Writes full-length isoform paths reconstructed from cirexon graph traversal.
-fn write_isoforms(path: &str, records: &[IsoformRecord]) -> Result<()> {
-    let mut writer = BufWriter::new(File::create(path)?);
-    writeln!(
-        writer,
-        "circ_id\tisoform_id\tchr\tstart\tend\tstrand\tpath_tier\tbsj_supported\tgene_id\texon_chain\tjunction_chain\texon_count\tisoform_len\tbsj_seed_reads\tinternal_split_reads\tboundary_clip_reads\tanomalous_pair_reads\tannotation_supported_junctions\tde_novo_supported_junctions\tscore\trank"
-    )?;
-    for record in records {
-        writeln!(
-            writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            record.circ_id,
-            record.isoform_id,
-            record.chr,
-            record.start,
-            record.end,
-            record.strand,
-            record.path_tier,
-            record.bsj_supported,
-            record.gene_id,
-            record.exon_chain(),
-            record.junction_chain(),
-            record.exons.len(),
-            record.isoform_len,
-            record.bsj_seed_reads,
-            record.internal_split_reads,
-            record.boundary_clip_reads,
-            record.anomalous_pair_reads,
-            record.annotation_supported_junctions,
-            record.de_novo_supported_junctions,
-            record.score,
-            record.rank
-        )?;
-    }
-    Ok(())
-}
-
-/// Writes per-circRNA full-length isoform counts.
-///
-/// This summary is the quickest output for the current development goal: it
-/// reports how many anchored isoform paths were reconstructed for each
-/// Summary-confirmed circRNA, including zeros so missing path cases are explicit.
-fn write_isoform_summary(
-    path: &str,
-    state: &ScanState,
-    cirexons: &[CirexonRecord],
-    isoforms: &[IsoformRecord],
-) -> Result<()> {
-    let mut cirexon_count: HashMap<&str, usize> = HashMap::new();
-    for cirexon in cirexons {
-        *cirexon_count.entry(cirexon.circ_id.as_str()).or_insert(0) += 1;
-    }
-    let mut isoform_count: HashMap<&str, usize> = HashMap::new();
-    for isoform in isoforms {
-        *isoform_count.entry(isoform.circ_id.as_str()).or_insert(0) += 1;
-    }
-
-    let mut circ_records: Vec<&CircRecord> = state.circ_by_id.values().collect();
-    circ_records.sort_by_key(|circ| (&circ.chr, circ.start, circ.end));
-    let mut writer = BufWriter::new(File::create(path)?);
-    writeln!(
-        writer,
-        "circ_id\tchr\tstart\tend\tstrand\tgene_id\tjunction_reads\tcirexon_count\tisoform_count"
-    )?;
-    for circ in circ_records {
-        writeln!(
-            writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            circ.id,
-            circ.chr,
-            circ.start,
-            circ.end,
-            circ.strand,
-            circ.gene_id,
-            circ.junction_read_count,
-            cirexon_count.get(circ.id.as_str()).copied().unwrap_or(0),
-            isoform_count.get(circ.id.as_str()).copied().unwrap_or(0)
-        )?;
-    }
-    Ok(())
-}
-
-/// Writes FASTA sequences for reconstructed full-length isoforms.
-///
-/// Coordinates remain 1-based inclusive in the table, but FASTA extraction uses
-/// Rust's 0-based end-exclusive slicing in this one helper so coordinate
-/// conversion is not duplicated around the reconstruction code.
-fn write_isoform_fasta(
-    path: &str,
-    records: &[IsoformRecord],
-    reference: &HashMap<String, String>,
-) -> Result<()> {
-    let mut writer = BufWriter::new(File::create(path)?);
-    for record in records {
-        let seq = isoform_sequence(record, reference)?;
-        writeln!(
-            writer,
-            ">{}|{}|tier={}|bsj_supported={}|score={}|rank={}|exons={}",
-            record.circ_id,
-            record.isoform_id,
-            record.path_tier,
-            record.bsj_supported,
-            record.score,
-            record.rank,
-            record.exon_chain()
-        )?;
-        for chunk in seq.as_bytes().chunks(80) {
-            writer.write_all(chunk)?;
-            writer.write_all(b"\n")?;
-        }
-    }
-    Ok(())
-}
-
-/// Extracts one isoform sequence from the reference FASTA.
-fn isoform_sequence(record: &IsoformRecord, reference: &HashMap<String, String>) -> Result<String> {
-    let chr_seq = reference
-        .get(&record.chr)
-        .ok_or_else(|| anyhow!("missing reference sequence for {}", record.chr))?;
-    let mut seq = String::with_capacity(record.isoform_len.max(0) as usize);
-    for &(start, end) in &record.exons {
-        if start < 1 || end < start || end as usize > chr_seq.len() {
-            bail!(
-                "invalid isoform exon coordinate {}:{}-{} for {}",
-                record.chr,
-                start,
-                end,
-                record.isoform_id
-            );
-        }
-        let fragment = &chr_seq[(start - 1) as usize..end as usize];
-        if record.strand == "-" {
-            seq.push_str(&reverse_complement(fragment));
-        } else {
-            seq.push_str(fragment);
-        }
-    }
-    Ok(seq)
-}
-
-/// Writes a compact development log for CIRI-AS sidecar runs.
-fn write_as_log(path: &str, state: &ScanState) -> Result<()> {
-    let mut writer = BufWriter::new(File::create(path)?);
-    writeln!(writer, "{} circRNAs are loaded.", state.circ_by_id.len())?;
-    writeln!(
-        writer,
-        "{} circular junction reads are loaded.",
-        state.stats.junction_reads_loaded
-    )?;
-    writeln!(
-        writer,
-        "{} circular junction reads were found from the alignment file.",
-        state.stats.junction_reads_seen
-    )?;
-    writeln!(
-        writer,
-        "{} candidate splice junctions are recognized, of which {} are from known BSJ reads.",
-        state.stats.known_candidates + state.stats.add_candidates,
-        state.stats.known_candidates
-    )?;
-    writeln!(
-        writer,
-        "{} candidate splice junctions have splicing signals.",
-        state.stats.motif_validated
-    )?;
-    writeln!(
-        writer,
-        "In sum, {} non-redundant splice junctions within circRNAs are detected.",
-        state.stats.final_splice_clusters
-    )?;
-    writeln!(
-        writer,
-        "{} cirexons are predicted from internal splice junctions and coverage.",
-        state.stats.final_cirexons
-    )?;
-    writeln!(
-        writer,
-        "{} full-length isoform paths are reconstructed from cirexon graph traversal.",
-        state.stats.final_isoforms
-    )?;
-    Ok(())
-}
-
 /// Converts validated read classes into `<prefix>.segments` rows.
 ///
 /// The current phase emits only BSJ reads and non-BSJ backward reads. The
@@ -6169,7 +4702,7 @@ fn collect_sidecar_junction_support_from_shards(
     correction: &SegmentCorrectionContext<'_>,
 ) -> Result<JunctionSupportMap> {
     let mut support = HashMap::new();
-    let pb = retained_segment_progress_bar(bsj_shards, non_bsj_shards, "collect junctions")?;
+    let pb = retained_segment_progress_bar(bsj_shards, non_bsj_shards, "")?;
     let pb_ref = pb.as_ref();
     for shard in bsj_shards {
         for_each_retained_segment_group(&shard.path, pb_ref, |group| {
@@ -6190,7 +4723,12 @@ fn collect_sidecar_junction_support_from_shards(
         })?;
     }
     if let Some(pb) = pb {
-        pb.finish_with_message("");
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")?
+                .progress_chars("#>-"),
+        );
+        pb.finish_with_message("Completed");
     }
     Ok(support)
 }
@@ -6205,7 +4743,7 @@ fn build_corrected_sidecar_records_from_shards(
     correction: &SegmentCorrectionContext<'_>,
 ) -> Result<Vec<SegmentRecord>> {
     let mut out = Vec::new();
-    let pb = retained_segment_progress_bar(bsj_shards, non_bsj_shards, "correct segments")?;
+    let pb = retained_segment_progress_bar(bsj_shards, non_bsj_shards, "")?;
     let pb_ref = pb.as_ref();
     for shard in bsj_shards {
         for_each_retained_segment_group(&shard.path, pb_ref, |group| {
@@ -6253,7 +4791,12 @@ fn build_corrected_sidecar_records_from_shards(
         })?;
     }
     if let Some(pb) = pb {
-        pb.finish_with_message("");
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}")?
+                .progress_chars("#>-"),
+        );
+        pb.finish_with_message("Completed");
     }
     Ok(out)
 }
@@ -7610,7 +6153,7 @@ fn materialize_chain(
         correction,
         token_strand,
     );
-    let (tokens, token_spans, cigar) = materialize_read_chain_output(
+    let (tokens, _token_spans, cigar) = materialize_read_chain_output(
         &output_blocks,
         token_strand,
         &boundary_gap_idxs,
@@ -7620,10 +6163,8 @@ fn materialize_chain(
 
     Some(MateChain {
         chrom,
-        order_strand,
         token_strand,
         blocks: output_blocks,
-        token_spans,
         tokens,
         cigar,
         is_bsj,
@@ -8076,46 +6617,6 @@ fn choose_hinted_splice_boundary(
         .min_by_key(|&(site2, site1)| (prev_end - site2).abs() + (next_start - site1).abs())
 }
 
-/// Chooses a nearby canonical splice signal when annotation gives no answer.
-fn choose_motif_splice_boundary(
-    reference: &HashMap<String, String>,
-    chrom: &str,
-    left: &SegmentBlock,
-    right: &SegmentBlock,
-    token_strand: char,
-) -> Option<(i32, i32)> {
-    let chr_seq = reference.get(chrom)?;
-    let mut best: Option<(i32, i32, i32, i32)> = None;
-    for end in left.ref_end - INTERNAL_SPLICE_CORRECTION_WINDOW
-        ..=left.ref_end + INTERNAL_SPLICE_CORRECTION_WINDOW
-    {
-        if end < left.ref_start || end >= right.ref_start {
-            continue;
-        }
-        for start in right.ref_start - INTERNAL_SPLICE_CORRECTION_WINDOW
-            ..=right.ref_start + INTERNAL_SPLICE_CORRECTION_WINDOW
-        {
-            if start > right.ref_end || end >= start {
-                continue;
-            }
-            let Some(score) = splice_motif_score(chr_seq, end, start, token_strand) else {
-                continue;
-            };
-            let movement = (end - left.ref_end).abs() + (start - right.ref_start).abs();
-            let key = (
-                score,
-                -movement,
-                -(end.abs_diff(left.ref_end) as i32),
-                -(start.abs_diff(right.ref_start) as i32),
-            );
-            if best.is_none_or(|current| key > current) {
-                best = Some((key.0, key.1, end, start));
-            }
-        }
-    }
-    best.map(|(_, _, end, start)| (end, start))
-}
-
 /// Scores the intronic dinucleotides implied by one genomic-order junction.
 fn splice_motif_score(chr_seq: &str, end: i32, start: i32, token_strand: char) -> Option<i32> {
     if start - end < 3 {
@@ -8325,19 +6826,6 @@ fn chain_text(chain: Option<&MateChain>) -> (String, String, usize) {
     )
 }
 
-/// Infers the RNA strand to write into `<prefix>.segments` for one read.
-///
-/// Validated splice candidates already carry the motif/annotation strand decision
-/// from `validate_splice_motifs`. If all candidates for the read agree, we emit
-/// that RNA strand; otherwise the read stays `unknown` so alignment strand does
-/// not get misreported as biological strand.
-fn infer_read_token_strand(read_id: &str, state: &ScanState) -> Option<char> {
-    build_read_strand_hints(state)
-        .get(read_id)
-        .copied()
-        .flatten()
-}
-
 /// Precomputes one RNA-strand hint per read ID from validated splice candidates.
 ///
 /// Re-scanning `state.candidates` for every backward read turns segments writing
@@ -8465,7 +6953,7 @@ fn build_major_isoforms_from_segments_file(
     out_prefix: &str,
     reference: &HashMap<String, String>,
     annotation: Option<&Annotation>,
-) -> Result<usize> {
+) -> Result<IsoformRunSummary> {
     let circ_by_id: HashMap<&str, usize> = circ_records
         .iter()
         .enumerate()
@@ -8628,9 +7116,21 @@ fn build_major_isoforms_from_segments_file(
             .then_with(|| a.circ_id.cmp(&b.circ_id))
     });
 
+    let total_isoforms = isoforms.len();
+    let circ_rnas = isoforms
+        .iter()
+        .map(|record| record.circ_id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
     write_major_isoform_gtf(&format!("{}.isoforms.gtf", out_prefix), &isoforms)?;
-    write_major_isoform_fasta(&format!("{}.isoforms.fa", out_prefix), &isoforms, reference)?;
-    Ok(isoforms.len())
+    let fasta_summary =
+        write_major_isoform_fasta(&format!("{}.isoforms.fa", out_prefix), &isoforms, reference)?;
+    Ok(IsoformRunSummary {
+        total_isoforms,
+        circ_rnas,
+        fasta_isoforms: fasta_summary.isoforms,
+        fasta_circ_rnas: fasta_summary.circ_rnas,
+    })
 }
 
 /// Borrowed view of one `<prefix>.segments` row used by the isoform stage.
@@ -10202,13 +8702,22 @@ fn gtf_escape(value: &str) -> String {
     value.replace('"', "\\\"")
 }
 
+/// Counts FASTA records emitted from the selected major isoforms.
+#[derive(Debug, Clone, Copy, Default)]
+struct MajorIsoformFastaSummary {
+    isoforms: usize,
+    circ_rnas: usize,
+}
+
 /// Writes reference-derived FASTA sequences for the selected major isoforms.
 fn write_major_isoform_fasta(
     path: &str,
     records: &[MajorIsoformRecord],
     reference: &HashMap<String, String>,
-) -> Result<()> {
+) -> Result<MajorIsoformFastaSummary> {
     let mut writer = BufWriter::new(File::create(path)?);
+    let mut summary = MajorIsoformFastaSummary::default();
+    let mut circ_ids = HashSet::new();
     for record in records {
         if !major_isoform_should_emit_fasta(record) {
             continue;
@@ -10234,9 +8743,12 @@ fn write_major_isoform_fasta(
             writer.write_all(chunk)?;
             writer.write_all(b"\n")?;
         }
+        summary.isoforms += 1;
+        circ_ids.insert(record.circ_id.as_str());
     }
     writer.flush()?;
-    Ok(())
+    summary.circ_rnas = circ_ids.len();
+    Ok(summary)
 }
 
 /// Returns whether a major isoform is reliable enough for sequence FASTA output.
@@ -10381,13 +8893,9 @@ mod tests {
             read_len,
             min_mapq: 10,
             candidates: Vec::new(),
-            coverage: HashMap::new(),
-            read_mappings: HashMap::new(),
-            seen_junction_reads: HashSet::new(),
             outward_read_ids: HashSet::new(),
             prebuilt_segment_records: Vec::new(),
             segment_groups: HashMap::new(),
-            stats: AsStats::default(),
         }
     }
 
@@ -10466,147 +8974,6 @@ mod tests {
     }
 
     #[test]
-    fn coverage_validation_accepts_supported_exon_body() {
-        let mut coverage = HashMap::new();
-        let mut chr_cov = HashMap::new();
-        for pos in 100..=119 {
-            chr_cov.insert(pos, 10);
-        }
-        coverage.insert("chr1".to_string(), chr_cov);
-        let reference = HashMap::new();
-        let state = ScanState {
-            circ_by_id: HashMap::new(),
-            junction_read_to_circ: HashMap::new(),
-            mate_bsj_evidence: HashMap::new(),
-            reference: &reference,
-            annotation: None,
-            circ_spans_by_chr: HashMap::new(),
-            clusters_by_chr: HashMap::new(),
-            read_len: 100,
-            min_mapq: 10,
-            candidates: Vec::new(),
-            coverage,
-            read_mappings: HashMap::new(),
-            seen_junction_reads: HashSet::new(),
-            outward_read_ids: HashSet::new(),
-            prebuilt_segment_records: Vec::new(),
-            segment_groups: HashMap::new(),
-            stats: AsStats::default(),
-        };
-        let junction_coverage = (100..=119).map(|pos| (pos, 1)).collect();
-
-        let result = exon_coverage_validation_single(
-            "chr1",
-            100,
-            119,
-            BoundarySupport::Count(2),
-            BoundarySupport::Count(2),
-            2,
-            2,
-            0,
-            0,
-            &junction_coverage,
-            &state,
-        );
-
-        assert_eq!(result.code, 1);
-        assert_eq!(result.median, 10);
-    }
-
-    #[test]
-    fn negative_strand_cirexon_ids_are_reverse_ordered() {
-        let mut records = vec![
-            test_cirexon_record(100, 120),
-            test_cirexon_record(200, 220),
-            test_cirexon_record(300, 320),
-        ];
-        let mut out = Vec::new();
-
-        append_ordered_cirexons(&mut out, &mut records, "-");
-
-        assert_eq!(out[0].start, 300);
-        assert_eq!(out[0].cirexon_id, "cirexon1");
-        assert_eq!(out[2].start, 100);
-        assert_eq!(out[2].cirexon_id, "cirexon3");
-    }
-
-    #[test]
-    fn isoform_graph_reconstructs_anchored_path() {
-        let circ = CircRecord {
-            id: "chr1:100|320".to_string(),
-            chr: "chr1".to_string(),
-            start: 100,
-            end: 320,
-            junction_reads: Vec::new(),
-            junction_read_count: "12".to_string(),
-            pcc: "1_1_1".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1.00".to_string(),
-            circ_type: "exon".to_string(),
-            gene_id: "GENE1".to_string(),
-            strand: "+".to_string(),
-        };
-        let mut splice_links = HashMap::new();
-        splice_links.insert((120, 200), 3);
-        splice_links.insert((220, 300), 4);
-        let context = CirexonContext {
-            supporting_start: BTreeMap::new(),
-            supporting_end: BTreeMap::new(),
-            splice_read_start: HashMap::new(),
-            splice_read_end: HashMap::new(),
-            splice_links,
-            splice_across_count: HashMap::new(),
-        };
-        let mut exons = vec![
-            test_cirexon_record(100, 120),
-            test_cirexon_record(200, 220),
-            test_cirexon_record(300, 320),
-        ];
-        for exon in &mut exons {
-            exon.strand = "+".to_string();
-        }
-
-        let isoforms = build_full_length_isoforms(&circ, "+", &exons, &context, None);
-
-        assert_eq!(isoforms.len(), 1);
-        assert_eq!(isoforms[0].exon_chain(), "100:120!+,200:220!+,300:320!+");
-        assert_eq!(isoforms[0].junction_chain(), "120:200,220:300");
-        assert_eq!(isoforms[0].internal_split_reads, 7);
-    }
-
-    #[test]
-    fn negative_isoform_sequence_uses_transcript_order() {
-        let mut reference = HashMap::new();
-        reference.insert("chr1".to_string(), "AACCGG".to_string());
-        let record = IsoformRecord {
-            circ_id: "chr1:1|6".to_string(),
-            isoform_id: "iso1".to_string(),
-            chr: "chr1".to_string(),
-            start: 1,
-            end: 6,
-            strand: "-".to_string(),
-            path_tier: "anchored".to_string(),
-            bsj_supported: "yes".to_string(),
-            gene_id: "GENE1".to_string(),
-            exons: vec![(5, 6), (1, 2)],
-            junctions: vec![(2, 5)],
-            isoform_len: 4,
-            bsj_seed_reads: 1,
-            internal_split_reads: 1,
-            boundary_clip_reads: 0,
-            anomalous_pair_reads: 0,
-            annotation_supported_junctions: 0,
-            de_novo_supported_junctions: 1,
-            score: 1,
-            rank: 1,
-        };
-
-        let seq = isoform_sequence(&record, &reference).unwrap();
-
-        assert_eq!(seq, "CCTT");
-    }
-
-    #[test]
     fn reverse_alignment_blocks_are_flipped_into_read_order() {
         let record = AsAlignment {
             flag: 0x10,
@@ -10652,36 +9019,8 @@ mod tests {
                 xa_alternatives: Vec::new(),
             },
         ];
-        let reference = HashMap::new();
-        let state = ScanState {
-            circ_by_id: HashMap::new(),
-            junction_read_to_circ: HashMap::new(),
-            mate_bsj_evidence: HashMap::new(),
-            reference: &reference,
-            annotation: None,
-            circ_spans_by_chr: HashMap::new(),
-            clusters_by_chr: HashMap::new(),
-            read_len: 100,
-            min_mapq: 10,
-            candidates: Vec::new(),
-            coverage: HashMap::new(),
-            read_mappings: HashMap::new(),
-            seen_junction_reads: HashSet::new(),
-            outward_read_ids: HashSet::new(),
-            prebuilt_segment_records: Vec::new(),
-            segment_groups: HashMap::new(),
-            stats: AsStats::default(),
-        };
-
-        let record = build_backward_segment_record(
-            "read1",
-            &records,
-            infer_read_token_strand("read1", &state),
-            &[],
-            None,
-            100,
-        )
-        .unwrap();
+        let record =
+            build_backward_segment_record("read1", &records, None, &[], None, 100).unwrap();
 
         assert_eq!(record.type_name, "backward");
         assert_eq!(record.circ_id, "NA");
@@ -10744,13 +9083,9 @@ mod tests {
             read_len: 100,
             min_mapq: 10,
             candidates: Vec::new(),
-            coverage: HashMap::new(),
-            read_mappings: HashMap::new(),
-            seen_junction_reads: HashSet::new(),
             outward_read_ids: HashSet::new(),
             prebuilt_segment_records: Vec::new(),
             segment_groups: HashMap::new(),
-            stats: AsStats::default(),
         };
 
         assert!(is_outward_pair_group(&records, &state));
@@ -10885,13 +9220,9 @@ mod tests {
             read_len: 100,
             min_mapq: 10,
             candidates: Vec::new(),
-            coverage: HashMap::new(),
-            read_mappings: HashMap::new(),
-            seen_junction_reads: HashSet::new(),
             outward_read_ids: HashSet::new(),
             prebuilt_segment_records: Vec::new(),
             segment_groups: HashMap::new(),
-            stats: AsStats::default(),
         };
 
         assert!(!is_outward_pair_group(&records, &state));
@@ -11267,23 +9598,14 @@ mod tests {
             chr: "chrT".to_string(),
             start: 100,
             end: 300,
-            junction_reads: vec![
-                "read1".to_string(),
-                "read2".to_string(),
-                "read3".to_string(),
-            ],
             junction_read_count: "3".to_string(),
-            pcc: "NA".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1".to_string(),
-            circ_type: "exon".to_string(),
             gene_id: "geneT".to_string(),
             strand: "+".to_string(),
         };
         let mut reference = HashMap::new();
         reference.insert("chrT".to_string(), "ACGT".repeat(100));
 
-        let count = build_major_isoforms_from_segments_file(
+        let summary = build_major_isoforms_from_segments_file(
             &[circ],
             segments_path.to_str().unwrap(),
             &out_prefix,
@@ -11292,7 +9614,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(count, 1);
+        assert_eq!(summary.total_isoforms, 1);
+        assert_eq!(summary.circ_rnas, 1);
+        assert_eq!(summary.fasta_isoforms, 1);
+        assert_eq!(summary.fasta_circ_rnas, 1);
         let gtf = std::fs::read_to_string(format!("{}.isoforms.gtf", out_prefix)).unwrap();
         assert!(gtf.contains("\texon\t100\t150\t"));
         assert!(gtf.contains("\texon\t200\t300\t"));
@@ -11360,12 +9685,7 @@ mod tests {
             chr: "chrT".to_string(),
             start: 100,
             end: 1000,
-            junction_reads: Vec::new(),
             junction_read_count: "1".to_string(),
-            pcc: "NA".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1".to_string(),
-            circ_type: "exon".to_string(),
             gene_id: "geneT".to_string(),
             strand: "+".to_string(),
         }];
@@ -11434,12 +9754,7 @@ mod tests {
             chr: "chrT".to_string(),
             start: 100,
             end: 20500,
-            junction_reads: Vec::new(),
             junction_read_count: "3".to_string(),
-            pcc: "NA".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1".to_string(),
-            circ_type: "exon".to_string(),
             gene_id: "geneT".to_string(),
             strand: "+".to_string(),
         };
@@ -11496,12 +9811,7 @@ mod tests {
             chr: "chrT".to_string(),
             start: 120,
             end: 420,
-            junction_reads: Vec::new(),
             junction_read_count: "3".to_string(),
-            pcc: "NA".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1".to_string(),
-            circ_type: "exon".to_string(),
             gene_id: "geneT".to_string(),
             strand: "+".to_string(),
         };
@@ -11531,12 +9841,7 @@ mod tests {
             chr: "chrT".to_string(),
             start: 100,
             end: 1534,
-            junction_reads: Vec::new(),
             junction_read_count: "2".to_string(),
-            pcc: "NA".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1".to_string(),
-            circ_type: "exon".to_string(),
             gene_id: "geneT".to_string(),
             strand: "+".to_string(),
         };
@@ -11901,12 +10206,7 @@ mod tests {
             chr: "chrT".to_string(),
             start: 100,
             end: 500,
-            junction_reads: Vec::new(),
             junction_read_count: "1".to_string(),
-            pcc: "NA".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1".to_string(),
-            circ_type: "exon".to_string(),
             gene_id: "geneT".to_string(),
             strand: "+".to_string(),
         };
@@ -11942,12 +10242,7 @@ mod tests {
             chr: "chr18".to_string(),
             start: 29234877,
             end: 29255341,
-            junction_reads: Vec::new(),
             junction_read_count: "1".to_string(),
-            pcc: "NA".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1".to_string(),
-            circ_type: "exon".to_string(),
             gene_id: "NA".to_string(),
             strand: "-".to_string(),
         };
@@ -12013,19 +10308,14 @@ mod tests {
             chr: "chrT".to_string(),
             start: 100,
             end: 300,
-            junction_reads: vec!["read1".to_string()],
             junction_read_count: "1".to_string(),
-            pcc: "NA".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1".to_string(),
-            circ_type: "exon".to_string(),
             gene_id: "NA".to_string(),
             strand: "-".to_string(),
         };
         let mut reference = HashMap::new();
         reference.insert("chrT".to_string(), "ACGT".repeat(100));
 
-        let count = build_major_isoforms_from_segments_file(
+        let summary = build_major_isoforms_from_segments_file(
             &[circ],
             segments_path.to_str().unwrap(),
             &out_prefix,
@@ -12034,7 +10324,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(count, 1);
+        assert_eq!(summary.total_isoforms, 1);
+        assert_eq!(summary.circ_rnas, 1);
         let gtf = std::fs::read_to_string(format!("{}.isoforms.gtf", out_prefix)).unwrap();
         assert!(gtf.contains("\texon\t100\t170\t"));
         assert!(gtf.contains("\texon\t240\t300\t"));
@@ -12095,13 +10386,9 @@ mod tests {
             read_len: 150,
             min_mapq: 10,
             candidates: Vec::new(),
-            coverage: HashMap::new(),
-            read_mappings: HashMap::new(),
-            seen_junction_reads: HashSet::new(),
             outward_read_ids: HashSet::new(),
             prebuilt_segment_records: Vec::new(),
             segment_groups: HashMap::new(),
-            stats: AsStats::default(),
         };
 
         let enriched = add_non_bsj_local_clip_alignments(&records, &state);
@@ -12672,12 +10959,7 @@ mod tests {
             chr: "chr1".to_string(),
             start: 100,
             end: 199,
-            junction_reads: vec!["read1".to_string()],
             junction_read_count: "1".to_string(),
-            pcc: "1_0_0".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1.00".to_string(),
-            circ_type: "exon".to_string(),
             gene_id: "GENE1".to_string(),
             strand: "+".to_string(),
         };
@@ -12721,12 +11003,7 @@ mod tests {
             chr: "chr1".to_string(),
             start: 100,
             end: 349,
-            junction_reads: vec!["read1".to_string()],
             junction_read_count: "1".to_string(),
-            pcc: "1_0_0".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1.00".to_string(),
-            circ_type: "exon".to_string(),
             gene_id: "GENE1".to_string(),
             strand: "+".to_string(),
         };
@@ -12782,12 +11059,7 @@ mod tests {
             chr: "chr1".to_string(),
             start: 100,
             end: 349,
-            junction_reads: vec!["read1".to_string()],
             junction_read_count: "1".to_string(),
-            pcc: "1_0_0".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1.00".to_string(),
-            circ_type: "exon".to_string(),
             gene_id: "GENE1".to_string(),
             strand: "-".to_string(),
         };
@@ -12843,12 +11115,7 @@ mod tests {
             chr: "chr1".to_string(),
             start: 100,
             end: 199,
-            junction_reads: vec!["read1".to_string()],
             junction_read_count: "1".to_string(),
-            pcc: "1_0_0".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1.00".to_string(),
-            circ_type: "exon".to_string(),
             gene_id: "GENE1".to_string(),
             strand: "+".to_string(),
         };
@@ -12910,12 +11177,7 @@ mod tests {
             chr: "chr1".to_string(),
             start: 100,
             end: 199,
-            junction_reads: vec![],
             junction_read_count: "1".to_string(),
-            pcc: "1_0_0".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1.00".to_string(),
-            circ_type: "exon".to_string(),
             gene_id: "GENE1".to_string(),
             strand: "+".to_string(),
         };
@@ -13256,12 +11518,7 @@ mod tests {
             chr: "chr1".to_string(),
             start: 100,
             end: 349,
-            junction_reads: vec!["read1".to_string()],
             junction_read_count: "1".to_string(),
-            pcc: "1_0_0".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1.00".to_string(),
-            circ_type: "exon".to_string(),
             gene_id: "GENE1".to_string(),
             strand: "+".to_string(),
         };
@@ -13383,28 +11640,5 @@ mod tests {
             vec!["100-149:+".to_string(), "201-250:+".to_string()]
         );
         assert_eq!(chain.cigar, "50M51N50M");
-    }
-
-    fn test_cirexon_record(start: i32, end: i32) -> CirexonRecord {
-        CirexonRecord {
-            circ_id: "chr1:100|320".to_string(),
-            chr: "chr1".to_string(),
-            circ_start: 100,
-            circ_end: 320,
-            strand: "-".to_string(),
-            junction_read_count: "1".to_string(),
-            pcc: "1_0_0".to_string(),
-            non_junction_reads: "0".to_string(),
-            junction_reads_ratio: "1.00".to_string(),
-            circ_type: "exon".to_string(),
-            gene_id: "GENE1".to_string(),
-            cirexon_id: String::new(),
-            start,
-            end,
-            start_support: "1".to_string(),
-            end_support: "1".to_string(),
-            coverage_median: 10,
-            is_icf: false,
-        }
     }
 }

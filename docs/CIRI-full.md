@@ -1,6 +1,8 @@
-# CIRI-full 功能拆解与 Rust 接入计划
+# CIRI-full 功能拆解与历史参考
 
-本文档记录 `vendor/CIRI-full` Java 模块的功能边界、数据契约和算法阶段。当前 CIRI-toolkit 不计划完整复刻 CIRI-full 的全部输出；该文档主要用于提取 RO（Reverse Overlap）识别、RO read remap 和 full-length structure reconstruction 的可用思路。
+本文档记录 `vendor/CIRI-full` Java 模块的功能边界、数据契约和算法阶段。当前 CIRI-toolkit 已经实现基于 `<prefix>.segments` 的 major isoform 重构，后续活跃路线是 multi-isoform usage 和 multi-sample integration；不再沿 CIRI-full RO remap / Merge pipeline 继续开发，也不计划完整复刻 Java 历史输出。
+
+本文件仅作为历史参考和风险清单保留。若将来重新评估 RO side evidence，应先作为独立 sidecar 设计验证，不能反向改变 CIRI3 parity 主流程。
 
 ## 1. 定位
 
@@ -9,7 +11,7 @@ CIRI-full 的目标不是重新识别 BSJ，而是在已有 circRNA 候选基础
 - CIRI-AS：提供 circRNA 内部 cirexon、junction read mapping 和可变剪接候选。
 - RO reads：从 paired-end RNA-seq 中识别 5' reverse overlap，将 read pair 合并成长单端 read，再通过 BWA-MEM 比对和 splice motif 检查推断全长或部分 circRNA 结构。
 
-推荐的 Rust pipeline 边界为：
+历史 CIRI-full pipeline 边界为：
 
 ```text
 Scan1 -> Scan2 -> Summary -> CIRI-AS -> CIRI-full
@@ -24,16 +26,19 @@ Scan1 -> Scan2 -> Summary -> CIRI-AS -> CIRI-full
 - `RO1/RO2` 是 CIRI-full 自己的 RO read 识别与验证路径。
 - `Merge` 只整合结构信息，不应反向改变主 `.ciri/.out` 的 circRNA 判定。
 
-后续实现时应把 CIRI-full 设计成可选后处理阶段，默认不改变当前稳定的 CIRI3 主流程输出。
+当前不再把该 pipeline 作为 CIRI-toolkit 的实现路线。CIRI-toolkit 的当前边界是：
 
-当前新的实现口径为：
+```text
+Scan1 -> Scan2 -> Summary -> segments -> major isoform -> future usage/multi-sample
+```
+
+当前实现口径为：
 
 - 不要求 CIRI-full 与 Java 模块 100% parity。
 - 不复刻历史 `Merge` detail annotation、旧 header、未验证的 RO-only 聚类输出和辅助 FASTA 提取功能。
-- 优先复用 CIRI-full RO1 思路，在 CIRI-toolkit `Scan1` 中识别 read pair RO，并输出 `<prefix>.ro.fq` / `<prefix>.ro.tsv`。
-- `.ro.fq` 阶段只标注 sequence-level 类型：`5p_ro`、`3p_ro`、`bidirectional_ro`、`full_length_candidate`。
-- CIRI-full Java 中的 `Full/Part` 属于 RO remap 后的结构判定，不能在 Scan1 RO detector 阶段直接输出。
-- 后续 RO remap / RO Scan1 / RO Scan2 的设计以 `docs/05-ro-feature-plan.md` 为准。
+- 不再优先实现 RO1/RO2 或 CIRI-full Merge。
+- 仍可保留 RO1、RO2、Merge 章节作为术语和风险参考：例如 sequence-level RO overlap 不能直接等价于 full-length structure evidence。
+- 后续 multi-isoform usage / multi-sample integration 的活跃设计以 `docs/07-full-length-reconstruction.md` 为准。
 
 ## 2. 上游 Java 模块概览
 
@@ -711,7 +716,7 @@ RO1 是最适合先落地的子模块，因为不依赖 CIRI-AS 或 CIRI 主流�
 
 ## 12. 测试建议
 
-建议新增测试分层：
+以下测试分层是历史 CIRI-full parity 路线的建议，当前不作为活跃实现任务：
 
 - `full_ro1_overlap_unit`：覆盖 perfect overlap、1 mismatch、N、min overlap、first-hit。
 - `full_cigar_sam5_unit`：覆盖 `S/H/M/I/D/N/=/X` 在 Java 兼容分类下的结果。
@@ -729,18 +734,21 @@ RO1 是最适合先落地的子模块，因为不依赖 CIRI-AS 或 CIRI 主流�
 
 ## 13. 与现有 CIRI-toolkit 的关系
 
-当前 Rust CIRI3 主流程已经达到小数据基线 100% 对齐。CIRI-full 接入时应遵守：
+当前 Rust CIRI3 主流程已经达到 parity，且 CIRI-toolkit 已经通过 `<prefix>.segments` 实现 major isoform 输出。CIRI-full 不再作为下一阶段接入路线。若未来重新评估本文件中的 RO side evidence，应遵守：
 
-- 默认不开启 CIRI-full。
+- 默认不开启 CIRI-full/RO remap。
 - 不修改 Scan1/Scan2/Summary 判定逻辑。
-- CIRI-AS 的 `_jav.list` 兼容输出是 CIRI-full Merge 的前置依赖。
-- RO1/RO2 可先作为独立模块开发，不阻塞 CIRI-AS。
-- Merge 必须等 CIRI-AS 输出契约稳定后再做最终对齐。
+- 不要求 CIRI-AS `_jav.list` 或 CIRI-full Merge 兼容输出。
+- RO1/RO2 只能作为 sidecar evidence 重新设计，不能作为主流程前置依赖。
+- 当前优先级仍是 multi-isoform usage 与 multi-sample integration，见 `docs/07-full-length-reconstruction.md`。
 
-建议优先顺序：
+历史建议优先顺序如下，当前已归档：
 
 ```text
 RO1 -> RO2 -> CIRI-AS _jav.list writer -> Merge -> full pipeline orchestration
 ```
 
 这样可以把 CIRI-full 中最独立、最容易建立 golden 的 RO 路径先做出来，再整合 CIRI-AS 和主流程。
+
+---
+最后更新：2026-05-19

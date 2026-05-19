@@ -17,7 +17,9 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::annotation::Annotation;
-use crate::ciri_as::{rebuild_major_isoforms_from_segments, run_ciri_as, AsConfig};
+use crate::ciri_as::{
+    rebuild_major_isoforms_from_segments, run_ciri_as, AsConfig, IsoformRunSummary,
+};
 use crate::fasta::FastaReader;
 use crate::runtime::init_runtime;
 use crate::sam_bam::{check_bam_sorting, detect_format, InputFormat};
@@ -35,12 +37,6 @@ const IGV_BSJ_COLOR: &str = "220,53,69";
 const IGV_BACKWARD_COLOR: &str = "25,118,210";
 const IGV_OUTWARD_COLOR: &str = "245,124,0";
 
-#[derive(Debug, Clone, Copy)]
-struct IgvSegmentsBamStats {
-    segment_rows: usize,
-    segment_bam_written: bool,
-}
-
 /// Parsed command-line arguments for the end-to-end pipeline.
 ///
 /// Defaults are kept aligned with CIRI3 unless there is explicit evidence that a
@@ -49,6 +45,7 @@ struct IgvSegmentsBamStats {
 #[command(
     author,
     version,
+    disable_version_flag = true,
     about = "Run the CIRI Rust analysis pipeline",
     long_about = None
 )]
@@ -74,16 +71,20 @@ struct Args {
     #[arg(short = 'm', long = "mapq", default_value_t = 10)]
     min_mapq: i32,
 
-    /// Stringency level (0, 1, 2), Java default is 2
-    #[arg(short = 's', long = "stringency", default_value_t = 2)]
+    /// Stringency level (0, 1, 2). CIRI-rs defaults to 0 to retain candidate
+    /// circRNAs for downstream segment/isoform filtering; Java CIRI3 defaults
+    /// to 2.
+    #[arg(short = 's', long = "stringency", default_value_t = 0)]
     stringency: i32,
 
     /// Max spanning distance of circRNAs (Java -Max, default 200000)
     #[arg(long = "max-span", default_value_t = 200000)]
     max_span: i32,
 
-    /// Min spanning distance of circRNAs (Java -Min, default 140)
-    #[arg(long = "min-span", default_value_t = 140)]
+    /// Min spanning distance of circRNAs. CIRI-rs defaults to 50 to retain
+    /// short candidate circRNAs for downstream filtering; Java CIRI3 defaults
+    /// to 140.
+    #[arg(long = "min-span", default_value_t = 50)]
     min_span: i32,
 
     /// Linear competition search range size (Java internal default 50000)
@@ -112,15 +113,21 @@ struct Args {
     #[arg(long = "perf", default_value_t = false)]
     perf: bool,
 
-    /// Resume from the latest completed merged checkpoint.
+    /// Resume from the completed merged segments checkpoint.
     ///
     /// The resume logic intentionally ignores shard-local `.part_*.tmp` files.
-    /// If `<prefix>.segments` exists, only isoforms are rebuilt. Otherwise, if
-    /// `<prefix>.out` and `<prefix>.bsj` exist, segments and isoforms are rebuilt
-    /// from the input BAM/SAM. All normal required inputs still must be provided
-    /// so `--continue` stays an execution-mode switch, not a separate CLI shape.
+    /// If `<prefix>.segments` exists, only isoforms are rebuilt from
+    /// `<prefix>.out + <prefix>.segments`. Earlier merged outputs such as
+    /// `<prefix>.out + <prefix>.bsj` are intentionally not resumable because
+    /// rebuilding segments still requires a full BAM/SAM rescan. All normal
+    /// required inputs still must be provided so `--continue` stays an
+    /// execution-mode switch, not a separate CLI shape.
     #[arg(long = "continue", default_value_t = false)]
     continue_run: bool,
+
+    /// Print version.
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::SetTrue)]
+    _version: bool,
 }
 
 /// Emits one aligned, timestamped progress line.
@@ -183,20 +190,11 @@ fn write_display_bsj(final_bsj: &str, bsj1_path: &str, bsj2_path: &str) -> Resul
     Ok(())
 }
 
-/// Writes the `.out`-scoped BEDPE track and records the sidecar in the run log.
-fn write_and_log_bsj_bedpe(
-    log_writer: &mut BufWriter<File>,
-    out_prefix: &str,
-    result_output: &str,
-) -> Result<()> {
+/// Writes the `.out`-scoped BEDPE track and returns its output path and row count.
+fn write_bsj_bedpe(out_prefix: &str, result_output: &str) -> Result<(String, usize)> {
     let bedpe_path = format!("{}.bedpe", out_prefix);
     let rows = write_bsj_bedpe_from_out(result_output, &bedpe_path)?;
-    log_info(
-        log_writer,
-        "BSJ BEDPE output",
-        &format!("{} ({} BSJs)", bedpe_path, rows),
-    )?;
-    Ok(())
+    Ok((bedpe_path, rows))
 }
 
 /// Converts Summary-confirmed circRNA sites into a BEDPE BSJ arc track.
@@ -262,23 +260,24 @@ fn write_and_log_segments_bam(
     threads: usize,
 ) -> Result<()> {
     let bam_path = format!("{}.segments.bam", out_prefix);
-    let stats = write_segments_review_tracks_from_segments(
+    write_segments_review_tracks_from_segments(
         segments_output,
         &bam_path,
         out_prefix,
         reference_lengths,
         threads,
     )?;
-    let message = if stats.segment_bam_written {
-        format!("{} ({} segment rows) + .bai", bam_path, stats.segment_rows)
-    } else {
-        format!(
-            "{} skipped (samtools not found; {} segment rows parsed)",
-            bam_path, stats.segment_rows
-        )
-    };
-    log_info(log_writer, "Segments BAM output", &message)?;
+    let message = format!("{}", bam_path);
+    log_info(log_writer, "Output segments BAM", &message)?;
     Ok(())
+}
+
+/// Formats the isoform stage summary for the CLI run log.
+fn format_isoform_summary(summary: IsoformRunSummary) -> String {
+    format!(
+        "Assembled {} high-confidence isoforms from {} circRNAs",
+        summary.fasta_isoforms, summary.fasta_circ_rnas,
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -320,7 +319,7 @@ fn write_segments_review_tracks_from_segments(
     out_prefix: &str,
     reference_lengths: &HashMap<String, usize>,
     threads: usize,
-) -> Result<IgvSegmentsBamStats> {
+) -> Result<()> {
     let file = File::open(segments_path)?;
     let mut lines = BufReader::new(file).lines();
     let header = lines
@@ -361,18 +360,8 @@ fn write_segments_review_tracks_from_segments(
         }
     }
     rows.sort_by(compare_igv_segment_rows);
-    let row_count = rows.len();
-    let segment_bam_written = write_segments_bam_from_sorted_rows(
-        &rows,
-        bam_path,
-        out_prefix,
-        reference_lengths,
-        threads,
-    )?;
-    Ok(IgvSegmentsBamStats {
-        segment_rows: row_count,
-        segment_bam_written,
-    })
+    write_segments_bam_from_sorted_rows(&rows, bam_path, out_prefix, reference_lengths, threads)?;
+    Ok(())
 }
 
 /// Resolves the public `<prefix>.segments` columns needed by IGV export.
@@ -623,8 +612,9 @@ fn igv_segment_mapq(type_name: &str) -> u8 {
 
 /// Writes a coordinate-sorted synthetic BAM and BAI from already sorted rows.
 ///
-/// This uses `samtools` when available because the repo does not yet own a
-/// native BAI writer. The SAM temp is deleted after successful conversion so the
+/// This intentionally requires `samtools` because the repo does not yet own a
+/// native BAI writer and `.segments.bam/.bai` is part of the normal review
+/// output contract. The SAM temp is deleted after successful conversion so the
 /// indexed BAM is the durable high-performance IGV artifact.
 fn write_segments_bam_from_sorted_rows(
     rows: &[IgvSegmentRow],
@@ -632,10 +622,8 @@ fn write_segments_bam_from_sorted_rows(
     out_prefix: &str,
     reference_lengths: &HashMap<String, usize>,
     threads: usize,
-) -> Result<bool> {
-    let Some(samtools) = find_samtools() else {
-        return Ok(false);
-    };
+) -> Result<()> {
+    let samtools = require_samtools()?;
     let sam_path = format!("{}.segments.sam.tmp", out_prefix);
     write_segments_sam_from_sorted_rows(rows, &sam_path, reference_lengths)?;
     let view_threads = threads.max(1).to_string();
@@ -661,7 +649,7 @@ fn write_segments_bam_from_sorted_rows(
         bail!("samtools index failed while creating {}.bai", bam_path);
     }
     let _ = fs::remove_file(&sam_path);
-    Ok(true)
+    Ok(())
 }
 
 /// Writes sorted SAM records used as the conversion source for the review BAM.
@@ -721,7 +709,7 @@ fn igv_bam_reference_lengths(
     entries
 }
 
-/// Finds a `samtools` executable for optional BAM/BAI review-track generation.
+/// Finds the `samtools` executable used for BAM/BAI review-track generation.
 fn find_samtools() -> Option<String> {
     if let Ok(path) = env::var("SAMTOOLS") {
         if samtools_is_usable(&path) {
@@ -732,6 +720,19 @@ fn find_samtools() -> Option<String> {
         return Some("samtools".to_string());
     }
     None
+}
+
+/// Requires `samtools` before the pipeline starts touching large input files.
+///
+/// CIRI-toolkit writes `<prefix>.segments.bam/.bai` as a standard IGV review
+/// sidecar. Failing early avoids spending minutes or hours on Scan1/Scan2 only
+/// to discover that the final indexed review artifact cannot be produced.
+fn require_samtools() -> Result<String> {
+    find_samtools().ok_or_else(|| {
+        anyhow::anyhow!(
+            "`samtools` is not installed. Please install samtools in PATH or set SAMTOOLS=/path/to/samtools"
+        )
+    })
 }
 
 /// Checks whether a candidate `samtools` command can be executed.
@@ -785,7 +786,15 @@ fn igv_segment_color(type_name: &str) -> &'static str {
 /// full-length reconstruction.
 pub fn main() -> Result<()> {
     let run_started = Instant::now();
+    if env::args()
+        .skip(1)
+        .any(|arg| arg == "-v" || arg == "--version")
+    {
+        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let args = Args::parse();
+    let _ = require_samtools()?;
     let mem_limit = parse_mem_str(&args.mem_per_thread);
     let result_output = result_path_for_output(&args.out_prefix);
     let log_output = log_path_for_output(&args.out_prefix);
@@ -863,11 +872,10 @@ pub fn main() -> Result<()> {
             }
             log_info(
                 &mut log_writer,
-                "Continue",
-                "Resuming from completed .segments; rebuilding isoforms only...",
+                "Resume from checkpoint",
+                "Start building circRNA isoforms...",
             )?;
-            write_and_log_bsj_bedpe(&mut log_writer, &args.out_prefix, &result_output)?;
-            let major_isoforms = rebuild_major_isoforms_from_segments(
+            let isoform_summary = rebuild_major_isoforms_from_segments(
                 &result_output,
                 &segments_output,
                 &args.out_prefix,
@@ -885,76 +893,7 @@ pub fn main() -> Result<()> {
             log_info(
                 &mut log_writer,
                 "Isoforms summary",
-                &format!("{} major isoforms", major_isoforms),
-            )?;
-            write_and_log_segments_bam(
-                &mut log_writer,
-                &segments_output,
-                &args.out_prefix,
-                &fasta.chr_len_map,
-                args.threads,
-            )?;
-            log_info(
-                &mut log_writer,
-                "Total runtime",
-                &format!("{:.2} seconds", run_started.elapsed().as_secs_f64()),
-            )?;
-            return Ok(());
-        }
-
-        if Path::new(&result_output).is_file() && Path::new(&bsj_output).is_file() {
-            log_info(
-                &mut log_writer,
-                "Continue",
-                "Resuming from completed .out/.bsj; rebuilding segments and isoforms...",
-            )?;
-            write_and_log_bsj_bedpe(&mut log_writer, &args.out_prefix, &result_output)?;
-            let mut segment_progress_log =
-                |label: &str, message: &str| log_info(&mut log_writer, label, message);
-            let segment_summary = run_ciri_as(AsConfig {
-                input_path,
-                circ_path: &result_output,
-                bsj_path: Some(&bsj_output),
-                segment_evidence_paths: Vec::new(),
-                non_bsj_segment_evidence_paths: Vec::new(),
-                out_prefix: &args.out_prefix,
-                keep_temp_files: args.debug,
-                reference: &fasta.chr_tcga_map,
-                annotation: args.gtf.as_ref().map(|_| &annotation),
-                min_mapq: args.min_mapq,
-                progress_log: Some(&mut segment_progress_log),
-            })?;
-            log_info(&mut log_writer, "Segments output", &segments_output)?;
-            log_info(
-                &mut log_writer,
-                "Segments summary",
-                &format!(
-                    "{} rows ({} BSJ, {} backward, {} outward)",
-                    segment_summary.total_segments,
-                    segment_summary.bsj_segments,
-                    segment_summary.backward_segments,
-                    segment_summary.outward_segments
-                ),
-            )?;
-            log_info(
-                &mut log_writer,
-                "Isoforms output",
-                &format!(
-                    "{}.isoforms.gtf, {}.isoforms.fa",
-                    args.out_prefix, args.out_prefix
-                ),
-            )?;
-            log_info(
-                &mut log_writer,
-                "Isoforms summary",
-                &format!("{} major isoforms", segment_summary.major_isoforms),
-            )?;
-            write_and_log_segments_bam(
-                &mut log_writer,
-                &segments_output,
-                &args.out_prefix,
-                &fasta.chr_len_map,
-                args.threads,
+                &format_isoform_summary(isoform_summary),
             )?;
             log_info(
                 &mut log_writer,
@@ -965,10 +904,8 @@ pub fn main() -> Result<()> {
         }
 
         bail!(
-            "--continue did not find a resumable checkpoint: expected {} or both {} and {}",
-            segments_output,
-            result_output,
-            bsj_output
+            "--continue did not find a resumable checkpoint: expected completed {}",
+            segments_output
         );
     }
 
@@ -977,8 +914,13 @@ pub fn main() -> Result<()> {
     // 3. Scan 1
     log_info(
         &mut log_writer,
+        "=== STAGE 1/3 ===",
+        "Back-splicing junction identification...",
+    )?;
+    log_info(
+        &mut log_writer,
         "Running scan 1",
-        "Identifying back-spliced junctions...",
+        "Identifying BSJ sites...",
     )?;
     let mut scan1 = Scan1::new(
         args.min_mapq,
@@ -1054,9 +996,12 @@ pub fn main() -> Result<()> {
         &fasta.chr_tcga_map,
         &annotation,
     )?;
+    scan2.release_working_set();
+    write_display_bsj(&bsj_output, &bsj1_output, &bsj2_output)?;
+
     log_info(
         &mut log_writer,
-        "Final summary",
+        "BSJ summary",
         &format!(
             // This count comes from Summary's retained circ/read assignments,
             // not from `Scan1 + Scan2` raw BSJ accumulation. Keeping the final
@@ -1066,21 +1011,23 @@ pub fn main() -> Result<()> {
             summary.circ_count, summary.final_bsj_reads
         ),
     )?;
-    scan2.release_working_set();
-
+    log_info(&mut log_writer, "Output BSJ file", &result_output)?;
+    let (bedpe_path, _bedpe_rows) = write_bsj_bedpe(&args.out_prefix, &result_output)?;
     log_info(
         &mut log_writer,
-        "Formatting BSJ",
-        "Sorting mate-level BSJ display...",
+        "Output BEDPE file",
+        &format!("{}", bedpe_path),
     )?;
-    write_display_bsj(&bsj_output, &bsj1_output, &bsj2_output)?;
 
-    log_info(&mut log_writer, "Output file", &result_output)?;
-    write_and_log_bsj_bedpe(&mut log_writer, &args.out_prefix, &result_output)?;
     log_info(
         &mut log_writer,
-        "Running segments",
-        "Reconstructing circRNA read-level segments...",
+        "=== STAGE 2/3 ===",
+        "Internal splice junction identification...",
+    )?;
+    log_info(
+        &mut log_writer,
+        "Processing segments",
+        "Generating read-level junction paths...",
     )?;
     let mut segment_progress_log =
         |label: &str, message: &str| log_info(&mut log_writer, label, message);
@@ -1105,32 +1052,8 @@ pub fn main() -> Result<()> {
     let segment_summary = segment_summary_result?;
     log_info(
         &mut log_writer,
-        "Segments output",
+        "Output segments file",
         &format!("{}.segments", args.out_prefix),
-    )?;
-    log_info(
-        &mut log_writer,
-        "Segments summary",
-        &format!(
-            "{} rows ({} BSJ, {} backward, {} outward)",
-            segment_summary.total_segments,
-            segment_summary.bsj_segments,
-            segment_summary.backward_segments,
-            segment_summary.outward_segments
-        ),
-    )?;
-    log_info(
-        &mut log_writer,
-        "Isoforms output",
-        &format!(
-            "{}.isoforms.gtf, {}.isoforms.fa",
-            args.out_prefix, args.out_prefix
-        ),
-    )?;
-    log_info(
-        &mut log_writer,
-        "Isoforms summary",
-        &format!("{} major isoforms", segment_summary.major_isoforms),
     )?;
     write_and_log_segments_bam(
         &mut log_writer,
@@ -1138,6 +1061,48 @@ pub fn main() -> Result<()> {
         &args.out_prefix,
         &fasta.chr_len_map,
         args.threads,
+    )?;
+    log_info(
+        &mut log_writer,
+        "Segments summary",
+        &format!(
+            "{} reads ({} BSJ, {} backward, {} outward)",
+            segment_summary.total_segments,
+            segment_summary.bsj_segments,
+            segment_summary.backward_segments,
+            segment_summary.outward_segments
+        ),
+    )?;
+
+    log_info(
+        &mut log_writer,
+        "=== STAGE 3/3 ===",
+        "Full-length isoform reconstruction...",
+    )?;
+    log_info(
+        &mut log_writer,
+        "Reconstructing isoforms",
+        "Calling circRNA isoforms from splice graphs...",
+    )?;
+    let isoform_summary = rebuild_major_isoforms_from_segments(
+        &result_output,
+        &segments_output,
+        &args.out_prefix,
+        &fasta.chr_tcga_map,
+        args.gtf.as_ref().map(|_| &annotation),
+    )?;
+    log_info(
+        &mut log_writer,
+        "Output isoform files",
+        &format!(
+            "{}.isoforms.gtf, {}.isoforms.fa",
+            args.out_prefix, args.out_prefix
+        ),
+    )?;
+    log_info(
+        &mut log_writer,
+        "Isoform summary",
+        &format_isoform_summary(isoform_summary),
     )?;
 
     log_info(

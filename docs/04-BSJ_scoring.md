@@ -1,5 +1,7 @@
 # circRNA 候选 BSJ 位点重评分模型设计思路
 
+本文档是探索性设计笔记，不代表当前主流程实现。当前 CIRI-toolkit 主流程仍保持 CIRI3-compatible `Scan1 -> Scan2 -> Summary` parity；已落地的默认扩展是 `<prefix>.segments`、major isoform GTF/FASTA 和 IGV review sidecar。后续活跃路线是 multi-isoform usage 与 multi-sample integration，而不是先引入新的 BSJ scoring 模型。
+
 ## 1. 背景与核心问题
 
 现有 circRNA 识别方法在实际应用中往往依赖以下两类先验：
@@ -349,4 +351,3 @@ Score(BSJ) =
 ## 11. 最终一句话概括
 
 > **最佳策略不是“先用 motif 定义 circRNA”，而是“先最大化召回 candidate BSJ，再利用物种特异剪接先验、比对一致性和聚合证据，对局部多个 donor/acceptor 组合进行重评分，从而解析最可能的真实 back-splice junction。”**
-

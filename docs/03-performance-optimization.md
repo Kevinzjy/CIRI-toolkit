@@ -4,9 +4,9 @@
 
 ## 当前结论
 - CIRI3-compatible `Scan1 -> Scan2 -> Summary` 主流程已经完成 Java parity 对齐。
-- 当前活跃优化对象是 whole-genome BAM 上的 `Scan2` 与默认 `<prefix>.segments` 后处理阶段。
+- 当前活跃优化对象是 whole-genome BAM 上的 `Scan2`、默认 `<prefix>.segments` 后处理阶段，以及从 `<prefix>.segments` 解析 major isoform / future usage 的最后一步。
 - 优化优先级是：先保证大规模数据下峰值 RSS 与临时 I/O 有明确上界，再优化 wall-clock 时间。
-- 因此，本文件同时作为性能约束、测量规范、历史档案和当前 Scan2/segments 优化 backlog。
+- 因此，本文件同时作为性能约束、测量规范、历史档案和当前 Scan2/segments/isoform 后处理优化 backlog。
 
 ## 已完成的优化范围
 - 不改变 Java 对齐结果（行为与输出保持一致）。
@@ -71,7 +71,7 @@ python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-r
 
 ### 入口
 
-- 真实 BAM/SAM、CIRI3 parity、CIRI-AS/segments 性能观察统一使用 `--release` 构建。
+- 真实 BAM/SAM、CIRI3 parity、segments/isoform 性能观察统一使用 `--release` 构建。
 - 推荐用 CLI `--perf` 打开主流程 profiling，输出固定写入 `<prefix>.perf.log`。
 - 兼容环境变量入口：
   - `CIRI_PROFILE_SCAN1=1`
@@ -91,6 +91,13 @@ python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-r
 - 临时文件只能作为 shard-local spill、bounded merge 或 debug artifact 使用，不应成为正式输出协议。
 - 默认成功运行后删除内部临时文件；用户显式传入 `--debug` 时保留。
 - 正式用户输出当前限定为 `<prefix>.out`、`<prefix>.bsj`、`<prefix>.segments`、`<prefix>.isoforms.gtf`、`<prefix>.isoforms.fa`、`<prefix>.bedpe`、`<prefix>.segments.bam` 和 `<prefix>.segments.bam.bai`；`.bedpe` 跟随 `.out` 写出，`.segments.bam/.bai` 跟随 `.segments` 写出并作为大数据 IGV review 主入口。
+- `tmp/` 只保留一次性运行产物、probe 输出和短期分析表；可复用脚本迁入 `scripts/`，并使用参数化 CLI。当前已保留的通用 interval read-name 抽取工具是 `scripts/ciri_extract_interval_read_names.py`。
+
+### Isoform / usage 后处理边界
+
+- 当前 major isoform 阶段必须从已写出的 `<prefix>.segments` 重新解析，不能依赖前一阶段内存对象；这是 `--continue`、debug 和未来 multi-sample integration 的稳定输入边界。
+- 后续 multi-isoform usage 和 multi-sample integration 必须继续保持可流式/分片处理，不允许把全量 read-level rows 或所有样本的 segments 常驻内存。
+- 若新增 usage profiling，应单独标记 parser、circ-local graph、read assignment、sample merge 和 writer 阶段，避免把最后一步性能问题误归因到 Scan1/Scan2。
 
 ## Scan2 专项记录（2026-05）
 
@@ -235,4 +242,4 @@ profiling 输出：
 4. 必要时可重新开启 `CIRI_PROFILE_SCAN1=1` 复用本文件中的 profiling 口径。
 
 ---
-最后更新：2026-05-13
+最后更新：2026-05-19

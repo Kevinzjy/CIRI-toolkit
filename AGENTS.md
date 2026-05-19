@@ -10,7 +10,7 @@
 - **大规模可扩展性优先于速度**：面向真实全量 BAM/SAM、超大 sidecar 或 whole-genome hg38 数据时，优化目标首先是保证内存有明确上界、可流式/分片处理、不会随 read/row/alignment 全量线性驻留；在 scalability 和内存安全成立后，才进一步优化 wall-clock 时间和 CPU 吞吐。
 - **测试覆盖关键逻辑**：BSJ 识别、CIGAR 分类、Scan2 救援（rescue）、Summary 合并与严格度（stringency）过滤都应有验证。
 - **小步快跑、每步验证**：每次改动后都要立刻做差异比较。
-- **扩展模块不反向污染主流程**：CIRI-AS / CIRI-full / RO feature 等扩展能力默认作为 sidecar 或后处理推进，未完成验证前不得改变 `Scan1 -> Scan2 -> Summary` 的既有输出。
+- **扩展模块不反向污染主流程**：segments、isoform usage、multi-sample 等扩展能力默认作为 sidecar 或后处理推进，未完成验证前不得改变 `Scan1 -> Scan2 -> Summary` 的既有输出。
 
 ## 技术架构约束
 - **SAM/BAM**：使用 `noodles-sam` 和 `noodles-bam`。
@@ -18,13 +18,12 @@
 - **两遍扫描流程**：遵循 CIRI3 两遍扫描架构（Scan1 -> Scan2 -> Summary）。
 - **过滤条件**：严格按 `Summary.java` 的严格度（stringency）逻辑实现。
 
-## 扩展模块策略（CIRI-AS / CIRI-full / RO）
-- **CIRI3 parity 与扩展功能分层**：`vendor/CIRI3` 仍是核心 BSJ 检测行为标准；`vendor/CIRI-AS` 与 `vendor/CIRI-full` 当前只作为算法参考和风险清单，不要求完整复刻所有历史输出。
-- **RO feature 第一阶段目标**：优先在 `Scan1` read group 层识别 paired-end reads 的 RO 序列，输出 `<prefix>.ro.fq` 与 `<prefix>.ro.tsv`，并标注 `5p_ro / 3p_ro / bidirectional_ro / full_length_candidate` 等 sequence-level 类型。
-- **RO sidecar 红线**：第一阶段 RO 输出不得改变 `.bsj1`、`.bsj`、`.out`；`--ro-feature` 关闭时应保持主流程字节级或三层 diff 完全一致。
-- **RO 证据边界**：Scan1 阶段的 RO overlap 不是 BSJ 证据，也不是 CIRI-full 的 `Full/Part` 结构判定；只有经过后续 RO remap、RO Scan1/Scan2、origin read 去重和回归验证后，才可考虑合并进主 BSJ 判定。
-- **原始方向隔离**：RO detector 需要 read pair 的原始测序方向序列和质量值；不得复用或改写服务 Java parity 的 alignment-oriented `stand_map` 语义。
-- **文档优先**：RO、isoform、CIRI-AS/CIRI-full 相关设计变更必须同步更新 `docs/05-ro-feature-plan.md` 以及必要的状态文档，再进入代码实现。
+## 扩展模块策略（segments / isoforms / multi-sample）
+- **CIRI3 parity 与扩展功能分层**：`vendor/CIRI3` 仍是核心 BSJ 检测行为标准；`vendor/CIRI-AS` 与 `vendor/CIRI-full` 只作为历史算法参考和风险清单，不再作为当前开发路线或完整 parity 目标。
+- **当前已落地能力**：默认后处理已实现 `<prefix>.segments`、`<prefix>.isoforms.gtf`、高可信 `<prefix>.isoforms.fa`、`<prefix>.bedpe` 和 `<prefix>.segments.bam/.bai`；isoform 阶段必须从已写出的 `<prefix>.segments` 重新解析，保证断点调试和后续多样本整合共用同一输入边界。
+- **下一阶段目标**：围绕同一 circRNA 的多个候选 isoform 建立 usage 计算、置信度分层和 multi-sample integration；重点是比较 major isoform switching、结构稳定性和样本间 usage 变化，而不是沿 CIRI-AS / CIRI-full / RO remap 路线继续复刻历史输出。
+- **证据边界**：BSJ/backward/outward segments 是当前 isoform 图的主要证据层。后续新增 evidence 必须先进入审计字段或 sidecar，不能反向改变 `.out/.bsj/.segments` 的既有判定。
+- **文档优先**：isoform usage、多样本整合、输出协议或证据分层发生变化时，必须同步更新 `docs/07-full-length-reconstruction.md`、`docs/01-development-status.md` 和必要的用户文档。
 
 ## 代码注释规范
 - **Rust 文档化注释是强约束**：`src/` 下新增或修改的模块、结构体、函数都应补齐规范的 Rust 文档注释。
@@ -58,6 +57,8 @@
   - 必须按“当前比对链方向（alignment strand）”逐条计算，不能按片段（segment）固定方向。
 - **默认参数**
   - 命令行（CLI）默认值应与 CIRI3 默认行为一致，除非有明确证据需要调整。
+  - 已确认例外：`ciri -s/--stringency` 默认值为 `0`，用于保留候选 circRNA 供 segments、isoform 和多样本规则后续过滤；Java CIRI3 `-S/--strigency` 默认仍记录为 `2`，stringency 判定公式本身必须保持 Java parity。
+  - 已确认例外：`ciri --min-span` 默认值为 `50`，用于保留较短 circRNA 候选供后处理过滤；Java CIRI3 `-Min` 默认仍记录为 `140`，显式传参时仍按用户指定值执行。
 
 ## 调试与验证流程（SOP）
 - 使用 `scripts/ciri_result_diff.py` 做三层比较：
@@ -75,6 +76,11 @@
   - `CIRI_PROFILE_SEGMENTS=1`：segments 内部阶段计时
 - `--debug` 只表示保留内部临时文件，不等同于 trace 或 profiling。
 - 调试结束后必须关闭追踪（trace）环境变量，再跑最终验证。
+- 常用开发脚本：
+  - `scripts/ciri_result_diff.py`：CIRI3 vs Rust `.out` 四层差异检查。
+  - `scripts/ciri_segments_eval.py`：segments 与 simulator truth 的 read-level 评估。
+  - `scripts/ciri_read_subset.py`：按 read list 生成调试子集。
+  - `scripts/ciri_extract_interval_read_names.py`：按 genomic interval 从 BAM/SAM 收集 read-name list，便于生成 focused subset。
 - 详细操作手册见：
   - `docs/02-parity-debug-playbook.md`
   - `docs/00-index.md`
@@ -83,7 +89,7 @@
 - 当前正式用户输出限定为 `<prefix>.out`、`<prefix>.bsj`、`<prefix>.segments`、`<prefix>.isoforms.gtf`、`<prefix>.isoforms.fa`、`<prefix>.bedpe`、`<prefix>.segments.bam` 和 `<prefix>.segments.bam.bai`；`.bedpe` 在 `.out` 写出时同步生成，`.segments.bam/.bai` 在 `.segments` 写出时同步生成并作为大数据 IGV review 主入口；`.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj` 以及 `.part_XXXX.tmp` shard 文件都是内部临时文件。
 - 所有多进程/多线程 shard 临时文件统一使用合并后文件名加 `.part_XXXX.tmp` 后缀，例如 `<prefix>.segments.non_bsj.part_0001.tmp`。
 - 默认成功运行后删除内部临时文件；只有 CLI `--debug` 才保留。
-- 所有临时脚本输出、探针产物、一次性依赖下载统一放在 `tmp/` 目录下。
+- 所有临时脚本输出、探针产物、一次性依赖下载统一放在 `tmp/` 目录下；需要长期复用的脚本整理到 `scripts/`，并提供通用 CLI 参数，不保留硬编码 `tmp/...` 输入。
 - 不要在 `tests/`、`src/`、仓库根目录散落临时文件或编译中间产物。
 - `tmp/` 为本地工作区目录，不纳入版本控制。
 
@@ -110,11 +116,11 @@
   - 若出现差异，先回到行为对齐再谈性能。
   - 不允许以“统计上接近”替代“逐条一致”。
 
-## 当前扩展阶段定义（2026-04）
-- **阶段目标**：实现 RO1 思路的 sidecar 功能，在 `Scan1` 过程中生成 `<prefix>.ro.fq` 和 `<prefix>.ro.tsv`。
-- **实现范围**：只做 RO read pair 检测、merged RO read 输出和 RO metadata 记录；暂不做 BWA remap、RO BAM、RO-assisted Scan2 或 isoform usage。
-- **验证要求**：新增 RO 单元测试；`--ro-feature` 关闭时执行既有 parity 检查；`--ro-feature` 开启时主结果仍不变，只额外生成 RO sidecar 文件。
-- **注释要求**：新增 `src/ro.rs`、Scan1 RO 接入点、原始方向 seq/qual 恢复、shard-local RO writer 和输出合并逻辑，都必须有说明职责边界与不能误改的 Rust 文档注释。
+## 当前扩展阶段定义（2026-05）
+- **阶段结论**：read-level segments 与单样本 major isoform 全长识别已实现，当前默认输出可作为 first usable version。
+- **实现范围**：主流程默认输出 `<prefix>.segments`、`<prefix>.isoforms.gtf`、高可信 `<prefix>.isoforms.fa`、`<prefix>.bedpe` 和 `<prefix>.segments.bam/.bai`；`--continue` 只从已完成的 `<prefix>.segments` 断点重建 isoforms。
+- **下一阶段目标**：实现多 isoform usage 计算与 multi-sample 整合，包括候选 isoform search space、per-sample support/usage、major isoform switching 和跨样本结构合并。
+- **暂不推进内容**：不再把 CIRI-AS / CIRI-full / RO remap 作为主开发路线；相关旧设计只保留为参考，废弃或未使用代码应优先删除，除非仍直接支撑 segments 或 major isoform 输出。
 
 ## 交付前检查清单
 - 关闭所有 trace 环境变量后执行一次完整流程。

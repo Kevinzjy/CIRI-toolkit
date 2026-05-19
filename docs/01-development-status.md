@@ -8,11 +8,11 @@ CIRI-toolkit 是 CIRI3（Java）的 Rust 复现版本，目标是在保持判定
 ## 相关文档
 - 调试手册：`docs/02-parity-debug-playbook.md`
 - 性能总结：`docs/03-performance-optimization.md`
-- RO feature 计划：`docs/05-ro-feature-plan.md`
+- RO feature 历史设计：`docs/05-ro-feature-plan.md`
 - 模拟数据与 truth 输出设计：`docs/06-simulation-truth-design.md`
-- CIRI-AS-style full-length 结构识别设计：`docs/07-full-length-reconstruction.md`
-- CIRI-AS 拆解：`docs/CIRI-AS.md`
-- CIRI-full 拆解：`docs/CIRI-full.md`
+- segments 与 major isoform 结构识别设计：`docs/07-full-length-reconstruction.md`
+- CIRI-AS 拆解（历史参考）：`docs/CIRI-AS.md`
+- CIRI-full 拆解（历史参考）：`docs/CIRI-full.md`
 - 文档导航：`docs/00-index.md`
 
 ## 当前状态（Functional v1）
@@ -22,7 +22,7 @@ CIRI-toolkit 是 CIRI3（Java）的 Rust 复现版本，目标是在保持判定
 - `stringency` 过滤、FSJ 统计、注释输出等关键能力均可运行。
 - 双端（paired-end）与单端（single-end）输入均已完成验证，当前输出与 Java CIRI3 保持一致。
 - `Scan1` 与 `Scan2` 的性能优化阶段已完成，当前版本整体性能已达到并超过 Java 基线，可作为正式功能版本持续使用。
-- 默认后处理已进入 `<prefix>.segments` 阶段：主流程写完 `<prefix>.out` 后继续生成 read-level circRNA segment chain，用于后续 full-length reconstruction。
+- 默认后处理已完成 `<prefix>.segments` 和 major isoform 阶段：主流程写完 `<prefix>.out` 后继续生成 read-level circRNA segment chain，并从稳定的 `<prefix>.segments` 重新解析生成 major isoform GTF/FASTA。
 
 ## 对齐基线
 - circRNA-level：100%
@@ -34,7 +34,7 @@ CIRI-toolkit 是 CIRI3（Java）的 Rust 复现版本，目标是在保持判定
 - `tests/chr1` BAM / SAM 基线继续保持 circ/read/read-assignment/FSJ 四层 100% 对齐。
 - `<prefix>.bsj1` 和 `<prefix>.bsj2` 已升级为 mate-level BSJ 中间文件，包含 `mate_label` 与 `priority`；`Summary` 只消费 `priority=1` 行，最终 `<prefix>.bsj` 保留 `priority=0` 行供后续内部 splice site 识别使用。
 - 当前运行路径不再生成额外 `<prefix>.scan1.tmp`、`<prefix>.scan2.tmp` 或 `<prefix>.bsj.raw.tmp`。
-- 当前正式用户输出为 `<prefix>.out`、`<prefix>.bsj`、`<prefix>.segments`、major isoform 文件和 IGV review sidecar；`.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj` 以及 `.part_XXXX.tmp` shard 文件均为内部临时文件，默认成功运行后删除，`--debug` 时保留。
+- 当前正式用户输出为 `<prefix>.out`、`<prefix>.bsj`、`<prefix>.segments`、`<prefix>.isoforms.gtf`、`<prefix>.isoforms.fa`、`<prefix>.bedpe` 和 `<prefix>.segments.bam/.bai`；`.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj` 以及 `.part_XXXX.tmp` shard 文件均为内部临时文件，默认成功运行后删除，`--debug` 时保留。
 - 单端测序数据的专项验证已完成，当前输出与 Java 基线完全一致。
 - 大规模 hg38 验证表明：当 Rust 与 Java 使用一致的参考 FASTA / GTF 版本时，`BSJ reads` 与 `FSJ counts` 已完成全量对齐。
 - 当前推荐的 hg38 对齐口径为：
@@ -47,6 +47,7 @@ CIRI-toolkit 是 CIRI3（Java）的 Rust 复现版本，目标是在保持判定
   - 相同 GTF 版本
   - 相同 stringency 参数
   - 关闭所有 trace/profile 环境变量
+- chr1 simulator truth 上当前 FASTA isoform 评估口径为：FASTA `7919` 条，其中 `7870` 条有对应 truth circRNA；严格匹配 truth major isoform `77.64%`，严格匹配任意 truth isoform `86.72%`，junction chain 匹配任意 truth isoform `87.33%`。其中 `mature` FASTA exact-any 为 `94.38%`，`estimate` FASTA exact-any 为 `85.88%`。这些指标用于评估 sequence candidate 可信度，不替代 `.out/.bsj/.segments` 的 parity 验收。
 
 统一校验命令：
 
@@ -86,23 +87,25 @@ python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI-r
 
 ## 后续开发计划
 - 高优先级功能点：在当前 `priority` 协议基础上继续推进真正的 paired-end R1/R2 BSJ 决策。当前默认路径仍采用 CIRI3 read-pair first-hit 语义；后续更合理的方向是先做 mate-level candidate 收集，再做 pair-level 决策，最后仍按 read-pair-level 计数。R1/R2 支持同一 BSJ 时应记录一致支持，支持不同 BSJ 时应显式标记冲突或 ambiguity。
-- 当前 CIRI-AS-style read-level segments reconstruction 和 major isoform 输出已进入可用的第一版：以 Summary confirmed BSJ、Scan1/Scan2 sidecar evidence 和 non-BSJ topology sidecar 为输入，默认输出 `<prefix>.segments`、`<prefix>.isoforms.gtf`、可信度更严格的 `<prefix>.isoforms.fa`，以及用于 IGV review 的 `<prefix>.bedpe` / `<prefix>.segments.bam`。
+- 当前 read-level segments reconstruction 和 major isoform 输出已进入可用的第一版：以 Summary confirmed BSJ、Scan1/Scan2 sidecar evidence 和 non-BSJ topology sidecar 为输入，默认输出 `<prefix>.segments`、`<prefix>.isoforms.gtf`、可信度更严格的 `<prefix>.isoforms.fa`，以及用于 IGV review 的 `<prefix>.bedpe` / `<prefix>.segments.bam`。
 - 当前默认后处理不依赖 RO remap，不新增 circ seed，不改变 `priority=1` 主流程证据和 `.out`；isoform 阶段从已写出的 `<prefix>.segments` 重新解析，方便 `--continue` 调试和后续多样本整合。
 - IGV visualization sidecar 当前先提供两个最小 track：`.bedpe` 在 `.out` 写出时展示识别到的 BSJ anchor pair，`.segments.bam/.bai` 在 `.segments` 写出时以合成 alignment 展示 bsj/backward/outward read 的 R1/R2 aligned blocks。BAM 中 internal junction 用 `N` CIGAR，`<bsj>` / `B` marker 拆成同 read 的多条 alignment，并写入 `YC` 与 `RG` tags 供 IGV 按固定 RGB 或 read group 着色。后续再补 internal junction arcs、confidence tier tracks 和 per-circ mini-BAM/read-list。
-- CIRI-AS / CIRI-full 尚未经过本项目同等级别的严格验证和性能优化，后续不以完整复刻其所有历史输出为目标；CIRI-AS 主要提供内部结构识别思路，CIRI-full/RO 暂作为未来 side evidence 风险清单。
+- CIRI-AS / CIRI-full 不再作为当前开发路线；后续不以完整复刻其历史输出为目标。相关文档只保留为历史参考、算法术语解释和风险清单，代码中不再使用的 CIRI-AS/cirexon/full-length path 旧实现应删除。
 - CIRI-AS sidecar 的 splice signal 阶段已明确采用 annotation-aware motif / strand / offset tie-break：当 annotation exon boundary 支持某个解释时，优先于 Perl v1.2 的 `AC/CT elsif AG/GT` 与 hash-order offset 行为；这是有意偏离 Perl 输出、追求稳定和边界可解释性的设计选择。
 - CIRI-AS sidecar 的 splice signal 阶段、annotation-aware motif / strand / offset tie-break 与 read-group 识别逻辑继续保留，用于支撑 `<prefix>.segments` 的 best-chain 选择和 segment 边界解释。
-- 当前 full-length 目标收敛为单样本 major isoform 输出；多 isoform usage 和更复杂的 sequence confidence tier 暂不硬判定，先通过 GTF 审计字段和后续 IGV review track 保留证据。
+- 当前 full-length 目标已经收敛为单样本 major isoform 输出；下一阶段补齐多 isoform usage 计算和 multi-sample integration。usage 阶段应复用 `<prefix>.segments` parser / circ-local graph，输出 per-sample support、isoform usage、major isoform switching 和跨样本 structure_hash 合并结果。
+- FASTA 输出应继续保持“高可信 sequence candidate”定位：`mature` 一律输出；`estimate` 只有在 reason 与 `segment_coverage_pct` 足够可信时输出。GTF 保留未进入 FASTA 的 unresolved/partial estimate 作为审计记录。
 - 独立 Rust 模拟器已作为开发 fixture 基础接入，通过 `ciri-simulator` 生成 paired FASTQ、linear-only `<prefix>.annotation.gtf`、circ/isoform-level `<prefix>.isoforms.tsv` 和 read-pair-level `<prefix>.reads.tsv`，用于后续 internal structure 和 full-length path 验证。
-- 新增模块仍应遵守小步验证原则：segments 输出优先、主流程 parity 不回退，等 read-level truth 稳定后再恢复 path-level full-length 输出。
+- 新增模块仍应遵守小步验证原则：segments 和 major isoform 输出保持稳定，主流程 parity 不回退；multi-isoform usage 和 multi-sample 先作为后处理/sidecar 推进。
 
 ## 开发规范
 - 后续代码改动应继续遵守已沉淀的 hg38 排障结论、Java parity 约束与关键注释说明，避免在重构或优化中重新引入回归。
 - 后续若再进行性能优化或结构调整，仍必须执行完整 parity 校验，出现差异即先回到行为对齐。
 - 大规模数据路径的优化必须先确认峰值 RSS 不随 read/row 全量线性增长，再讨论 CPU 时间；不允许为了速度回退到全量 read-level 结构常驻内存。
 - 临时文件命名、清理和 debug 保留策略必须与 `docs/00-index.md`、`docs/03-performance-optimization.md` 保持一致。
-- full-length reconstruction 实现前应先阅读 `docs/07-full-length-reconstruction.md`；新增 bundle、graph、FASTA 输出等模块必须补齐 Rust 文档注释，说明职责边界、证据层级和不影响主流程 parity 的原因。
-- CIRI-AS / CIRI-full 相关实现当前不以完整 parity 为目标，任何取舍必须写入对应设计文档，避免后续误把历史输出当作强制兼容契约；尤其是 annotation-aware offset/strand 判断这类有意偏离，必须在代码注释和 `docs/CIRI-AS.md` 同步维护。
+- 可复用开发脚本统一放在 `scripts/`，一次性探针和分析输出放在 `tmp/`；迁入 `scripts/` 的脚本必须提供通用 CLI 参数，不依赖硬编码 `tmp/...` 路径。
+- isoform usage 或 multi-sample integration 实现前应先阅读 `docs/07-full-length-reconstruction.md`；新增 graph、usage、multi-sample merge、FASTA/GTF 输出等模块必须补齐 Rust 文档注释，说明职责边界、证据层级和不影响主流程 parity 的原因。
+- CIRI-AS / CIRI-full 相关文档当前只作为历史参考，不作为强制兼容契约；仍被当前 segments 逻辑复用的 annotation-aware offset/strand 判断，必须在代码注释和 `docs/CIRI-AS.md` 同步维护。
 
 ---
-最后更新：2026-05-18
+最后更新：2026-05-19

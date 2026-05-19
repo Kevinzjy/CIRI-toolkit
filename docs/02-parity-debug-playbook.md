@@ -11,6 +11,7 @@
 - 每次只改一个小点，改后立即复测。
 - 优先做“可证伪”的对比：先数据定位，再代码定位。
 - 严禁用“补偿逻辑”掩盖与 Java 的真实分歧。
+- `<prefix>.segments`、major isoform、future usage/multi-sample 属于 Summary 后处理；除非明确评估主流程改造，否则这些阶段的问题不得通过改变 `.out/.bsj` parity 逻辑来修复。
 
 ## 2. 标准输入与基线
 
@@ -201,6 +202,28 @@ CIRI_PROFILE_SEGMENTS=1 ./target/release/ciri ...
 8. 只做一个最小改动，立即复测四层指标。
 9. 关闭所有 trace/profile 环境变量，删除或确认 `--debug` 保留的临时文件，再做最终验证。
 
+### 5.1 `--continue` 调试 isoform
+
+当只改 major isoform、FASTA 过滤或后续 usage 逻辑时，不需要重复跑 Scan1/Scan2：
+
+```bash
+./target/release/ciri \
+  --continue \
+  -i tests/chr1/test.bam \
+  -o tests/chr1/simulate.ciri \
+  -r tests/chr1/chr1.fa \
+  -a tests/chr1/chr1.gtf \
+  -s 0 -t 16
+```
+
+`--continue` 仍要求所有普通必填参数都正常提供。恢复规则只认合并完成的 `<prefix>.segments`：
+
+- 已有 `<prefix>.segments`：只重建 `<prefix>.isoforms.gtf` 和 `<prefix>.isoforms.fa`，不重复报告已有 `.out/.bedpe/.segments/.segments.bam`；
+- 没有 `<prefix>.segments`：直接报错，即使 `<prefix>.out + <prefix>.bsj` 已存在也不从 BAM/SAM 重建 segments；
+- `.out + .bsj`、`.part_XXXX.tmp`、`.segments1/.segments2/.segments.non_bsj` 等文件不能作为断点。
+
+后续 multi-sample integration 也应复用同一边界：先确认每个样本的 `<prefix>.segments` 和 `<prefix>.isoforms.gtf` 已完成，再运行跨样本 merge / usage 逻辑。
+
 ## 6. 单条 read 定位建议
 
 针对具体 read，建议按这个顺序缩小范围：
@@ -254,10 +277,21 @@ CIRI_PROFILE_SEGMENTS=1 ./target/release/ciri ...
 - 调试产物命名建议：
   - `tmp/<dataset>_<short_name>.out`
   - `tmp/<dataset>_<short_name>.log`
+- 可复用脚本命名建议：
+  - 通用工具放在 `scripts/ciri_*.py`
+  - 一次性探针放在 `tmp/`，结束后清理
+  - 如果从 `tmp/` 迁入 `scripts/`，必须去掉硬编码输入路径，改为 CLI 参数
 - 每次实验记录四件事：
   - 改了什么
   - 为什么改
   - 指标变化
   - 是否保留
+
+当前常用辅助脚本：
+
+- `scripts/ciri_result_diff.py`：`.out` 四层 parity 差异检查；
+- `scripts/ciri_segments_eval.py`：segments vs simulator truth 评估；
+- `scripts/ciri_read_subset.py`：按 read list 生成调试子集；
+- `scripts/ciri_extract_interval_read_names.py`：按 genomic interval 从 BAM/SAM 收集 read-name list，可接 `samtools view -N` 生成 focused subset。
 
 这样可以快速回放“哪一步真正有效”。

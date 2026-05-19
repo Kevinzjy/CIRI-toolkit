@@ -269,7 +269,6 @@ struct MateSegments {
 struct SegmentToken {
     start: usize,
     end: usize,
-    exon_idx: usize,
     partition: usize,
 }
 
@@ -655,11 +654,10 @@ fn format_segments(
     let mut partition = 0usize;
     let flush_current =
         |segments: &mut Vec<SegmentToken>, current: &mut Option<(usize, usize, usize, usize)>| {
-            if let Some((min_coord, max_coord, exon_idx, partition)) = current.take() {
+            if let Some((min_coord, max_coord, _exon_idx, partition)) = current.take() {
                 segments.push(SegmentToken {
                     start: min_coord,
                     end: max_coord,
-                    exon_idx,
                     partition,
                 });
             }

@@ -3,7 +3,9 @@
 本文档定义 CIRI-toolkit 当前阶段在 `Scan1 -> Scan2 -> Summary` 之后的默认后处理目标：先稳定识别 circRNA 相关 reads 的 read-level segments，并输出 `<prefix>.segments`；随后在不改变 `.out/.bsj/.segments` 的前提下，重新解析 `<prefix>.segments` 构建 segment graph，选择每个 circRNA 的 major isoform，输出 `<prefix>.isoforms.gtf` 和 `<prefix>.isoforms.fa`。  
 多 isoform usage 暂不在单样本中硬判定。当前只输出 major isoform，并保留 `sample_id`、`cov`、`structure_hash` 等字段，为后续多样本比较 major isoform 是否切换预留接口。
 
-当前目标不是重新发现新的 circRNA，也不是引入新启发式改变 `priority=1` 主流程证据或 `.out`。当前阶段要回答的问题是：
+当前目标不是重新发现新的 circRNA，也不是引入新启发式改变 `priority=1` 主流程证据或 `.out`。read-level segments 与单样本 major isoform 已经作为默认后处理落地；后续工作集中在同一 circRNA 内多个 isoform 的 usage 计算，以及跨样本结构合并和 major isoform switching 判断。
+
+当前阶段要回答的问题是：
 
 - 对于已识别到的 circRNA 相关 reads，能否稳定恢复 read-level segment chain；
 - 能否先把 `circ_id`、`is_circular` 和 `r1/r2_segments` 判定做对；
@@ -27,13 +29,15 @@ isoforms -> parse <prefix>.segments
          -> build circ-local segment graph
          -> select phase-seed-union major path
          -> <prefix>.isoforms.gtf + <prefix>.isoforms.fa
+IGV     -> <prefix>.bedpe from <prefix>.out
+         -> <prefix>.segments.bam/.bai from <prefix>.segments
 ```
 
 `--continue` 只从合并完成的稳定文件恢复：
 
 - `--continue` 是普通运行命令的附加执行模式，不改变参数契约；`-i/-o/-r/-a` 等参数仍应像从头运行一样正常指定。
-- 若 `<prefix>.segments` 已存在，直接解析 `<prefix>.out + <prefix>.segments`，只重建 `<prefix>.isoforms.gtf` 和 `<prefix>.isoforms.fa`。
-- 若 `<prefix>.segments` 不存在，但 `<prefix>.out` 和 `<prefix>.bsj` 均存在，则重新扫描 BAM/SAM，重建 `<prefix>.segments` 后再重建 isoforms。
+- 若 `<prefix>.segments` 已存在，直接解析 `<prefix>.out + <prefix>.segments`，只重建 `<prefix>.isoforms.gtf` 和 `<prefix>.isoforms.fa`；已有 `.out/.bedpe/.segments/.segments.bam` 不重复写出或重复报告。
+- 若 `<prefix>.segments` 不存在，直接报错；即使 `<prefix>.out` 和 `<prefix>.bsj` 已存在，也不把它们作为 continue 断点。重建 segments 需要全量 BAM/SAM rescan，应直接按普通流程重跑。
 - `.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj.part_XXXX.tmp` 以及其他 `.part_XXXX.tmp` 文件都不是断点。它们可能来自未完成的并行阶段，不能用于判断前一阶段已经成功结束。
 
 设计边界：
@@ -47,22 +51,22 @@ isoforms -> parse <prefix>.segments
 - isoforms 阶段只输出每个 circRNA 的 major isoform；多 isoform candidate/search space 暂不作为用户最终输出。
 - 正式用户输出包括 `<prefix>.out`、`<prefix>.bsj`、`<prefix>.segments`、`<prefix>.isoforms.gtf`、`<prefix>.isoforms.fa` 和 IGV review sidecar；`.bsj1/.bsj2/.segments1/.segments2/.segments.non_bsj` 和 `.part_XXXX.tmp` 都是内部临时协议。
 
-## 2. 为什么先做 segments，不直接做 full-length
+## 2. 为什么以 segments 作为 isoform 输入边界
 
-直接 full-length reconstruction 当前行不通，核心原因不是“缺少图模型”，而是 read-level 输入层还不够稳定：
+早期没有先稳定 read-level 输入时，直接做 full-length reconstruction 会系统性放大错误；核心原因不是“缺少图模型”，而是 circRNA read 的解释必须先稳定：
 
 - 同一 read pair 可能有 `primary / supplementary / secondary` 多套可选比对链；
 - circRNA read 的最佳解释需要同时满足 topology、BSJ 结构和 splice 校正，而不是简单读取某一条主比对；
 - 一旦 read-level `circ_id`、`is_circular` 或 segment chain 错了，后续 exon graph / isoform path 会系统性放大错误；
 - simulator 目前最直接、最严格的 oracle 也是 `.reads.tsv`，而不是 path-level event taxonomy。
 
-因此当前阶段必须先把“单条 read 应该被解释成什么样”做成正式输出，再谈 path 构建。
+因此当前实现把“单条 read 应该被解释成什么样”做成正式 `<prefix>.segments` 输出，并规定 isoform 阶段必须从该文件重新解析。major isoform 已经在这个边界上落地；后续 multi-isoform usage 和 multi-sample integration 也应复用同一输入边界。
 
-## 3. 与 CIRI-AS 的关系
+## 3. 与 CIRI-AS / CIRI-full 的关系
 
-这条新路线仍然是 CIRI-AS-style 的后处理，只是阶段目标从“直接产出 full-length path”收缩为“先产出可靠的 segments”。
+CIRI-AS / CIRI-full 当前只作为历史算法参考，不再作为 active roadmap 或完整 parity 目标。已经落地的路线是 CIRI-toolkit 自己的 Summary 后处理：先输出稳定 `<prefix>.segments`，再从该文件解析并选择 major isoform。
 
-当前仍然直接保留的 CIRI-AS 核心思路：
+当前仍然直接保留的历史思路：
 
 - 以 Summary confirmed circRNA / BSJ 为后处理锚点；
 - 在 `Scan1` / `Scan2` 处理 read group 时同步保存 BSJ reads 的 alignment evidence；
@@ -70,7 +74,7 @@ isoforms -> parse <prefix>.segments
 - 使用 annotation-guided + de novo splice signal 逻辑修正 splice site；
 - 用局部 topology 解释 circRNA 相关 reads，而不是把每条 supplementary 直接当成独立证据。
 
-当前明确暂缓的 CIRI-AS / full-length 输出：
+当前明确不复刻的 CIRI-AS / CIRI-full 历史输出：
 
 - `_splice.list`
 - `.list`
@@ -81,7 +85,7 @@ isoforms -> parse <prefix>.segments
 - PSI / usage correction
 - ES / A5SS / A3SS / IR 等 event taxonomy
 
-这些能力不是被否定，而是顺序后移。只有当 `<prefix>.segments` 已经能稳定对齐 simulator truth，才值得继续往 path 层推进。
+这些能力不再作为本项目必须兼容的输出协议。后续若需要多个 isoform，不沿历史 CIRI-AS / CIRI-full 文件格式复刻，而是在当前 `<prefix>.segments -> isoform graph` 边界上实现 usage 和 multi-sample 合并。
 
 ## 4. 触发方式与输入边界
 
@@ -121,24 +125,31 @@ ciri \
 - annotation GTF
   - 提供 exon boundary、gene span、strand 辅助
 - reference FASTA
-  - 当前阶段不是必须依赖，但保留给后续 splice signal / path 扩展
+  - 用于 FASTA 序列输出和必要的 splice signal / path 校正
 
 ### 4.3 输出
 
-当前阶段只新增一个正式输出：
+当前阶段正式用户输出包括：
 
 ```text
+<prefix>.out
+<prefix>.bsj
 <prefix>.segments
+<prefix>.isoforms.gtf
+<prefix>.isoforms.fa
+<prefix>.bedpe
+<prefix>.segments.bam
+<prefix>.segments.bam.bai
 ```
 
 约束：
 
 - `priority=1` 主流程证据和 `.out` 判定结果保持不变；
-- `<prefix>.segments` 是后续 full-length reconstruction 的正式输入层；
+- `<prefix>.segments` 是 major isoform、future usage 和 multi-sample integration 的正式输入层；
 - `<prefix>.segments1` / `<prefix>.segments2` 是临时 sidecar 协议，不直接作为用户最终解释结果；
 - `<prefix>.segments.non_bsj` 是临时 stem；真实并行路径以 `<prefix>.segments.non_bsj.part_XXXX.tmp` shard 形式被 segments 阶段直接消费，不要求先合并成一个巨大文件；
 - 所有临时文件默认成功后删除，只有 `--debug` 保留；
-- 第一阶段不再把 full-length 路径文件作为主输出协议。
+- `<prefix>.isoforms.gtf` 是完整审计表；`<prefix>.isoforms.fa` 只输出高可信 major isoform sequence candidate。
 
 ### 4.4 sidecar evidence 协议
 
@@ -405,7 +416,7 @@ approximate local junction rescue 暂不进入当前 `<prefix>.segments` strong 
 - splice motif / strand 是否一致；
 - short clip 是否只提供 junction path hint，而不足以定义 exon boundary。
 
-因此 approximate clip rescue 应后移到 circRNA-level full-length assembly 阶段。后续可以把这类 clip 序列作为 `boundary_clip_read` / weak junction path evidence 使用，但必须经过 circRNA-level graph 或 path voting 后，才允许影响 isoform/path 输出。
+因此 approximate clip rescue 应后移到 circRNA-level isoform graph / usage 阶段。后续可以把这类 clip 序列作为 `boundary_clip_read` / weak junction path evidence 使用，但必须经过 circRNA-level graph 或 path voting 后，才允许影响 isoform/path 输出。
 
 ## 7. 第一阶段覆盖范围
 
@@ -607,6 +618,20 @@ isoform 输出必须建立在 read-level segments 稳定的前提上。当前单
 - FASTA 必须从 reference 按 GTF exon chain 抽取，`isoform_len` 必须和序列长度一致；
 - `.out/.bsj/.segments` 仍是独立验收面，isoform 阶段不能反向改变这些输出。
 
+当前 chr1 simulator truth 的 FASTA 评估结果（2026-05-18）：
+
+| 口径 | 数量 / 比例 |
+|---|---:|
+| FASTA isoforms | `7919` |
+| 有对应 truth circRNA | `7870` (`99.38%`) |
+| 严格匹配 truth major isoform | `6110 / 7870` (`77.64%`) |
+| 严格匹配任意 truth isoform | `6825 / 7870` (`86.72%`) |
+| junction chain 匹配任意 truth isoform | `6873 / 7870` (`87.33%`) |
+| `mature` FASTA exact-any | `94.38%` |
+| `estimate` FASTA exact-any | `85.88%` |
+
+`±2 bp` 边界容忍只把 exact-any 从 `86.72%` 提升到 `87.71%`，说明当前主要误差不是微小边界漂移，而是 major isoform 选择或 estimate 内部结构推断。另有 `715` 条 FASTA 结构精确匹配 truth 的非 major isoform，说明部分 mismatch 是 top-1 major 选择与 truth major 不一致，而不是序列结构完全错误。
+
 ## 11. 当前 major isoform 输出协议
 
 当前 Rust 主流程在 `<prefix>.out` 写出后生成 BSJ BEDPE review track；在 `<prefix>.segments` 写出后默认重新读取该文件，执行 circ-local segment graph reconstruction，并写出：
@@ -650,16 +675,16 @@ isoform 输出必须建立在 read-level segments 稳定的前提上。当前单
 - BSJ rows 仍按 `<prefix>.segments` 的 `circ_id` 精确归属，权重为 `1.0`；
 - backward/outward rows 没有精确 BSJ 位点，isoform 阶段会找出所有包含该 row span 的 confirmed circRNA，并根据 read segment 端点到候选 BSJ 两端的距离估计归属概率；多个候选 circRNA 的总权重最多为 `1.0`，剩余概率视为未分配，避免内部 non-BSJ read 被硬计入外层大 circRNA。
 
-isoform 阶段不直接消费 finalize 阶段的内存中 `SegmentRecord`。这保证 `<prefix>.segments` 是 full-length reconstruction 的正式输入边界，也让后续单独重跑 isoform reconstruction 和多样本整合可以复用同一套 parser / graph builder。
+isoform 阶段不直接消费 finalize 阶段的内存中 `SegmentRecord`。这保证 `<prefix>.segments` 是 major isoform、future usage 和 multi-sample integration 的正式输入边界，也让后续单独重跑 isoform reconstruction 和多样本整合可以复用同一套 parser / graph builder。
 
-CLI 的 `--continue` 也遵守这个边界：已有 `<prefix>.segments` 时只重跑 isoform parser / graph builder；没有 `<prefix>.segments` 但已有 `<prefix>.out/.bsj` 时，才回到 BAM/SAM 重新生成 segments。这样可以在调试 major isoform、mature/estimate 判定或后续多样本整合逻辑时避免重复执行 Scan1/Scan2。
+CLI 的 `--continue` 也遵守这个边界：已有 `<prefix>.segments` 时只重跑 isoform parser / graph builder；没有 `<prefix>.segments` 时直接报错，不从 `<prefix>.out/.bsj` 回到 BAM/SAM 重新生成 segments。这样可以让常见的 major isoform、mature/estimate 判定和后续多样本整合调试保持在最后一步，也避免把已存在的 `.out/.bedpe/.segments/.segments.bam` 再当成新输出提示。
 
 `cov` 当前定义为 selected path 上 edge weighted support 的最小值；没有 internal edge 的单 exon circRNA 退回使用 `bsj_reads`。BSJ/backward/outward 的 edge support 使用上述 circRNA 归属权重累加，其中 outward 仍按 `0.05` 进入 path scoring。`segment_coverage_pct` 是结构审计字段，表示 selected exon-chain 中被 `<prefix>.segments` aligned span 覆盖的加权碱基比例：BSJ span 按 `1.0` 计入，backward/outward span 按归属概率计入，单碱基 coverage capped at `1.0`。它不参与表达量估计或 path ranking，也不复用 `cov` 语义。`structure_hash` 是由 chromosome、strand、circ boundary 和 exon chain 计算的稳定哈希，用于后续多样本判断 major isoform 是否发生切换。
 
-`<prefix>.isoforms.gtf` 是完整审计表，包含 `mature`、可解释的 `estimate` 和明显 unresolved / partial 的 estimate；`<prefix>.isoforms.fa` 更严格，只输出可作为序列使用的结构：
+`<prefix>.isoforms.gtf` 是完整审计表，包含 `mature`、可解释的 `estimate` 和明显 unresolved / partial 的 estimate；`<prefix>.isoforms.fa` 更严格，只输出可作为 sequence candidate 使用的高可信结构：
 
 - `mature` 一律输出 FASTA；
-- `estimate` 只有在 `estimate_reason` 和 `segment_coverage_pct` 都满足高可信条件时才输出 FASTA；当前要求 `segment_coverage_pct >= 50%`；
+- `estimate` 只有在 `estimate_reason` 和 `segment_coverage_pct` 都满足高可信条件时才输出 FASTA；当前保留 annotation/read-guided estimate 的 `segment_coverage_pct >= 50%` 规则，并额外允许没有其它不可信 reason 且 `segment_coverage_pct >= 90%` 的 high-coverage candidate；
 - 包含 `unresolved_long_block` 的 estimate 不输出 FASTA，因为仍有无法解释的长 genomic block；
 - 包含 `unphased_junction_chain` 的 estimate 默认不输出 FASTA；但若它没有其它不可信 reason 且 `segment_coverage_pct >= 90%`，则作为 high-confidence candidate 输出，并在 FASTA header 中保留 `estimate_reason`；
 - 包含 `unphased_single_exon_block` 的 estimate 不输出 FASTA，因为现有 evidence 不能证明整个 circRNA span 是连续 mature exon；
@@ -703,50 +728,51 @@ CLI 的 `--continue` 也遵守这个边界：已有 `<prefix>.segments` 时只�
 
 如果 `gene_id=NA` 或 GTF 中没有可用 exon overlap，长 unspliced block 仍只能按 graph block 原样保留；这类 isoform 应视为低可信 / unresolved full-length case，而不是成熟 RNA 长度已经被可靠确定。后续 standalone isoform/multi-sample 阶段应把这类记录显式标记出来，或在 FASTA 输出中降级处理。
 
-## 12. 后续 full-length 方向中值得保留的内容
+## 12. 下一阶段：multi-isoform usage 与 multi-sample integration
 
-虽然“直接 full-length reconstruction”当前暂停，但旧方案里以下内容仍值得保留，作为下一阶段的设计补充。
+major isoform 已经是当前默认输出。下一阶段不再回到 CIRI-AS / CIRI-full 路线，而是在 `<prefix>.segments` parser 和 circ-local graph 基础上扩展多个候选 isoform 的 usage 与跨样本合并。
 
-### 12.1 保留的总体边界
+### 12.1 总体边界
 
 - 仍然以 Summary confirmed BSJ 为硬锚点
 - 仍然不修改 `priority=1` 主流程证据和 `.out` 判定结果
 - 仍然不把 remap 作为第一依赖
-- full-length 仍然应作为 `Summary` 之后的独立后处理阶段
+- isoform usage / multi-sample 仍然应作为 `Summary` 之后的独立后处理阶段
+- 单样本 `<prefix>.isoforms.gtf` 保留完整审计信息，`<prefix>.isoforms.fa` 保持高可信 sequence candidate 定位
 
-### 12.2 保留的 evidence 思路
+### 12.2 usage 计算所需输入
 
-后续 path 层仍可继续使用以下 evidence 分类：
+后续 usage 层应优先复用已经稳定的结构化 evidence：
 
-- `bsj_seed_read`
-- `internal_split_read`
-- `boundary_clip_read`
-- `mate_link_read`
-- `mate_orientation_anomalous`
-- `coverage_read`
+- `<prefix>.segments` 中的 BSJ/backward/outward read-chain、internal junction、exclusive aligned span 和 mate-level BSJ 标记；
+- `<prefix>.isoforms.gtf` 中的 `structure_hash`、`cov`、`segment_coverage_pct`、`isoform_origin` 和 `estimate_reason`；
+- `.out` 中的 circRNA boundary、BSJ reads 和 annotation 字段；
+- simulator `.isoforms.tsv/.reads.tsv` 用于验证 major 与 minor isoform usage，而不是只验证 top-1 structure。
 
-但这些 evidence 必须建立在 `<prefix>.segments` 已经稳定的前提上，再进一步汇总。
+### 12.3 候选 isoform search space
 
-其中 `boundary_clip_read` 只作为后续 circRNA-level path assembly 的候选证据来源。short / approximate clip 不能在 read-level `<prefix>.segments` 阶段升级成 strong segment template；只有当同一 circRNA 内的其他 BSJ reads、内部 linear junction 或 annotation junction 共同支持同一 path 时，才可在 full-length assembly 中作为弱证据参与路径选择。
+候选 isoform 不应简单等同于所有 annotation transcript，也不应只输出当前 major path。建议 search space 来源按优先级分层：
 
-### 12.3 保留的 path 层约束
+- phase-supported path：BSJ/backward read-chain 中相邻 junction-junction link 直接支持的路径；
+- seed-extended path：以高覆盖节点或已选 major path 为 seed，向相邻 read-supported junction 扩展；
+- annotation-guided repair：只在 unphased block 中使用 transcript-consistent annotation exon chain 或 read-supported internal junction 进行拆分；
+- audit-only candidate：证据不足但需要保留给 GTF 审计的 unresolved / partial path。
 
-后续若重新启动 full-length reconstruction，仍建议保留：
+### 12.4 usage / multi-sample 输出方向
 
-- anchored path 与 candidate path 的证据分层
-- circ-local graph，而不是 genome-wide novo transcript graph
-- 不把 side-evidence-only boundary 直接升级成强 path 证据
-- path 输出必须显式区分 `anchored` 与 `candidate`
+后续输出建议保持两个层次：
 
-### 12.4 保留的“暂不做”原则
+- 单样本 usage：每个 circRNA 输出候选 isoform、support reads、加权 usage、是否为 major、confidence tier 和 structure_hash；
+- 多样本整合：按 `circ_id + structure_hash` 合并结构，输出 per-sample support/usage、major isoform switching、样本缺失/新增结构和跨样本一致性。
 
-在 segments 阶段和 future path 阶段都继续成立：
+### 12.5 仍然暂不做的内容
 
-- 不修改 `.bsj` / `.out`
-- 不依赖 `bwa mem` remap 作为第一前提
-- 不从 sidecar 结果反向新增 circ seed
-- 不做无 BSJ 锚点的 genome-wide circRNA 发现
-- 不把 PSI / usage correction 提前到 read-level 基础仍不稳定的阶段
+- 不修改 `.bsj` / `.out`；
+- 不依赖 `bwa mem` remap 作为第一前提；
+- 不从 sidecar 结果反向新增 circ seed；
+- 不做无 BSJ 锚点的 genome-wide circRNA 发现；
+- 不复刻 CIRI-AS `.isoforms/.isoform_summary` 或 CIRI-full RO remap 文件协议；
+- 不把 low-confidence estimate 当作 FASTA sequence candidate。
 
 ## 13. IGV 可视化规划
 
@@ -822,6 +848,8 @@ BSJ 关系的推荐表达方式是“线性 exon / segment track + BSJ arc track
 
 ## 14. 推荐实现顺序
 
+已完成：
+
 1. 去掉 `--as` / `--as-out`，让后处理默认运行
 2. 在 Scan1 写 `<prefix>.bsj1` 的同时写 `<prefix>.segments1`
 3. 在 Scan2 写 `<prefix>.bsj2` 的同时写 `<prefix>.segments2`
@@ -834,8 +862,16 @@ BSJ 关系的推荐表达方式是“线性 exon / segment track + BSJ arc track
 10. 在 sidecar chain selection 中评估 XA-aware alternative alignment，只修复 read-level segments，不改变 CIRI3 parity 主流程
 11. 用 retained shard streaming 进行 junction support collection 与 ambiguous row correction，避免全量 read-level rows 常驻内存
 12. 基于 `<prefix>.segments` 构建 circ-local graph，输出每个 circRNA 的 major isoform GTF/FASTA
-13. 后续再通过 circRNA-level region extraction 补 `forward` / internal linear reads，并重新评估 multi-isoform path 层
-14. 增加 IGV visualization sidecar，把 segment blocks、internal junctions、BSJ arcs 和 confidence tiers 拆成可叠加 review tracks
+13. 增加默认 IGV review sidecar：`<prefix>.bedpe` 和 `<prefix>.segments.bam/.bai`
+
+下一阶段：
+
+1. 从当前 major path builder 中拆出 candidate isoform search space，保留 phase-supported、seed-extended、annotation-guided 和 audit-only tier
+2. 设计 per-circ read-to-isoform assignment / fractional usage 规则，避免 backward/outward reads 在多个 circRNA 或多个 isoform 间重复计数
+3. 输出单样本 isoform usage sidecar，包含 support、usage、confidence tier、structure_hash 和 FASTA eligibility
+4. 实现 multi-sample structure merge：按 circ boundary、strand、structure_hash 和 exon chain 合并，报告 per-sample usage 与 major isoform switching
+5. 用 chr1 simulator truth 同时评估 major accuracy、minor recovery、usage rank correlation 和 false sequence candidate rate
+6. 继续补充 IGV review track，用于人工检查高支持但未进 FASTA 或 usage 分歧明显的 circRNA
 
 ---
-最后更新：2026-05-18
+最后更新：2026-05-19

@@ -25,15 +25,16 @@
 在当前项目里，`vendor/CIRI3` 是唯一的主流程行为规范。
 
 - `Scan1 -> Scan2 -> Summary` 的判定结果必须以 `vendor/CIRI3` 为准。
-- `CIRI-AS` 与 `CIRI-full` 都是下游结构分析或 side evidence，不得反向改写主 CIRI3 的 circRNA 判定。
+- `CIRI-AS` 与 `CIRI-full` 当前都是下游结构分析或 side evidence 的历史参考，不得反向改写主 CIRI3 的 circRNA 判定。
 - Rust 可以重构代码结构、I/O 路径和性能实现，但不能改变 Java 已知的 read-level 决策顺序、过滤条件和输出契约。
 
 推荐把几个上游文档的关系理解为：
 
 ```text
 CIRI3      = 主 BSJ/FSJ 检测规范
-CIRI-AS    = circ 内部结构与 splice evidence 参考
-CIRI-full  = RO/remap/full-length 重构参考
+CIRI-AS    = circ 内部结构与 splice evidence 的历史参考
+CIRI-full  = RO/remap/full-length 重构的历史参考
+CIRI-toolkit segments/isoforms = 当前默认后处理与后续 usage/multi-sample 基础
 ```
 
 本文档的覆盖范围限定为：
@@ -632,13 +633,14 @@ annotation/fasta load
 -> Scan2
 -> Summary
 -> final annotation output
+-> Summary后处理输出 segments / isoforms / review sidecar
 ```
 
-并把以下能力明确隔离在主流程之外：
+并把以下能力明确隔离在 CIRI3 parity 判定之外：
 
-- CIRI-AS sidecar
-- CIRI-full / RO remap
-- full-length isoform reconstruction
+- segments / major isoform / future usage / multi-sample
+- CIRI-AS 历史 sidecar
+- CIRI-full / RO remap 历史路线
 - 任何新的 re-scoring / ranking 试验
 
 理由很直接：

@@ -1,82 +1,125 @@
-# CIRI-toolkit（Rust）
+# CIRI-toolkit
 
-`CIRI-toolkit` 是 CIRI3 的高性能 Rust 实现，实现了高速 BAM/SAM 处理，低内存的同时保证核心 BSJ 检测结果与 Java 版本高度一致。
+`CIRI-toolkit` is a high-performance circRNA detection and isoform reconstruction toolkit for large-scale transcriptome data. It provides CIRI3-compatible BSJ detection, read-level circRNA segment reconstruction, major isoform sequence output, and IGV-ready review tracks.
 
-实测 ~80G BAM (~300G SAM) 文件，CIRI3 总用时 80min (scan1 67min + scan2 14min)。CIRI-toolkit 用时 6 min (1.25min + 4.5min)；提速>10x
+## Performance Benchmarking
 
-后续将优先沿 CIRI-AS 思路加入 circRNA 内部结构与 full-length isoform 后处理能力；RO 相关能力保留为后续 side evidence 方向。
+Benchmark dataset: ~80 GB BAM file (~300 GB SAM).
 
-## 依赖
+| Tool / workflow | Output scope | Runtime |
+|---|---|---:|
+| CIRI3 | BSJ detection | ~80 min |
+| CIRI-toolkit | BSJ detection | ~6 min |
+| CIRI-toolkit | BSJ detection + isoform reconstruction | <20 min |
 
-- rust >= 1.85.0 (Tested with 4d91de4e4 2025-02-17)
-- gcc >= 5
+## Prerequisites
 
-## 安装与构建
+- Rust >= 1.85.0, if building from source
+- GCC >= 5
+- `pigz` or `gzip`
+- `samtools` in `PATH`, or set `SAMTOOLS=/path/to/samtools`
+
+## Installation
+
+Download a prebuilt binary from the [release page](https://bioinfo.ioz.ac.cn/git/zhangjy/CIRI-toolkit/releases), or build from source:
 
 ```bash
+git clone https://bioinfo.ioz.ac.cn/git/zhangjy/CIRI-toolkit.git
+cd CIRI-toolkit
 cargo build --release
+
+# Run the compiled binary
+./target/release/ciri --help
 ```
 
-编译后的可执行文件位于：
+## Quick Start
 
 ```bash
-./target/release/ciri
-./target/release/ciri-simulator
-```
+# Step 1. Align reads with BWA-MEM and write a BAM file.
+bwa mem -t <threads> -T 19 <bwa_index> <R1.fastq.gz> <R2.fastq.gz> \
+  | samtools view -bS -@ <threads> -o <bam_file> -
 
-## 快速开始
-
-```bash
-# Step1. Run bwa-mem
-bwa mem -t <threads> -T 19 <bwa_index> <R1> <R2> > | samtools view -bS -@ <threads> - > <bam_file>
-
-# Step2. Run ciri
+# Step 2. Run CIRI-toolkit.
 ciri \
   -i <bam_file> \
   -o <prefix> \
   -r <reference_fasta> \
   -a <annotation_gtf> \
-  -t <threads> \
-  -s 0 
+  -t <threads>
 ```
 
-常见环形RNA测序数据示例：
+## Usage
 
-```bash
-./target/release/ciri \
-  -i RNA015434_S1.bam \
-  -o RNA015434_S1.ciri \
-  -r /data/public/database/gencode/hg38/_BWAindex/hg38.fa \
-  -a /data/public/database/gencode/hg38/gencode.v44.annotation.gtf \
-  -s 0 \
-  -t 16
+```text
+CIRI-toolkit: fast circRNA detection and isoform reconstruction
+
+Usage: ciri [OPTIONS] --in <IN_SAM> --out <OUT_PREFIX> --ref <REF_FASTA>
+
+Required arguments:
+  -i, --in <SAM/BAM>              Input SAM/BAM file; BAM must not be coordinate-sorted
+  -o, --out <PREFIX>              Output prefix
+  -r, --ref <FASTA>               Reference genome FASTA
+
+Optional arguments:
+  -a, --anno <GTF>                GTF annotation file
+  -m, --mapq <MIN_MAPQ>           Minimum MAPQ for candidate BSJ reads (default: 10)
+  -s, --stringency <LEVEL>        Summary filter level [0/1/2] (default: 0)
+  --min-span <SIZE>               Minimum circRNA span (default: 50)
+  --max-span <SIZE>               Maximum circRNA span (default: 200000)
+  --linear-range-size-min <SIZE>  Linear competition search range size (default: 50000)
+  -t, --threads <THREADS>         Number of worker threads (default: auto)
+  -M, --mem-per-thread <MEM>      Maximum memory per thread (default: 512M; e.g., 2G)
+
+Review and debugging arguments:
+  --trace <READS>                 Comma-separated read IDs to trace in Scan1/Scan2
+  --debug                         Keep internal pipeline temporary files
+  --perf                          Write profiling report to <prefix>.perf.log
+  --continue                      Rebuild isoforms only from existing <prefix>.out + <prefix>.segments
+  -h, --help                      Print help
+  -v, --version                   Print version
 ```
 
-## 参数说明
-- `-i, --in`：输入文件（SAM 或 BAM）
-- `-o, --out`：输出前缀
-- `-r, --ref`：参考基因组 FASTA
-- `-a, --anno`：注释文件 GTF（可选）
-- `-m, --mapq`：最小 MAPQ（默认 `10`，与 CIRI3 `-U` 默认一致）
-- `-s, --stringency`：过滤等级（`0/1/2`，默认 `2`，与 CIRI3 `-S` 默认一致）
-- `--min-span`：最小环长（默认 `140`，与 CIRI3 `-Min` 默认一致）
-- `--max-span`：最大环长（默认 `200000`，与 CIRI3 `-Max` 默认一致）
-- `--linear-range-size-min`：线性竞争区间（默认 `50000`）
-- `-t, --threads`：线程数（默认为CPU可用核心数）
-- `-M, --mem-per-thread`：每线程内存预算（如 `2G`、`512M`，默认 `512M`）
-- `--trace`：逗号分隔的 read ID 列表，输出详细追踪到 `<prefix>.trace.log`
-- `--debug`：保留内部临时文件（如 `.bsj1/.bsj2/.segments1/.segments2` 和 shard sidecar）
-- `--perf`：开启 profiling，自动写到 `<prefix>.perf.log`
-- `--continue`：作为附加执行模式，从已完成的合并断点继续；所有普通运行必需参数仍需正常指定。若 `<prefix>.segments` 已存在，则只重建 isoform GTF/FASTA；否则若 `<prefix>.out` 和 `<prefix>.bsj` 已存在，则重建 segments + isoforms
+**Note:** CIRI-toolkit keeps the CIRI3 BSJ detection, Scan2 rescue, and Summary stringency formulas, but its default command-line policy is tuned for downstream segment and isoform reconstruction. CIRI-toolkit defaults to `-s 0 --min-span 50`, while CIRI3 defaults to `-S 2 -Min 140`. To use the same filtering policy as CIRI3, run CIRI-toolkit with `-s 2 --min-span 140`.
 
-> 默认参数已对齐 CIRI3，推荐使用 `-s 0` 输出所有潜在 circRNA 后手动过滤，其他参数一般无需手动设置。
+## Outputs
 
-`ciri` 是主分析入口。`ciri-simulator` 是开发用模拟器，用于生成 paired FASTQ、linear annotation 和结构化 truth TSV。
+The main output files are:
 
-`ciri-simulator` 示例：
+- `<prefix>.out`: CIRI3-compatible circRNA result table
+- `<prefix>.bsj`: mate-level BSJ evidence display used for review/debugging
+- `<prefix>.segments`: read-level BSJ/backward/outward segment chains
+- `<prefix>.isoforms.gtf`: major isoform structure audit table for all reported circRNAs
+- `<prefix>.isoforms.fa`: high-confidence major circRNA isoform sequences
+- `<prefix>.bedpe`: IGV-compatible BSJ anchor track
+- `<prefix>.segments.bam` and `<prefix>.segments.bam.bai`: IGV-compatible synthetic segment alignments
+- `<prefix>.log`: run log
+
+## `.out` Format
+
+`<prefix>.out` uses the CIRI3-compatible 13-column format:
+
+```text
+1.  circRNA_ID
+2.  chr
+3.  circRNA_start
+4.  circRNA_end
+5.  #junction_reads
+6.  SM_MS_SMS
+7.  #non_junction_reads
+8.  junction_reads_ratio
+9.  circRNA_type
+10. gene_id
+11. strand
+12. junction_reads_ID
+13. Score
+```
+
+## Generate a simulation dataset with `ciri-simulator`
+
+CIRI-toolkit also includes `ciri-simulator`, which generates paired-end circRNA reads and structured truth tables from a reference genome and annotation.
 
 ```bash
-./target/release/ciri-simulator \
+ciri-simulator \
   -r <reference_fasta> \
   -a <source_gtf> \
   -o <prefix> \
@@ -87,71 +130,9 @@ ciri \
   --seed 5
 ```
 
-模拟器正式输出：
+Simulator outputs:
 
-- `<prefix>_1.fq.gz`
-- `<prefix>_2.fq.gz`
-- `<prefix>.annotation.gtf`
-- `<prefix>.isoforms.tsv`
-- `<prefix>.reads.tsv`
-
-## 输出文件
-
-当 `-o <prefix>` 时，程序会生成：
-
-- 环形RNA识别结果：`<prefix>.out`
-- 运行日志：`<prefix>.log`
-- BSJ reads 比对情况：`<prefix>.bsj`
-- read-level circRNA segment 解释：`<prefix>.segments`
-- major circRNA isoform 结构：`<prefix>.isoforms.gtf`
-- major circRNA isoform 序列：`<prefix>.isoforms.fa`
-- IGV BSJ arc track：`<prefix>.bedpe`
-- IGV read segment track：`<prefix>.segments.bam` / `<prefix>.segments.bam.bai`
-
-内部临时文件（如 `<prefix>.bsj1`、`<prefix>.bsj2`、`<prefix>.segments1`、`<prefix>.segments2`、`<prefix>.segments.non_bsj.part_XXXX.tmp`）默认在成功运行后删除；需要排查时可用 `--debug` 保留。
-
-`<prefix>.bedpe` 在 `.out` 写出后同步生成，每个 circRNA 一条 BSJ anchor pair，不表达内部结构，score 使用原始 `#junction_reads`。`<prefix>.segments.bam` 在 `.segments` 写出后生成合成 alignment track，并同步写出 `.bai`，适合作为大数据 IGV review 的主入口；internal junction 用 `N` CIGAR 表达，遇到 `<bsj>` / `B` marker 时拆成同 read 的多条 alignment，`YC`/`RG`/`ZT`/`CI` tags 记录颜色、read group、read type 和 circRNA 来源。IGV 中可对该 track 选择 `Color alignments by -> tag -> YC` 使用固定 RGB，或选择按 read group 区分 `bsj/backward/outward`。
-
-`--continue` 只使用已合并、可校验的断点文件，不把 `.part_XXXX.tmp` 或其他 shard-local 临时文件当作可恢复状态。
-
-## 结果格式
-
-最终 `.out` 为 13 列，兼容 CIRI3 常见下游分析：
-1. `circRNA_ID`
-2. `chr`
-3. `circRNA_start`
-4. `circRNA_end`
-5. `#junction_reads`
-6. `SM_MS_SMS`
-7. `#non_junction_reads`
-8. `junction_reads_ratio`
-9. `circRNA_type`
-10. `gene_id`
-11. `strand`
-12. `junction_reads_ID`
-13. `Score`
-
-最终 `.bsj` 为无 header TSV，前 3 列用于区分 read pair 与 mate-level evidence：
-
-```text
-read_id  mate_label  priority  <CIGAR payload>  <判定结果 payload>  source_stage
-```
-
-- `mate_label` 为 `R1` 或 `R2`。
-- `priority=1` 表示该行参与 `.out` 的 CIRI3-compatible Summary。
-- `priority=0` 表示同一 read pair 的附加 mate-level BSJ evidence；它会保留给后续内部 splice site 识别，但不会增加 `.out` 的 junction read count。
-- `source_stage` 为 `scan1` 或 `scan2`。
-
-## 开发文档
-
-开发、对齐排障、性能优化与验证说明统一放在 `docs/`：
-
-- 文档导航：`docs/00-index.md`
-- 项目状态：`docs/01-development-status.md`
-- 对齐排障手册：`docs/02-parity-debug-playbook.md`
-- 性能优化总结：`docs/03-performance-optimization.md`
-- 模拟数据与 truth 输出设计：`docs/06-simulation-truth-design.md`
-- CIRI-AS-style full-length 结构识别设计：`docs/07-full-length-reconstruction.md`
-
----
-最后更新：2026-05-13
+- `<prefix>_1.fq.gz` and `<prefix>_2.fq.gz`: simulated paired-end reads
+- `<prefix>.annotation.gtf`: masked linear annotation for de novo evaluation
+- `<prefix>.isoforms.tsv`: isoform-level truth table
+- `<prefix>.reads.tsv`: read-pair-level truth table
