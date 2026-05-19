@@ -24,6 +24,7 @@
 - **下一阶段目标**：围绕同一 circRNA 的多个候选 isoform 建立 usage 计算、置信度分层和 multi-sample integration；重点是比较 major isoform switching、结构稳定性和样本间 usage 变化，而不是沿 CIRI-AS / CIRI-full / RO remap 路线继续复刻历史输出。
 - **证据边界**：BSJ/backward/outward segments 是当前 isoform 图的主要证据层。后续新增 evidence 必须先进入审计字段或 sidecar，不能反向改变 `.out/.bsj/.segments` 的既有判定。
 - **文档优先**：isoform usage、多样本整合、输出协议或证据分层发生变化时，必须同步更新 `docs/07-full-length-reconstruction.md`、`docs/01-development-status.md` 和必要的用户文档。
+- **项目本地 skills**：CIRI 专用重复工作流保存在 `.agents/skills/`。涉及 segments / isoform / FASTA 可信度评估时优先读取 `.agents/skills/ciri-segments-isoform-eval/SKILL.md`；涉及 release、README、AGENTS 或开发文档同步时优先读取 `.agents/skills/ciri-release-and-doc-sync/SKILL.md`。
 
 ## 代码注释规范
 - **Rust 文档化注释是强约束**：`src/` 下新增或修改的模块、结构体、函数都应补齐规范的 Rust 文档注释。
