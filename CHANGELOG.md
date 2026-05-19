@@ -24,13 +24,11 @@ The format is based on Keep a Changelog, adapted to the current release flow of
 
 ### Verified
 - Verified `tests/chr1` BAM and SAM runs against Java CIRI3 with zero
-  circ/read/read-assignment/FSJ differences using
-  `scripts/ciri_result_diff.py`.
+  circ/read/read-assignment/FSJ differences.
 
 ## [0.1.1] - 2026-03-24
 
 ### Added
-- Added `scripts/ciri_result_diff.py` FSJ parity reporting for shared circRNAs.
 - Added `<prefix>.log` as a first-class pipeline output so stage summaries and
   runtime information are preserved outside the terminal session.
 - Added CLI `--debug <read_id_list>` to trace selected reads through the
@@ -70,7 +68,7 @@ The format is based on Keep a Changelog, adapted to the current release flow of
 ### Fixed
 - Fixed Scan2 FSJ counting drift on whole-genome BAM inputs. With the verified
   hg38 FASTA/GTF pairing, shared-circ `#non_junction_reads` now match Java
-  exactly (`fsj_diff=0` in `scripts/ciri_result_diff.py`).
+  exactly.
 - Fixed Scan2 whole-genome parity regressions caused by BAM mate-switch handling
   within supplementary-heavy read groups.
 - Fixed documentation drift so debugging, parity checking, and release-state
