@@ -47,7 +47,7 @@ CIRI-toolkit 是 CIRI3（Java）的 Rust 复现版本，目标是在保持判定
   - 相同 GTF 版本
   - 相同 stringency 参数
   - 关闭所有 trace/profile 环境变量
-- chr1 simulator truth 上当前 FASTA isoform 评估口径为：FASTA `7919` 条，其中 `7870` 条有对应 truth circRNA；严格匹配 truth major isoform `77.64%`，严格匹配任意 truth isoform `86.72%`，junction chain 匹配任意 truth isoform `87.33%`。其中 `mature` FASTA exact-any 为 `94.38%`，`estimate` FASTA exact-any 为 `85.88%`。这些指标用于评估 sequence candidate 可信度，不替代 `.out/.bsj/.segments` 的 parity 验收。
+- chr1 simulator truth 上当前 read-level segments / major isoform 评估口径为：`tmp/chain_final` 完整流程输出 `10813` 条高可信 FASTA isoform；在有 truth circRNA 的 `13643` 个预测 circRNA 上，major isoform exon-chain 严格匹配率为 `83.89%`，1 bp 容忍为 `84.06%`，2 bp 容忍为 `84.23%`。这些指标用于评估 sequence candidate 可信度，不替代 `.out/.bsj/.segments` 的 parity 验收。
 
 统一校验命令：
 
@@ -87,9 +87,9 @@ python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI.r
 
 ## 后续开发计划
 - 高优先级功能点：在当前 `priority` 协议基础上继续推进真正的 paired-end R1/R2 BSJ 决策。当前默认路径仍采用 CIRI3 read-pair first-hit 语义；后续更合理的方向是先做 mate-level candidate 收集，再做 pair-level 决策，最后仍按 read-pair-level 计数。R1/R2 支持同一 BSJ 时应记录一致支持，支持不同 BSJ 时应显式标记冲突或 ambiguity。
-- 当前 read-level segments reconstruction 和 major isoform 输出已进入可用的第一版：以 Summary confirmed BSJ、Scan1/Scan2 sidecar evidence 和 non-BSJ topology sidecar 为输入，默认输出 `<prefix>.segments`、`<prefix>.isoforms.gtf`、可信度更严格的 `<prefix>.isoforms.fa`，以及用于 IGV review 的 `<prefix>.bedpe` / `<prefix>.segments.bam`。
+- 当前 read-level segments reconstruction 和 major isoform 输出已进入可用的第一版：以 Summary confirmed BSJ、Scan1/Scan2 sidecar evidence 和 non-BSJ topology sidecar 为输入，默认输出 `<prefix>.segments`、`<prefix>.isoforms.gtf`、可信度更严格的 `<prefix>.isoforms.fa`，以及用于 IGV review 的 `<prefix>.bedpe` / `<prefix>.segments.bam`。Scan1/Scan2 segments sidecar 会携带 short-form `cs` 与原始 BWA `XA:Z` payload；这些信息只用于 post-Summary read-level chain selection，不改变 `.out/.bsj` 主流程判定。
 - 当前默认后处理不依赖 RO remap，不新增 circ seed，不改变 `priority=1` 主流程证据和 `.out`；isoform 阶段从已写出的 `<prefix>.segments` 重新解析，方便 `--continue` 调试和后续多样本整合。
-- IGV visualization sidecar 当前先提供两个最小 track：`.bedpe` 在 `.out` 写出时展示识别到的 BSJ anchor pair，`.segments.bam/.bai` 在 `.segments` 写出时以合成 alignment 展示 bsj/backward/outward read 的 R1/R2 aligned blocks。BAM 中 internal junction 用 `N` CIGAR，`<bsj>` / `B` marker 拆成同 read 的多条 alignment，并写入 `YC` 与 `RG` tags 供 IGV 按固定 RGB 或 read group 着色。后续再补 internal junction arcs、confidence tier tracks 和 per-circ mini-BAM/read-list。
+- IGV visualization sidecar 当前先提供两个最小 track：`.bedpe` 在 `.out` 写出时展示识别到的 BSJ anchor pair，`.segments.bam/.bai` 在 `.segments` 写出时以合成 alignment 展示 bsj/backward/outward read 的 R1/R2 aligned blocks。BAM 中 internal junction 用 `N` CIGAR，`<bsj>` / `B` marker 或 chain 内坐标回跳会拆成同 read 的多条 alignment；当 `r*_cs` 与拆分后的 part span 一致时同步重建 `SEQ`、part-level `cs:Z` 和含 `I/D/N/M` 的 BAM CIGAR，否则回退为 `N` 序列。`YC` 与 `RG` tags 供 IGV 按固定 RGB 或 read group 着色。后续再补 internal junction arcs、confidence tier tracks 和 per-circ mini-BAM/read-list。
 - CIRI-AS / CIRI-full 不再作为当前开发路线；后续不以完整复刻其历史输出为目标。相关文档只保留为历史参考、算法术语解释和风险清单，代码中不再使用的 CIRI-AS/cirexon/full-length path 旧实现应删除。
 - CIRI-AS sidecar 的 splice signal 阶段已明确采用 annotation-aware motif / strand / offset tie-break：当 annotation exon boundary 支持某个解释时，优先于 Perl v1.2 的 `AC/CT elsif AG/GT` 与 hash-order offset 行为；这是有意偏离 Perl 输出、追求稳定和边界可解释性的设计选择。
 - CIRI-AS sidecar 的 splice signal 阶段、annotation-aware motif / strand / offset tie-break 与 read-group 识别逻辑继续保留，用于支撑 `<prefix>.segments` 的 best-chain 选择和 segment 边界解释。
@@ -108,4 +108,4 @@ python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI.r
 - CIRI-AS / CIRI-full 相关文档当前只作为历史参考，不作为强制兼容契约；仍被当前 segments 逻辑复用的 annotation-aware offset/strand 判断，必须在代码注释和 `docs/CIRI-AS.md` 同步维护。
 
 ---
-最后更新：2026-05-19
+最后更新：2026-05-20

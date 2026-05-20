@@ -10,14 +10,21 @@ use crate::is_bsj_hg2::{java_substring, report_scan1_hg_profile, IsBSJHg2};
 use crate::misd::misd;
 use crate::runtime::{emit_perf_line, emit_trace_line, scan1_profile_enabled, should_trace_read};
 use crate::utils::{
-    bam_shard_count, clip_sequence_payload, local_clip_evidence_lines, part_path, AlignmentRecord,
+    alignment_short_cs, bam_shard_count, clip_sequence_payload, local_clip_evidence_lines,
+    part_path, AlignmentRecord,
 };
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use noodles::sam::{
     self,
-    alignment::{record::Sequence as _, Record as _},
+    alignment::{
+        record::{
+            data::field::{Tag, Value},
+            Data as _, Sequence as _,
+        },
+        Record as _,
+    },
 };
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -53,6 +60,58 @@ pub struct Scan1 {
 
 type OwnedAlignmentRecord = AlignmentRecord<'static>;
 type OwnedStandMap = HashMap<i32, (char, Cow<'static, str>)>;
+
+/// Returns a stable text payload for one optional `XA:Z` field.
+///
+/// Empty alternatives are written as `*` in the Scan1 sidecar so the protocol
+/// has an explicit missing value while preserving raw BWA payloads unchanged
+/// when post-Summary segment selection needs them.
+fn xa_payload(raw: &str) -> &str {
+    if raw.is_empty() {
+        "*"
+    } else {
+        raw
+    }
+}
+
+/// Extracts a raw BWA `XA:Z` payload from one SAM record.
+///
+/// Scan1's CIRI3 decision logic ignores this optional tag. It is retained only
+/// for the segments sidecar, where a confirmed BSJ read can prefer a
+/// circRNA-compatible alternative over a paralogous primary alignment.
+fn raw_xa_from_sam_record(record: &sam::Record) -> Result<String> {
+    let tag = Tag::new(b'X', b'A');
+    let data = record.data();
+    let Some(value) = data.get(&tag).transpose()? else {
+        return Ok(String::new());
+    };
+    let Value::String(raw) = value else {
+        return Ok(String::new());
+    };
+    let Ok(raw) = std::str::from_utf8(raw.as_ref()) else {
+        return Ok(String::new());
+    };
+    Ok(raw.to_string())
+}
+
+/// Extracts a raw BWA `XA:Z` payload from one BAM record.
+///
+/// This mirrors [`raw_xa_from_sam_record`] for the sharded BAM hot path and
+/// deliberately treats malformed or non-string tags as absent sidecar evidence.
+fn raw_xa_from_bam_record(record: &noodles::bam::Record) -> Result<String> {
+    let tag = Tag::new(b'X', b'A');
+    let data = record.data();
+    let Some(value) = data.get(&tag).transpose()? else {
+        return Ok(String::new());
+    };
+    let Value::String(raw) = value else {
+        return Ok(String::new());
+    };
+    let Ok(raw) = std::str::from_utf8(raw.as_ref()) else {
+        return Ok(String::new());
+    };
+    Ok(raw.to_string())
+}
 
 /// Owned SAM read-group payload passed from the sequential parser thread to the
 /// parallel candidate-evaluation workers.
@@ -614,6 +673,7 @@ impl Scan1 {
                 mapq,
                 cigar: Cow::Owned(cigar_buf.clone()),
                 seq: Cow::Owned(seq),
+                xa: Cow::Owned(raw_xa_from_sam_record(&record)?),
             });
             align_num += 1;
             records_since_progress += 1;
@@ -1093,6 +1153,7 @@ impl Scan1 {
         read_id: &str,
         stage: &str,
         group: &[Vec<AlignmentRecord<'a>>; 2],
+        reference: &HashMap<String, String>,
     ) -> Vec<String> {
         let mut rows = Vec::new();
         for bucket in group {
@@ -1102,8 +1163,15 @@ impl Scan1 {
                 }
                 let mate = if aln.flag & 0x40 != 0 { "R1" } else { "R2" };
                 let clips = clip_sequence_payload(aln.cigar.as_ref(), aln.seq.as_ref());
+                let cs = alignment_short_cs(
+                    aln.cigar.as_ref(),
+                    aln.seq.as_ref(),
+                    aln.chrom.as_ref(),
+                    aln.pos,
+                    reference,
+                );
                 rows.push(format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     read_id,
                     stage,
                     mate,
@@ -1113,7 +1181,9 @@ impl Scan1 {
                     aln.mapq,
                     aln.cigar,
                     aln.seq.len(),
-                    clips
+                    clips,
+                    cs,
+                    xa_payload(aln.xa.as_ref())
                 ));
             }
         }
@@ -1129,7 +1199,7 @@ impl Scan1 {
         bsj_lines: &[String],
         fasta_map: &HashMap<String, String>,
     ) -> Vec<String> {
-        let mut rows = Self::segment_evidence_lines(read_id, stage, group);
+        let mut rows = Self::segment_evidence_lines(read_id, stage, group, fasta_map);
         let alignments: Vec<&AlignmentRecord<'_>> =
             group.iter().flat_map(|bucket| bucket.iter()).collect();
         rows.extend(local_clip_evidence_lines(
@@ -1468,6 +1538,7 @@ impl Scan1 {
                 mapq,
                 cigar: Cow::Owned(cigar_buf.clone()),
                 seq: Cow::Owned(seq),
+                xa: Cow::Owned(raw_xa_from_bam_record(&record)?),
             });
             align_num += 1;
         }

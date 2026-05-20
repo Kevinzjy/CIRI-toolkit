@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as FmtWrite;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClipPlacement {
@@ -35,6 +36,12 @@ pub struct AlignmentRecord<'a> {
     pub mapq: i32,
     pub cigar: Cow<'a, str>,
     pub seq: Cow<'a, str>,
+    /// Raw BWA `XA:Z` payload retained for post-Summary segment selection.
+    ///
+    /// Core CIRI3 parity logic ignores optional tags, but the segments sidecar
+    /// needs mapper alternatives to avoid choosing a paralogous primary
+    /// alignment when a confirmed circRNA-compatible placement is available.
+    pub xa: Cow<'a, str>,
 }
 
 /// Returns the reverse complement of a DNA sequence.
@@ -112,6 +119,121 @@ pub fn clip_sequence_payload(cigar: &str, seq: &str) -> String {
     } else {
         fields.join(",")
     }
+}
+
+/// Builds a minimap2-compatible short-form cs payload for one mapper alignment.
+///
+/// This is used by Scan1/Scan2 sidecars to retain allele bases without spilling
+/// full read sequences. The payload intentionally stays in standard short-form
+/// cs syntax here; CIRI's custom `<...>` back-splice op is added later when the
+/// post-Summary chain materializer joins selected blocks across a BSJ boundary.
+pub fn alignment_short_cs(
+    cigar: &str,
+    seq: &str,
+    chrom: &str,
+    pos: i32,
+    reference: &HashMap<String, String>,
+) -> String {
+    if seq.is_empty() || seq == "*" || pos <= 0 {
+        return "*".to_string();
+    }
+    let Some(chr_seq) = reference.get(chrom) else {
+        return "*".to_string();
+    };
+    let Some(ops) = parse_cigar_ops_basic(cigar) else {
+        return "*".to_string();
+    };
+    let mut out = String::new();
+    let mut matches = 0usize;
+    let mut read_idx = 0usize;
+    let mut ref_pos = pos;
+    let seq = seq.to_ascii_lowercase();
+    for (len, op) in ops {
+        if len < 0 {
+            return "*".to_string();
+        }
+        let len = len as usize;
+        match op {
+            'M' | '=' | 'X' => {
+                let start = (ref_pos - 1) as usize;
+                let end = start + len;
+                let Some(reference_part) = chr_seq.get(start..end) else {
+                    return "*".to_string();
+                };
+                let Some(query_part) = seq.get(read_idx..read_idx + len) else {
+                    return "*".to_string();
+                };
+                for (ref_base, query_base) in reference_part.chars().zip(query_part.chars()) {
+                    let ref_base = ref_base.to_ascii_lowercase();
+                    let query_base = query_base.to_ascii_lowercase();
+                    if ref_base.eq_ignore_ascii_case(&query_base) {
+                        matches += 1;
+                    } else {
+                        flush_short_cs_match(&mut out, &mut matches);
+                        out.push('*');
+                        out.push(ref_base);
+                        out.push(query_base);
+                    }
+                }
+                read_idx += len;
+                ref_pos += len as i32;
+            }
+            'I' => {
+                let Some(query_part) = seq.get(read_idx..read_idx + len) else {
+                    return "*".to_string();
+                };
+                flush_short_cs_match(&mut out, &mut matches);
+                out.push('+');
+                out.push_str(query_part);
+                read_idx += len;
+            }
+            'D' => {
+                let start = (ref_pos - 1) as usize;
+                let end = start + len;
+                let Some(reference_part) = chr_seq.get(start..end) else {
+                    return "*".to_string();
+                };
+                flush_short_cs_match(&mut out, &mut matches);
+                out.push('-');
+                out.push_str(&reference_part.to_ascii_lowercase());
+                ref_pos += len as i32;
+            }
+            'N' => {
+                flush_short_cs_match(&mut out, &mut matches);
+                let donor =
+                    reference_dinucleotide_lower(chr_seq, ref_pos).unwrap_or_else(|| "nn".into());
+                let acceptor = reference_dinucleotide_lower(chr_seq, ref_pos + len as i32 - 2)
+                    .unwrap_or_else(|| "nn".into());
+                let _ = write!(&mut out, "~{}{}{}", donor, len, acceptor);
+                ref_pos += len as i32;
+            }
+            'S' => read_idx += len,
+            'H' | 'P' => {}
+            _ => return "*".to_string(),
+        }
+    }
+    flush_short_cs_match(&mut out, &mut matches);
+    if out.is_empty() {
+        "*".to_string()
+    } else {
+        out
+    }
+}
+
+fn flush_short_cs_match(out: &mut String, matches: &mut usize) {
+    if *matches > 0 {
+        let _ = write!(out, ":{}", *matches);
+        *matches = 0;
+    }
+}
+
+fn reference_dinucleotide_lower(chr_seq: &str, start: i32) -> Option<String> {
+    if start <= 0 {
+        return None;
+    }
+    let start = (start - 1) as usize;
+    let end = start + 2;
+    chr_seq.get(start..end).map(|seq| seq.to_ascii_lowercase())
 }
 
 /// Adds pseudo-alignment rows for local clip evidence accepted with BSJ calls.
@@ -199,8 +321,9 @@ pub fn local_clip_evidence_lines<'a>(
                         continue;
                     }
                     let mate = if flag & 0x40 != 0 { "R1" } else { "R2" };
+                    let cs = alignment_short_cs(&cigar, aln.seq.as_ref(), &chr, pos, reference);
                     rows.push(format!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t*",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t*\t{}\t*",
                         read_id,
                         stage,
                         mate,
@@ -209,7 +332,8 @@ pub fn local_clip_evidence_lines<'a>(
                         pos,
                         aln.mapq.saturating_sub(1),
                         cigar,
-                        read_len
+                        read_len,
+                        cs
                     ));
                 }
             }
@@ -583,6 +707,7 @@ mod tests {
             mapq: 60,
             cigar: Cow::Borrowed("16S134M"),
             seq: Cow::Owned(seq),
+            xa: Cow::Borrowed(""),
         };
         let bsj_lines = vec!["read1\tx\ty\tchr1\t100\t199".to_string()];
 
@@ -597,7 +722,7 @@ mod tests {
 
         assert_eq!(
             rows,
-            vec!["read1\tscan1_local\tR1\t2128\tchr1\t180\t59\t16M134S\t150\t*"]
+            vec!["read1\tscan1_local\tR1\t2128\tchr1\t180\t59\t16M134S\t150\t*\t:16\t*"]
         );
     }
 
@@ -615,6 +740,7 @@ mod tests {
             mapq: 60,
             cigar: Cow::Borrowed("16S134M"),
             seq: Cow::Owned(seq),
+            xa: Cow::Borrowed(""),
         };
         let bsj_lines = vec!["read1\tx\ty\tchr1\t100\t250".to_string()];
 
@@ -629,7 +755,7 @@ mod tests {
 
         assert_eq!(
             rows,
-            vec!["read1\tscan1_local\tR1\t2112\tchr1\t180\t59\t15M135S\t150\t*"]
+            vec!["read1\tscan1_local\tR1\t2112\tchr1\t180\t59\t15M135S\t150\t*\t:15\t*"]
         );
     }
 
@@ -647,6 +773,7 @@ mod tests {
             mapq: 60,
             cigar: Cow::Borrowed("27S123M"),
             seq: Cow::Owned(seq),
+            xa: Cow::Borrowed(""),
         };
         let bsj_lines = vec!["read1\tx\ty\tchr1\t100\t250".to_string()];
 
@@ -661,7 +788,7 @@ mod tests {
 
         assert_eq!(
             rows,
-            vec!["read1\tscan1_local\tR2\t2176\tchr1\t200\t59\t12S15M123S\t150\t*"]
+            vec!["read1\tscan1_local\tR2\t2176\tchr1\t200\t59\t12S15M123S\t150\t*\t:15\t*"]
         );
     }
 

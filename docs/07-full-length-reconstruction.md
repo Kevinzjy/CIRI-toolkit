@@ -166,6 +166,8 @@ mapq
 cigar
 read_len
 clips
+alignment_cs
+raw_xa
 ```
 
 语义：
@@ -174,6 +176,8 @@ clips
 - `mate` 取 `R1` / `R2`，方便人工排查；
 - `flag/chrom/pos/mapq/cigar/read_len` 是最终 chain reconstruction 需要的 mapper block；
 - `clips` 只在 CIGAR 含 soft clip 时写入 `L:<seq>` / `R:<seq>` clipped subsequence，否则写 `*`，用于追踪 validator 接受时可定位的 clip 序列；
+- `alignment_cs` 是当前 mapper block 的 short-form cs payload，只用于在最终 `<prefix>.segments` 中生成 chain-level `r1_cs/r2_cs`；内部 sidecar 不保存 full read sequence；
+- `raw_xa` 是原始 BWA `XA:Z` payload，缺失时写 `*`；它只进入 post-Summary chain selection，用于在已确认 circRNA context 下替换明显落到重复/旁系位点的 mate block，不参与 Scan1 / Scan2 / Summary 的 BSJ 判定；
 - validator 接受 BSJ 后，长度 `>=10bp` 且能在 circ 区间 exact match 的 soft clip 会在同一 sidecar 中追加为 `scan1_local` / `scan2_local` pseudo-alignment row；若整段 clip 无法 exact match，则允许记录最长 prefix/suffix partial exact match，但仍要求 retained match 长度 `>=10bp`；
 - 最终 `<prefix>.segments` 会用 `<prefix>.out` 的 `junction_reads_ID` 过滤 confirmed BSJ reads；`type=backward` / `type=outward` rows 来自 Scan2 non-BSJ topology sidecar 或兼容 fallback 扫描中的非 BSJ read groups；
 - sidecar 文件不得反向影响 `.bsj1` / `.bsj2` / `.out`。
@@ -226,8 +230,10 @@ is_r2_bsj
 r1_align_strand
 r2_align_strand
 r1_cigar
+r1_cs
 r1_segments
 r2_cigar
+r2_cs
 r2_segments
 ```
 
@@ -369,13 +375,53 @@ r1_segments = 240-260:+|<bsj>|100-149:+|180-199:+
 r1_cigar    = 5S21M90B50M30N20M4S
 ```
 
+### 6.2 `r1_cs` / `r2_cs`
+
+`r1_cs` / `r2_cs` 是与 `r1_cigar` / `r2_cigar` / `r1_segments` / `r2_segments` 同步的 chain-level short-form cs payload，用于在不重新扫描 BAM/FASTQ 的情况下保留 allele base 差异信息。它不是原始 mapper `cs:Z` tag 的直接拷贝，而是 CIRI 在最终 read-chain block 上重新 materialize 的 compact sequence-difference record。
+
+当前只使用 short form，不输出 long form。基础 op 沿用 minimap2 `cs` 语义：
+
+```text
+:[0-9]+
+*[acgtn][acgtn]
++[acgtn]+
+-[acgtn]+
+~[acgtn]{2}[0-9]+[acgtn]{2}
+```
+
+CIRI 额外定义一个 back-spliced op：
+
+```text
+<[acgtn]{2}[0-9]+[acgtn]{2}
+```
+
+其中 `<` 表示 read-chain 跨过 BSJ/back-splice boundary；前后两个 dinucleotide 来自对应 skipped reference interval 两端，数字长度必须与同一位置 `r*_cigar` 中的 `B` 长度一致。若边界 reference 无法取得，使用 `nn`。普通 intron / linear skipped interval 仍使用 `~`。
+
+示例：
+
+```text
+r1_segments = 240-260:+|<bsj>|100-149:+|180-199:+
+r1_cigar    = 5S21M90B50M30N20M4S
+r1_cs       = :21<gt90ag:48*ag:1~gt30ag:20
+```
+
+约束：
+
+- `r*_cs` 的 op 顺序必须和同一 mate 的 `r*_cigar` / `r*_segments` read-chain order 一致；
+- `r*_cs` 的 query bases 必须和同一 mate 的最终 chain CIGAR 方向一致；当输出链对应反向比对时，query block 先 reverse-complement 后再与 reference 生成 `*refquery` / `+query` payload，语义与 SAM 中 `0x10` 记录的 `SEQ` / `cs:Z` 方向保持一致；
+- 每个 `<...>` op 必须对应一个 `B` 和一个 `<bsj>` boundary；
+- 每个 `~...` op 必须对应一个 `N` skipped interval；
+- mate 没有 retained chain 时写 `NA`；有 chain 但缺少 sequence 或 reference 时写 `*`；
+- `.segments.bam` writer 会按 `<bsj>` / `<...>` 以及没有显式 `<bsj>` 的坐标回跳把 chain 拆成多条 part alignment，并在每个 part 上用 reference + part-level cs 重建 `SEQ`、`cs:Z` 和 BAM CIGAR；合法 `+/-` 会写成 `I/D`。如果某个 part 的 cs reference span 与 segment span 不一致，该 part 回退为 `N` 序列且不写 `cs:Z`，避免输出不一致 BAM。
+- non-BSJ local clip exact placement 只在 clipped subsequence 与候选 reference window 完全一致时生成，因此它的 sidecar `cs` 可以写成 `:<len>`；这保证后续 BAM writer 不需要重新扫描 FASTQ/BAM 也能为该伪对齐 part 写出实际 sequence。
+
 当前过渡期仍保留 `is_r1_bsj` / `is_r2_bsj`，原因是：
 
 - 方便验证脚本在不解析 CIGAR 的情况下做快速统计；
 - 兼容已有 simulator truth 和当前评估口径；
 - 后续确认所有 BSJ-local alignment 都能 materialize 到 `B` 后，可以再讨论是否移除。
 
-### 6.2 internal splice boundary 校正
+### 6.3 internal splice boundary 校正
 
 最终 `<prefix>.segments` 写出前，会对 read-chain 相邻 segment 之间的普通 `N` junction 做边界校正：
 
@@ -524,12 +570,13 @@ approximate local junction rescue 暂不进入当前 `<prefix>.segments` strong 
 
 - Java CIRI3 Scan1 / Scan2 不解析 SAM optional tags；它只从每条 SAM record 中取 `flag / chr / pos / MAPQ / CIGAR / SEQ`，因此没有显式处理 `XA`；
 - Java CIRI3 也不解析 `SA:Z` 字符串；`SA` 的作用只来自 aligner 已经 materialize 成独立 SAM/BAM record 的 supplementary alignment；
-- Rust CIRI3 parity 主流程保持同一边界，不在 Scan1 / Scan2 / Summary 中读取 aux tag；
-- 当前 CIRI-AS / segments chain builder 会把 primary + supplementary record 作为优先链，并只在这条链不成立时考虑 secondary fallback，但它还看不到未展开的 `XA` alternative。
+- Rust CIRI3 parity 主流程保持同一边界，Scan1 / Scan2 / Summary 的 BSJ 判定不读取 aux tag；但 Scan1 / Scan2 会把原始 `XA:Z` payload 透传到内部 segments sidecar，供 post-Summary read-level chain selection 使用；
+- 当前 CIRI-AS / segments chain builder 会先把 primary + supplementary record 作为候选链，再在 confirmed circRNA context 中评估 sidecar 携带的 `XA` alternative，必要时只修正最终 read-level segments。
 
 当前已在 post-Summary segments / CIRI-AS sidecar 中实现 XA-aware 修正与 negative filter：
 
 - 将 `XA` 解析成低优先级 alternative alignment block，只用于 read-level sidecar chain 修正或拒绝弱 `type=backward`，不是 BSJ strong evidence；
+- 对 confirmed `type=bsj` row 的非 BSJ mate，若 primary block 落在远端重复位点，而同一 record 的 `XA` 与已确认 circRNA span 同染色体、同 strand 且 overlap 达到最小可信长度，则用 circ-context ranking 选择更合理的 mate chain；
 - 对 selected chain 中 `MAPQ=0` 的原始 alignment record，包括 primary 和 supplementary，寻找 `XA` 中 read-coordinate 几乎一致、strand 一致、anchor 长度达到最小可信阈值的无缝替代；
 - 多个 selected records 可以联合替换：单独替换 R1 或 R2 可能无法降低 pair-level span，但联合替换后能暴露更合理的 local linear / circular chain；
 - 对所有无缝 `XA` 用同一套 topology-neutral ranking 比较 linear / circular 替代：query coverage 基本不降低、single chromosome、selected span 更短且优先回到 CIRI3 `max_span=200000` 范围内；
@@ -645,7 +692,7 @@ isoform 输出必须建立在 read-level segments 稳定的前提上。当前单
 其中 IGV sidecar 只用于人工 review：
 
 - `<prefix>.bedpe` 在 `<prefix>.out` 写出时同步生成，每个 circRNA 一条 BSJ anchor pair；它只展示已识别 BSJ，不考虑内部结构，score 使用原始 `#junction_reads`；
-- `<prefix>.segments.bam` 在 `<prefix>.segments` 写出时同步生成坐标排序 synthetic alignment，并同步写出 `<prefix>.segments.bam.bai`；internal junction 用 `N` CIGAR，遇到 `<bsj>` / `B` marker 时拆成同 read 的多条 alignment，`YC`/`RG`/`ZT`/`CI` tags 记录颜色、read group、read type 和 circRNA 来源。
+- `<prefix>.segments.bam` 在 `<prefix>.segments` 写出时同步生成坐标排序 synthetic alignment，并同步写出 `<prefix>.segments.bam.bai`；internal junction 用 `N` CIGAR，遇到 `<bsj>` / `B` marker 或同一 chain 内的坐标回跳时拆成同 read 的多条 alignment。若 `r*_cs` 与拆分后的 part reference span 一致，writer 同步重建 `SEQ`、part-level `cs:Z` 和含 `I/D/N/M` 的 BAM CIGAR；否则保留 `N` 序列作为 IGV 结构 review fallback。`YC`/`RG`/`ZT`/`CI` tags 记录颜色、read group、read type 和 circRNA 来源。
 
 每个 Summary-confirmed circRNA 输出一个 `isoform_class "major"` 结构。GTF 包含 `circRNA`、`transcript` 和 `exon` feature；核心 attributes 包括：
 

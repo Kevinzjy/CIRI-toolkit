@@ -256,7 +256,7 @@ fn write_and_log_segments_bam(
     log_writer: &mut BufWriter<File>,
     segments_output: &str,
     out_prefix: &str,
-    reference_lengths: &HashMap<String, usize>,
+    reference: &HashMap<String, String>,
     threads: usize,
 ) -> Result<()> {
     let bam_path = format!("{}.segments.bam", out_prefix);
@@ -264,7 +264,7 @@ fn write_and_log_segments_bam(
         segments_output,
         &bam_path,
         out_prefix,
-        reference_lengths,
+        reference,
         threads,
     )?;
     let message = format!("{}", bam_path);
@@ -286,7 +286,9 @@ struct IgvSegmentsColumns {
     type_name: usize,
     circ_id: usize,
     chrom: usize,
+    r1_cs: Option<usize>,
     r1_segments: usize,
+    r2_cs: Option<usize>,
     r2_segments: usize,
 }
 
@@ -307,6 +309,12 @@ struct IgvSegmentRow {
     sam_line: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct IgvPartPayload {
+    seq: String,
+    cs: String,
+}
+
 /// Converts read-level segment chains into an indexed BAM review track.
 ///
 /// Each R1/R2 chain is split at explicit `<bsj>` markers so BSJ-crossing pieces
@@ -317,7 +325,7 @@ fn write_segments_review_tracks_from_segments(
     segments_path: &str,
     bam_path: &str,
     out_prefix: &str,
-    reference_lengths: &HashMap<String, usize>,
+    reference: &HashMap<String, String>,
     threads: usize,
 ) -> Result<()> {
     let file = File::open(segments_path)?;
@@ -350,17 +358,36 @@ fn write_segments_review_tracks_from_segments(
             continue;
         };
         let color = igv_segment_color(type_name);
-        for (mate_label, segments) in [
-            ("R1", cols.get(columns.r1_segments).copied().unwrap_or("NA")),
-            ("R2", cols.get(columns.r2_segments).copied().unwrap_or("NA")),
+        for (mate_label, segments, cs) in [
+            (
+                "R1",
+                cols.get(columns.r1_segments).copied().unwrap_or("NA"),
+                columns
+                    .r1_cs
+                    .and_then(|idx| cols.get(idx).copied())
+                    .unwrap_or("NA"),
+            ),
+            (
+                "R2",
+                cols.get(columns.r2_segments).copied().unwrap_or("NA"),
+                columns
+                    .r2_cs
+                    .and_then(|idx| cols.get(idx).copied())
+                    .unwrap_or("NA"),
+            ),
         ] {
             push_one_segments_alignment_chain(
-                &mut rows, chrom, read_id, type_name, circ_id, mate_label, segments, color,
+                &mut rows, chrom, read_id, type_name, circ_id, mate_label, segments, cs, color,
+                reference,
             )?;
         }
     }
     rows.sort_by(compare_igv_segment_rows);
-    write_segments_bam_from_sorted_rows(&rows, bam_path, out_prefix, reference_lengths, threads)?;
+    let reference_lengths: HashMap<String, usize> = reference
+        .iter()
+        .map(|(chrom, seq)| (chrom.clone(), seq.len()))
+        .collect();
+    write_segments_bam_from_sorted_rows(&rows, bam_path, out_prefix, &reference_lengths, threads)?;
     Ok(())
 }
 
@@ -378,7 +405,9 @@ fn igv_segments_columns(header: &str, path: &str) -> Result<IgvSegmentsColumns> 
         type_name: idx("type")?,
         circ_id: idx("circ_id")?,
         chrom: idx("chrom")?,
+        r1_cs: headers.iter().position(|field| *field == "r1_cs"),
         r1_segments: idx("r1_segments")?,
+        r2_cs: headers.iter().position(|field| *field == "r2_cs"),
         r2_segments: idx("r2_segments")?,
     })
 }
@@ -392,15 +421,21 @@ fn push_one_segments_alignment_chain(
     circ_id: &str,
     mate_label: &str,
     segments: &str,
+    cs: &str,
     color: &str,
+    reference: &HashMap<String, String>,
 ) -> Result<()> {
     if segments == "NA" || segments.is_empty() {
         return Ok(());
     }
+    let part_payloads = igv_part_payloads_from_cs(chrom, segments, cs, reference);
     let mut part = 1usize;
     let mut blocks: Vec<(i32, i32, char)> = Vec::new();
     for token in segments.split('|') {
         if token == "<bsj>" {
+            let payload = part_payloads
+                .as_ref()
+                .and_then(|payloads| payloads.get(part - 1));
             if push_segments_alignment_part(
                 rows,
                 chrom,
@@ -411,12 +446,32 @@ fn push_one_segments_alignment_chain(
                 part,
                 color,
                 &mut blocks,
+                payload,
             )? {
                 part += 1;
             }
             continue;
         }
         if let Some((start, end, strand)) = parse_igv_segment_token(token) {
+            if igv_part_coordinate_break(&blocks, start, end) {
+                let payload = part_payloads
+                    .as_ref()
+                    .and_then(|payloads| payloads.get(part - 1));
+                if push_segments_alignment_part(
+                    rows,
+                    chrom,
+                    read_id,
+                    type_name,
+                    circ_id,
+                    mate_label,
+                    part,
+                    color,
+                    &mut blocks,
+                    payload,
+                )? {
+                    part += 1;
+                }
+            }
             blocks.push((start, end, strand));
         }
     }
@@ -430,8 +485,24 @@ fn push_one_segments_alignment_chain(
         part,
         color,
         &mut blocks,
+        part_payloads
+            .as_ref()
+            .and_then(|payloads| payloads.get(part - 1)),
     )?;
     Ok(())
+}
+
+/// Returns whether a new segment must start a fresh BAM alignment part.
+///
+/// SAM/BAM CIGARs are reference-coordinate ordered. CIRI read chains can move
+/// backward across circular or ambiguous topology even when no explicit
+/// `<bsj>` token is present, so those coordinate breaks are written as separate
+/// synthetic records instead of forcing the sequence-aware cs payload through a
+/// reordered CIGAR.
+fn igv_part_coordinate_break(blocks: &[(i32, i32, char)], start: i32, end: i32) -> bool {
+    blocks.last().is_some_and(|(prev_start, prev_end, _)| {
+        (*prev_start, *prev_end) > (start, end) || start <= *prev_end
+    })
 }
 
 /// Appends one synthetic alignment part and clears the accumulated segment blocks.
@@ -445,6 +516,7 @@ fn push_segments_alignment_part(
     part: usize,
     color: &str,
     blocks: &mut Vec<(i32, i32, char)>,
+    payload: Option<&IgvPartPayload>,
 ) -> Result<bool> {
     if blocks.is_empty() {
         return Ok(false);
@@ -478,6 +550,7 @@ fn push_segments_alignment_part(
             color,
             strand,
             blocks,
+            payload,
         ),
     });
     blocks.clear();
@@ -531,11 +604,12 @@ fn compare_igv_segment_rows(left: &IgvSegmentRow, right: &IgvSegmentRow) -> Orde
         .then_with(|| left.name.cmp(&right.name))
 }
 
-/// Builds a synthetic SAM alignment line from one segment row.
+/// Builds a SAM alignment line from one segment row.
 ///
-/// The sequence is artificial because `<prefix>.segments` only carries mapped
-/// blocks, not full read bases. IGV still renders the splice structure from
-/// RNAME/POS/CIGAR, while tags retain segment provenance and color.
+/// When the chain-level `r*_cs` payload can be checked against the part's
+/// genomic span, the aligned query bases and BAM CIGAR are reconstructed from
+/// cs. If the cs payload is missing or inconsistent, the writer falls back to
+/// `N` bases and omits `cs:Z` rather than producing an invalid BAM.
 fn synthetic_segments_sam_line(
     chrom: &str,
     chrom_start: i32,
@@ -547,16 +621,37 @@ fn synthetic_segments_sam_line(
     color: &str,
     strand: char,
     blocks: &[(i32, i32, char)],
+    payload: Option<&IgvPartPayload>,
 ) -> Option<String> {
-    let (cigar, query_len) = synthetic_segments_cigar(blocks)?;
-    if query_len == 0 {
+    let (fallback_cigar, fallback_query_len) = synthetic_segments_cigar(blocks)?;
+    if fallback_query_len == 0 {
         return None;
     }
     let flag = if strand == '-' { 16 } else { 0 };
     let mapq = igv_segment_mapq(type_name);
-    let seq = "N".repeat(query_len);
+    let fallback_ref_len = cigar_query_ref_consumption(&fallback_cigar)?.1;
+    let usable_payload = payload.and_then(|payload| {
+        let cigar = cigar_from_part_cs(&payload.cs)?;
+        let (query_len, ref_len) = cigar_query_ref_consumption(&cigar)?;
+        (query_len == payload.seq.len()
+            && ref_len == fallback_ref_len
+            && payload
+                .seq
+                .bytes()
+                .all(|base| matches!(base.to_ascii_uppercase(), b'A' | b'C' | b'G' | b'T' | b'N')))
+        .then_some((payload, cigar))
+    });
+    let (cigar, seq, cs_tag) = if let Some((payload, cigar)) = usable_payload {
+        (cigar, payload.seq.clone(), format!("\tcs:Z:{}", payload.cs))
+    } else {
+        (
+            fallback_cigar,
+            "N".repeat(fallback_query_len),
+            String::new(),
+        )
+    };
     Some(format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t*\tRG:Z:{}\tYC:Z:{}\tZT:Z:{}\tCI:Z:{}\tML:Z:{}\tPT:i:{}\n",
+        "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t*\tRG:Z:{}\tYC:Z:{}\tZT:Z:{}\tCI:Z:{}\tML:Z:{}\tPT:i:{}{}\n",
         name,
         flag,
         chrom,
@@ -569,8 +664,356 @@ fn synthetic_segments_sam_line(
         type_name,
         circ_id,
         mate_label,
-        part
+        part,
+        cs_tag
     ))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IgvCsOp<'a> {
+    Match(usize),
+    Sub { query: u8 },
+    Ins(&'a str),
+    Del(usize),
+    Skip { raw: &'a str, len: usize, bsj: bool },
+}
+
+#[derive(Debug)]
+enum IgvChainUnit {
+    Segment { start: i32, end: i32 },
+    Bsj,
+}
+
+/// Reconstructs per-BSJ-part sequence and cs payloads for `.segments.bam`.
+///
+/// The public `.segments` row stores one read-chain cs payload, while the review
+/// BAM intentionally splits chains at `<bsj>`. This parser walks the segment
+/// tokens and cs operations together, using reference sequence for `:` match
+/// runs and starting a new part at CIRI's custom `<...>` back-splice op.
+fn igv_part_payloads_from_cs(
+    chrom: &str,
+    segments: &str,
+    cs: &str,
+    reference: &HashMap<String, String>,
+) -> Option<Vec<IgvPartPayload>> {
+    if matches!(cs, "NA" | "*" | "") {
+        return None;
+    }
+    let chr_seq = reference.get(chrom)?;
+    let units = igv_chain_units(segments)?;
+    let mut unit_idx = first_segment_unit_idx(&units)?;
+    let mut ref_pos = match units.get(unit_idx)? {
+        IgvChainUnit::Segment { start, .. } => *start,
+        IgvChainUnit::Bsj => return None,
+    };
+    let mut parts = Vec::new();
+    let mut current = IgvPartPayload {
+        seq: String::new(),
+        cs: String::new(),
+    };
+
+    let mut pos = 0usize;
+    while pos < cs.len() {
+        let (op, next_pos) = parse_igv_cs_op(cs, pos)?;
+        pos = next_pos;
+        match op {
+            IgvCsOp::Match(len) => {
+                let segment_end = segment_end_at(&units, unit_idx)?;
+                if ref_pos + len as i32 - 1 > segment_end {
+                    return None;
+                }
+                let start = (ref_pos - 1) as usize;
+                let end = start + len;
+                current.seq.push_str(chr_seq.get(start..end)?);
+                current.cs.push(':');
+                current.cs.push_str(&len.to_string());
+                ref_pos += len as i32;
+            }
+            IgvCsOp::Sub { query } => {
+                if ref_pos > segment_end_at(&units, unit_idx)? {
+                    return None;
+                }
+                let raw = &cs[next_pos - 3..next_pos];
+                current.seq.push(query.to_ascii_uppercase() as char);
+                current.cs.push_str(raw);
+                ref_pos += 1;
+            }
+            IgvCsOp::Ins(seq) => {
+                current.seq.push_str(&seq.to_ascii_uppercase());
+                current.cs.push('+');
+                current.cs.push_str(seq);
+            }
+            IgvCsOp::Del(len) => {
+                if ref_pos + len as i32 - 1 > segment_end_at(&units, unit_idx)? {
+                    return None;
+                }
+                current.cs.push_str(&cs[next_pos - len - 1..next_pos]);
+                ref_pos += len as i32;
+            }
+            IgvCsOp::Skip { raw, len, bsj } => {
+                let next_unit_idx = next_segment_unit_idx(&units, unit_idx, bsj)?;
+                let coordinate_break = match (units.get(unit_idx)?, units.get(next_unit_idx)?) {
+                    (
+                        IgvChainUnit::Segment {
+                            start: prev_start,
+                            end: prev_end,
+                        },
+                        IgvChainUnit::Segment { start, end },
+                    ) => igv_part_coordinate_break(&[(*prev_start, *prev_end, '+')], *start, *end),
+                    _ => return None,
+                };
+                if bsj || coordinate_break {
+                    parts.push(current);
+                    current = IgvPartPayload {
+                        seq: String::new(),
+                        cs: String::new(),
+                    };
+                } else {
+                    current.cs.push_str(raw);
+                }
+                unit_idx = next_unit_idx;
+                ref_pos = match units.get(unit_idx)? {
+                    IgvChainUnit::Segment { start, .. } => *start,
+                    IgvChainUnit::Bsj => return None,
+                };
+                let _ = len;
+            }
+        }
+    }
+    parts.push(current);
+    Some(parts)
+}
+
+/// Parses segment tokens into the same chain units consumed by `r*_cs`.
+fn igv_chain_units(segments: &str) -> Option<Vec<IgvChainUnit>> {
+    let mut units = Vec::new();
+    for token in segments.split('|') {
+        if token == "<bsj>" {
+            units.push(IgvChainUnit::Bsj);
+            continue;
+        }
+        let (start, end, _strand) = parse_igv_segment_token(token)?;
+        units.push(IgvChainUnit::Segment { start, end });
+    }
+    (!units.is_empty()).then_some(units)
+}
+
+fn first_segment_unit_idx(units: &[IgvChainUnit]) -> Option<usize> {
+    units
+        .iter()
+        .position(|unit| matches!(unit, IgvChainUnit::Segment { .. }))
+}
+
+fn segment_end_at(units: &[IgvChainUnit], unit_idx: usize) -> Option<i32> {
+    match units.get(unit_idx)? {
+        IgvChainUnit::Segment { end, .. } => Some(*end),
+        IgvChainUnit::Bsj => None,
+    }
+}
+
+fn next_segment_unit_idx(
+    units: &[IgvChainUnit],
+    current_idx: usize,
+    expect_bsj: bool,
+) -> Option<usize> {
+    let mut idx = current_idx + 1;
+    if expect_bsj {
+        if !matches!(units.get(idx)?, IgvChainUnit::Bsj) {
+            return None;
+        }
+        idx += 1;
+    } else if matches!(units.get(idx)?, IgvChainUnit::Bsj) {
+        return None;
+    }
+    while idx < units.len() {
+        if matches!(units[idx], IgvChainUnit::Segment { .. }) {
+            return Some(idx);
+        }
+        idx += 1;
+    }
+    None
+}
+
+/// Parses one minimap2-style short-form cs operation, including CIRI's `<...>`.
+fn parse_igv_cs_op(cs: &str, pos: usize) -> Option<(IgvCsOp<'_>, usize)> {
+    let bytes = cs.as_bytes();
+    let op = *bytes.get(pos)? as char;
+    let mut cursor = pos + 1;
+    match op {
+        ':' => {
+            let start = cursor;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+                cursor += 1;
+            }
+            if cursor == start {
+                return None;
+            }
+            Some((IgvCsOp::Match(cs[start..cursor].parse().ok()?), cursor))
+        }
+        '*' => {
+            let _ref_base = *bytes.get(cursor)?;
+            let query = *bytes.get(cursor + 1)?;
+            Some((IgvCsOp::Sub { query }, cursor + 2))
+        }
+        '+' => {
+            let start = cursor;
+            while bytes
+                .get(cursor)
+                .is_some_and(|base| base.is_ascii_alphabetic())
+            {
+                cursor += 1;
+            }
+            (cursor > start).then_some((IgvCsOp::Ins(&cs[start..cursor]), cursor))
+        }
+        '-' => {
+            let start = cursor;
+            while bytes
+                .get(cursor)
+                .is_some_and(|base| base.is_ascii_alphabetic())
+            {
+                cursor += 1;
+            }
+            (cursor > start).then_some((IgvCsOp::Del(cursor - start), cursor))
+        }
+        '~' | '<' => {
+            cursor += 2;
+            let len_start = cursor;
+            while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+                cursor += 1;
+            }
+            if cursor == len_start {
+                return None;
+            }
+            cursor += 2;
+            if cursor > cs.len() {
+                return None;
+            }
+            Some((
+                IgvCsOp::Skip {
+                    raw: &cs[pos..cursor],
+                    len: cs[len_start..cursor - 2].parse().ok()?,
+                    bsj: op == '<',
+                },
+                cursor,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Checks that a part-level cs payload consumes the same query and reference as
+/// the CIGAR that will be written to BAM.
+#[cfg(test)]
+fn cs_consumption_matches_cigar(cs: &str, cigar: &str) -> bool {
+    let Some((cs_query, cs_ref)) = cs_query_ref_consumption(cs) else {
+        return false;
+    };
+    let Some((cigar_query, cigar_ref)) = cigar_query_ref_consumption(cigar) else {
+        return false;
+    };
+    cs_query == cigar_query && cs_ref == cigar_ref
+}
+
+/// Converts a part-level cs payload into a BAM CIGAR.
+///
+/// `:` runs and `*` substitutions both become `M`, while `+`, `-`, and `~`
+/// become `I`, `D`, and `N`. CIRI's custom `<...>` should have been consumed
+/// when the chain was split into BAM parts, so it is rejected here.
+fn cigar_from_part_cs(cs: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut pending: Option<(char, usize)> = None;
+    let mut pos = 0usize;
+    while pos < cs.len() {
+        let (op, next) = parse_igv_cs_op(cs, pos)?;
+        match op {
+            IgvCsOp::Match(len) => push_cigar_run(&mut out, &mut pending, 'M', len),
+            IgvCsOp::Sub { .. } => push_cigar_run(&mut out, &mut pending, 'M', 1),
+            IgvCsOp::Ins(seq) => push_cigar_run(&mut out, &mut pending, 'I', seq.len()),
+            IgvCsOp::Del(len) => push_cigar_run(&mut out, &mut pending, 'D', len),
+            IgvCsOp::Skip { len, bsj, .. } => {
+                if bsj {
+                    return None;
+                }
+                push_cigar_run(&mut out, &mut pending, 'N', len);
+            }
+        }
+        pos = next;
+    }
+    flush_cigar_run(&mut out, &mut pending);
+    (!out.is_empty()).then_some(out)
+}
+
+fn push_cigar_run(out: &mut String, pending: &mut Option<(char, usize)>, op: char, len: usize) {
+    if len == 0 {
+        return;
+    }
+    match pending.as_mut() {
+        Some((pending_op, pending_len)) if *pending_op == op => *pending_len += len,
+        _ => {
+            flush_cigar_run(out, pending);
+            *pending = Some((op, len));
+        }
+    }
+}
+
+fn flush_cigar_run(out: &mut String, pending: &mut Option<(char, usize)>) {
+    if let Some((op, len)) = pending.take() {
+        out.push_str(&len.to_string());
+        out.push(op);
+    }
+}
+
+#[cfg(test)]
+fn cs_query_ref_consumption(cs: &str) -> Option<(usize, usize)> {
+    let mut query = 0usize;
+    let mut reference = 0usize;
+    let mut pos = 0usize;
+    while pos < cs.len() {
+        let (op, next) = parse_igv_cs_op(cs, pos)?;
+        match op {
+            IgvCsOp::Match(len) => {
+                query += len;
+                reference += len;
+            }
+            IgvCsOp::Sub { .. } => {
+                query += 1;
+                reference += 1;
+            }
+            IgvCsOp::Ins(seq) => query += seq.len(),
+            IgvCsOp::Del(len) => reference += len,
+            IgvCsOp::Skip { len, .. } => reference += len,
+        }
+        pos = next;
+    }
+    Some((query, reference))
+}
+
+fn cigar_query_ref_consumption(cigar: &str) -> Option<(usize, usize)> {
+    let mut query = 0usize;
+    let mut reference = 0usize;
+    let mut number = String::new();
+    for op in cigar.chars() {
+        if op.is_ascii_digit() {
+            number.push(op);
+            continue;
+        }
+        if number.is_empty() {
+            return None;
+        }
+        let len = number.parse::<usize>().ok()?;
+        match op {
+            'M' | '=' | 'X' => {
+                query += len;
+                reference += len;
+            }
+            'I' | 'S' => query += len,
+            'D' | 'N' => reference += len,
+            'H' | 'P' => {}
+            _ => return None,
+        }
+        number.clear();
+    }
+    number.is_empty().then_some((query, reference))
 }
 
 /// Converts sorted segment blocks into a splice-aware CIGAR string.
@@ -1063,7 +1506,7 @@ pub fn main() -> Result<()> {
         &mut log_writer,
         &segments_output,
         &args.out_prefix,
-        &fasta.chr_len_map,
+        &fasta.chr_tcga_map,
         args.threads,
     )?;
     log_info(
@@ -1130,6 +1573,138 @@ pub fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn igv_part_payloads_reconstruct_sequence_and_split_bsj_cs() {
+        let mut reference = HashMap::new();
+        reference.insert("chr1".to_string(), "NNNNACGTCCCCGGGG".to_string());
+
+        let payloads =
+            igv_part_payloads_from_cs("chr1", "5-8:+|<bsj>|13-16:+", ":4<cc4gg:2*ga:1", &reference)
+                .unwrap();
+
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0].seq, "ACGT");
+        assert_eq!(payloads[0].cs, ":4");
+        assert_eq!(payloads[1].seq, "GGAG");
+        assert_eq!(payloads[1].cs, ":2*ga:1");
+    }
+
+    #[test]
+    fn igv_part_payloads_split_coordinate_break_without_bsj_marker() {
+        let mut reference = HashMap::new();
+        reference.insert(
+            "chr1".to_string(),
+            "AAAACCCCGGGGTTTTAAAACCCCGGGG".to_string(),
+        );
+
+        let payloads =
+            igv_part_payloads_from_cs("chr1", "21-24:+|10-13:+", ":4~gg7tt:2*gc:1", &reference)
+                .unwrap();
+
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0].seq, "CCCC");
+        assert_eq!(payloads[0].cs, ":4");
+        assert_eq!(payloads[1].seq, "GGCT");
+        assert_eq!(payloads[1].cs, ":2*gc:1");
+    }
+
+    #[test]
+    fn cs_consumption_must_match_synthetic_cigar() {
+        assert!(cs_consumption_matches_cigar(":4~gt3ag:2", "4M3N2M"));
+        assert!(!cs_consumption_matches_cigar(":2+a:2", "4M"));
+        assert!(!cs_consumption_matches_cigar(":2-a:2", "4M"));
+    }
+
+    #[test]
+    fn cigar_from_part_cs_preserves_indels() {
+        assert_eq!(cigar_from_part_cs(":2+a:1*ag-g:3").unwrap(), "2M1I2M1D3M");
+        assert_eq!(cigar_from_part_cs(":4~gt3ag:2").unwrap(), "4M3N2M");
+        assert!(cigar_from_part_cs(":4<gt3ag:2").is_none());
+    }
+
+    #[test]
+    fn synthetic_segments_sam_line_writes_real_seq_and_cs_when_valid() {
+        let payload = IgvPartPayload {
+            seq: "ACGT".to_string(),
+            cs: ":4".to_string(),
+        };
+        let line = synthetic_segments_sam_line(
+            "chr1",
+            4,
+            "read1|bsj|circ|R1|part1",
+            "bsj",
+            "circ",
+            "R1",
+            1,
+            IGV_BSJ_COLOR,
+            '+',
+            &[(5, 8, '+')],
+            Some(&payload),
+        )
+        .unwrap();
+
+        assert!(line.contains("\t4M\t"));
+        assert!(line.contains("\tACGT\t"));
+        assert!(line.contains("\tcs:Z::4\n"));
+    }
+
+    #[test]
+    fn synthetic_segments_sam_line_falls_back_when_cs_and_cigar_disagree() {
+        let payload = IgvPartPayload {
+            seq: "AACGT".to_string(),
+            cs: "+a:4".to_string(),
+        };
+        let line = synthetic_segments_sam_line(
+            "chr1",
+            4,
+            "read1|bsj|circ|R1|part1",
+            "bsj",
+            "circ",
+            "R1",
+            1,
+            IGV_BSJ_COLOR,
+            '+',
+            &[(5, 8, '+')],
+            Some(&payload),
+        )
+        .unwrap();
+
+        assert!(line.contains("\t1I4M\t"));
+        assert!(line.contains("\tAACGT\t"));
+        assert!(line.contains("\tcs:Z:+a:4\n"));
+    }
+
+    #[test]
+    fn synthetic_segments_sam_line_falls_back_when_cs_ref_span_disagrees() {
+        let payload = IgvPartPayload {
+            seq: "ACGT".to_string(),
+            cs: ":4-a".to_string(),
+        };
+        let line = synthetic_segments_sam_line(
+            "chr1",
+            4,
+            "read1|bsj|circ|R1|part1",
+            "bsj",
+            "circ",
+            "R1",
+            1,
+            IGV_BSJ_COLOR,
+            '+',
+            &[(5, 8, '+')],
+            Some(&payload),
+        )
+        .unwrap();
+
+        assert!(line.contains("\t4M\t"));
+        assert!(line.contains("\tNNNN\t"));
+        assert!(!line.contains("\tcs:Z:"));
+    }
 }
 
 /// Removes internal stage sidecars after the final user-facing outputs exist.
