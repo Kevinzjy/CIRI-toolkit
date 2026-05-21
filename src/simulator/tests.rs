@@ -151,21 +151,16 @@ fn long_circ_sampling_matches_generic_insert_distribution() {
 
 #[test]
 fn simulator_output_contract_is_stable() {
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let temp_dir = tempfile::tempdir().expect("create temporary simulator output directory");
-    let prefix = temp_dir.path().join("sim_contract");
+    let output_dir = temp_dir.path().join("out");
+    let prefix = output_dir.join("sim_contract");
+    let (ref_fasta, gtf) = write_simulator_contract_fixture(temp_dir.path());
 
     let summary = run(SimulateArgs {
-        ref_fasta: workspace
-            .join("vendor/CIRI_simulator/chr1.fa")
-            .to_string_lossy()
-            .into_owned(),
-        gtf: workspace
-            .join("vendor/CIRI_simulator/chr1.gtf")
-            .to_string_lossy()
-            .into_owned(),
+        ref_fasta: ref_fasta.to_string_lossy().into_owned(),
+        gtf: gtf.to_string_lossy().into_owned(),
         out_prefix: prefix.to_string_lossy().into_owned(),
-        chrom: Some("chr1".to_string()),
+        chrom: Some("chrTest".to_string()),
         circ_count: 10,
         circ_coverage: 8.0,
         linear_coverage: 0.01,
@@ -182,7 +177,7 @@ fn simulator_output_contract_is_stable() {
     })
     .expect("run simulator");
 
-    assert_output_file_set(temp_dir.path());
+    assert_output_file_set(&output_dir);
 
     let isoforms = read_tsv(&prefix.with_extension("isoforms.tsv"), ISOFORM_HEADER);
     let reads = read_tsv(&prefix.with_extension("reads.tsv"), READS_HEADER);
@@ -279,6 +274,49 @@ fn simulator_output_contract_is_stable() {
         reads.len(),
     );
     assert_eq!(summary.to_string(), expected_summary);
+}
+
+fn write_simulator_contract_fixture(dir: &Path) -> (PathBuf, PathBuf) {
+    let ref_fasta = dir.join("contract.fa");
+    let gtf = dir.join("contract.gtf");
+    let reference = (0..20_000)
+        .map(|idx| match idx % 4 {
+            0 => 'A',
+            1 => 'C',
+            2 => 'G',
+            _ => 'T',
+        })
+        .collect::<String>();
+    fs::write(&ref_fasta, format!(">chrTest\n{reference}\n")).expect("write test FASTA");
+
+    let mut gtf_text = String::new();
+    for tx_idx in 0..12 {
+        let gene_id = format!("gene{tx_idx}");
+        let transcript_id = format!("tx{tx_idx}");
+        let strand = if tx_idx % 2 == 0 { '+' } else { '-' };
+        let tx_start = 100 + tx_idx * 1_200;
+        let exon_count = 5usize;
+        let exon_len = 120usize;
+        let intron_len = 30usize;
+        let tx_end = tx_start + (exon_count - 1) * (exon_len + intron_len) + exon_len - 1;
+        let attrs = format!("gene_id \"{gene_id}\"; transcript_id \"{transcript_id}\";");
+        gtf_text.push_str(&format!(
+            "chrTest\tfixture\tgene\t{tx_start}\t{tx_end}\t.\t{strand}\t.\tgene_id \"{gene_id}\";\n"
+        ));
+        gtf_text.push_str(&format!(
+            "chrTest\tfixture\ttranscript\t{tx_start}\t{tx_end}\t.\t{strand}\t.\t{attrs}\n"
+        ));
+        for exon_idx in 0..exon_count {
+            let start = tx_start + exon_idx * (exon_len + intron_len);
+            let end = start + exon_len - 1;
+            gtf_text.push_str(&format!(
+                "chrTest\tfixture\texon\t{start}\t{end}\t.\t{strand}\t.\t{attrs} exon_number \"{}\";\n",
+                exon_idx + 1
+            ));
+        }
+    }
+    fs::write(&gtf, gtf_text).expect("write test GTF");
+    (ref_fasta, gtf)
 }
 
 fn assert_output_file_set(output_dir: &Path) {
