@@ -411,6 +411,7 @@ r1_cs       = :21<gt90ag:48*ag:1~gt30ag:20
 - `r*_cs` 的 query bases 必须和同一 mate 的最终 chain CIGAR 方向一致；当输出链对应反向比对时，query block 先 reverse-complement 后再与 reference 生成 `*refquery` / `+query` payload，语义与 SAM 中 `0x10` 记录的 `SEQ` / `cs:Z` 方向保持一致；
 - 每个 `<...>` op 必须对应一个 `B` 和一个 `<bsj>` boundary；
 - 每个 `~...` op 必须对应一个 `N` skipped interval；
+- block 内部的 `I/D` 必须保留原始相对位置，不能把 `33M1I116M` 这类 block 压平成连续 `M`，否则 `.segments.bam` 无法从 `cs` 与 reference 一致地重建 query sequence；
 - mate 没有 retained chain 时写 `NA`；有 chain 但缺少 sequence 或 reference 时写 `*`；
 - `.segments.bam` writer 会按 `<bsj>` / `<...>` 以及没有显式 `<bsj>` 的坐标回跳把 chain 拆成多条 part alignment，并在每个 part 上用 reference + part-level cs 重建 `SEQ`、`cs:Z` 和 BAM CIGAR；合法 `+/-` 会写成 `I/D`。如果某个 part 的 cs reference span 与 segment span 不一致，该 part 回退为 `N` 序列且不写 `cs:Z`，避免输出不一致 BAM。
 - non-BSJ local clip exact placement 只在 clipped subsequence 与候选 reference window 完全一致时生成，因此它的 sidecar `cs` 可以写成 `:<len>`；这保证后续 BAM writer 不需要重新扫描 FASTQ/BAM 也能为该伪对齐 part 写出实际 sequence。
@@ -423,20 +424,21 @@ r1_cs       = :21<gt90ag:48*ag:1~gt30ag:20
 
 ### 6.3 internal splice boundary 校正
 
-最终 `<prefix>.segments` 写出前，会对 read-chain 相邻 segment 之间的普通 `N` junction 做边界校正：
+最终 `<prefix>.segments` 写出前，会对 read-chain 相邻 segment 之间的普通 `N` junction 做边界校正，并对 Summary-confirmed BSJ rows 的 `B` boundary 做单独处理：
 
-- 只校正 internal splice boundary，不校正 `B` 对应的 BSJ 分区边界；
+- internal splice boundary 和 confirmed BSJ boundary 使用不同规则；confirmed BSJ rows 在 `B` gap 附近优先强制贴回 Summary 已确认的 circRNA start/end，避免 annotation/motif 在 BSJ 处把边界拉走；
 - annotation first：优先在小窗口内选择同一 gene、同一 RNA strand 的 exon end / exon start；
 - read-specific validated junction hints 次之：复用 CIRI-AS candidate validation 已经校正过的 `(site2, site1)`；
 - de novo splice signal fallback：没有 annotation / read-specific hint 时，根据 RNA strand 检查 canonical / semi-canonical splice dinucleotide；
 - 普通 mapper block 保持保守窗口；validator 保存的 local clip block 或很短的 retained block 可对 annotation / read-specific hint 使用更宽窗口；
-- `B` 对应的 circ boundary gap 不参与 internal correction，避免把 read-level segments 修正反向污染 BSJ 拓扑解释；
+- `B` 对应的 circ boundary gap 不参与 ordinary internal correction，避免把 read-level segments 修正反向污染 BSJ 拓扑解释；它只接受 confirmed-BSJ 专用边界校正；
 - 校正后的坐标同时写入 `r*_segments` 和 `r*_cigar`。
 
 当前实现把这些信号合并进同一个候选排序，而不是命中 annotation 后立即停止：
 
-- read-specific validated junction hint 优先级最高；
-- transcript-consistent splice pair 高于普通 exon-boundary pair；
+- read-specific validated junction hint 可提供候选，但不能在明显 sequence mismatch 时无条件覆盖 read-level sequence evidence；
+- transcript-consistent splice pair 在局部窗口内作为高可信 exon-junction evidence，优先级高于普通 exon-boundary pair 和 microhomology extension；
+- 对非 transcript-level 的候选，sequence match/mismatch score 参与主要排序，避免 canonical motif 或 preliminary support 把 junction 校正到会引入大量 mismatch 的位置；
 - `type=bsj/backward/outward` 的 preliminary internal `N` junction support 会合并成统一 support map，作为第二轮 support-aware tie breaker；
 - 第二轮不是全量重建：只有 preliminary chain 中某个 internal `N` junction 附近存在不同的 supported splice pair 时，才重新 materialize 该 read；其他 reads 直接复用第一轮结果；
 - `type=bsj` 只在 confirmed BSJ gap 处保留特殊处理；除该 `B` gap 外，BSJ reads 的内部 `N` 与 `backward/outward` reads 的内部 `N` 使用同一套校正和 support 逻辑；
@@ -453,6 +455,8 @@ approximate local junction rescue 暂不进入当前 `<prefix>.segments` strong 
 - `<10bp` 的短片段或短 clip 不作为 strong exon / junction evidence；
 - terminal soft clip 推断出的 approximate junction 不直接写成 `r*_segments` 中的新 segment；
 - approximate clip 也不参与当前 strong `junction_chain` 评估口径。
+
+这意味着一类已知、可解释的严格边界误差会保留下来：如果真实 read-chain 末端有 `<10bp` exon fragment，而 BWA-MEM 因局部重复或 microhomology 把其中几 bp 吸收到相邻 mapper block，剩余 terminal clip 又短于 `MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH=10`，当前 segments 不会凭空创建这个短 block。典型表现是 truth 中存在短 terminal exon，但输出为相邻 exon 边界多出 1-9 bp。当前 chr1 simulator 中，约一半严格边界错误属于同形小范围边界漂移，其中大部分可由这类隐藏短片段解释；因此它被记录为 first usable version 的已知限制，而不是继续放宽普通 junction correction 的理由。后续若要修复，应设计 annotation/BSJ 锚定的 sub-10bp terminal fragment rescue，并独立评估 FP 风险。
 
 原因是 approximate clip 本质上是 path-level 证据，而不是单 read level 的强模板。它需要在同一个 circRNA 内结合更多信息共同解释：
 
@@ -692,7 +696,7 @@ isoform 输出必须建立在 read-level segments 稳定的前提上。当前单
 其中 IGV sidecar 只用于人工 review：
 
 - `<prefix>.bedpe` 在 `<prefix>.out` 写出时同步生成，每个 circRNA 一条 BSJ anchor pair；它只展示已识别 BSJ，不考虑内部结构，score 使用原始 `#junction_reads`；
-- `<prefix>.segments.bam` 在 `<prefix>.segments` 写出时同步生成坐标排序 synthetic alignment，并同步写出 `<prefix>.segments.bam.bai`；internal junction 用 `N` CIGAR，遇到 `<bsj>` / `B` marker 或同一 chain 内的坐标回跳时拆成同 read 的多条 alignment。若 `r*_cs` 与拆分后的 part reference span 一致，writer 同步重建 `SEQ`、part-level `cs:Z` 和含 `I/D/N/M` 的 BAM CIGAR；否则保留 `N` 序列作为 IGV 结构 review fallback。`YC`/`RG`/`ZT`/`CI` tags 记录颜色、read group、read type 和 circRNA 来源。
+- `<prefix>.segments.bam` 在 `<prefix>.segments` 写出时同步生成坐标排序 synthetic alignment，并同步写出 `<prefix>.segments.bam.bai`；internal junction 用 `N` CIGAR，遇到 `<bsj>` / `B` marker 或同一 chain 内的坐标回跳时拆成同 read 的多条 alignment。若 `r*_cs` 与拆分后的 part reference span 一致，writer 同步重建 `SEQ`、part-level `cs:Z` 和含 `I/D/N/M` 的 BAM CIGAR；否则保留 `N` 序列作为 IGV 结构 review fallback。这个 BAM 是 `.segments` 的可视化投影，不重新扫描原始 BAM/FASTQ；因此 sequence 正确性依赖 `.segments` 中的 short-form `cs` 和最终边界校正是否自洽。`YC`/`RG`/`ZT`/`CI` tags 记录颜色、read group、read type 和 circRNA 来源。
 
 每个 Summary-confirmed circRNA 输出一个 `isoform_class "major"` 结构。GTF 包含 `circRNA`、`transcript` 和 `exon` feature；核心 attributes 包括：
 

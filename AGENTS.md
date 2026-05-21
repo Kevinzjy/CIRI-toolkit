@@ -20,7 +20,7 @@
 
 ## 扩展模块策略（segments / isoforms / multi-sample）
 - **CIRI3 parity 与扩展功能分层**：`vendor/CIRI3` 仍是核心 BSJ 检测行为标准；`vendor/CIRI-AS` 与 `vendor/CIRI-full` 只作为历史算法参考和风险清单，不再作为当前开发路线或完整 parity 目标。
-- **当前已落地能力**：默认后处理已实现 `<prefix>.segments`、`<prefix>.isoforms.gtf`、高可信 `<prefix>.isoforms.fa`、`<prefix>.bedpe` 和 `<prefix>.segments.bam/.bai`；isoform 阶段必须从已写出的 `<prefix>.segments` 重新解析，保证断点调试和后续多样本整合共用同一输入边界。
+- **当前已落地能力**：默认后处理已实现 `<prefix>.segments`、`<prefix>.isoforms.gtf`、高可信 `<prefix>.isoforms.fa`、`<prefix>.bedpe` 和 `<prefix>.segments.bam/.bai`；`<prefix>.segments` 包含 chain-level CIGAR 与 short-form `cs`，`.segments.bam` 从这些字段重建 synthetic sequence / `cs:Z` 用于 IGV review；isoform 阶段必须从已写出的 `<prefix>.segments` 重新解析，保证断点调试和后续多样本整合共用同一输入边界。
 - **下一阶段目标**：围绕同一 circRNA 的多个候选 isoform 建立 usage 计算、置信度分层和 multi-sample integration；重点是比较 major isoform switching、结构稳定性和样本间 usage 变化，而不是沿 CIRI-AS / CIRI-full / RO remap 路线继续复刻历史输出。
 - **证据边界**：BSJ/backward/outward segments 是当前 isoform 图的主要证据层。后续新增 evidence 必须先进入审计字段或 sidecar，不能反向改变 `.out/.bsj/.segments` 的既有判定。
 - **文档优先**：isoform usage、多样本整合、输出协议或证据分层发生变化时，必须同步更新 `docs/07-full-length-reconstruction.md`、`docs/01-development-status.md` 和必要的用户文档。
@@ -118,7 +118,7 @@
   - 不允许以“统计上接近”替代“逐条一致”。
 
 ## 当前扩展阶段定义（2026-05）
-- **阶段结论**：read-level segments 与单样本 major isoform 全长识别已实现，当前默认输出可作为 first usable version。
+- **阶段结论**：read-level segments 与单样本 major isoform 全长识别已实现，当前默认输出可作为 first usable version。严格 segment 边界仍存在可解释误差，尤其是 `<10bp` terminal fragment 被 mapper 吸收到相邻 block 或残留 clip 低于 rescue 阈值的场景；这类弱证据后续若要修复，必须作为 sub-10bp rescue 独立评估，不能放宽普通 junction correction 规则。
 - **实现范围**：主流程默认输出 `<prefix>.segments`、`<prefix>.isoforms.gtf`、高可信 `<prefix>.isoforms.fa`、`<prefix>.bedpe` 和 `<prefix>.segments.bam/.bai`；`--continue` 只从已完成的 `<prefix>.segments` 断点重建 isoforms。
 - **下一阶段目标**：实现多 isoform usage 计算与 multi-sample 整合，包括候选 isoform search space、per-sample support/usage、major isoform switching 和跨样本结构合并。
 - **暂不推进内容**：不再把 CIRI-AS / CIRI-full / RO remap 作为主开发路线；相关旧设计只保留为参考，废弃或未使用代码应优先删除，除非仍直接支撑 segments 或 major isoform 输出。
