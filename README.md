@@ -87,11 +87,11 @@ The main output files are:
 
 - `<prefix>.out`: CIRI3-compatible circRNA result table
 - `<prefix>.bsj`: mate-level BSJ evidence display used for review/debugging
-- `<prefix>.segments`: read-level BSJ/backward/outward segment chains
+- `<prefix>.segments`: read-level BSJ/backward/outward segments
 - `<prefix>.isoforms.gtf`: major isoform structure audit table for all reported circRNAs
 - `<prefix>.isoforms.fa`: high-confidence major circRNA isoform sequences
 - `<prefix>.bedpe`: IGV-compatible BSJ anchor track
-- `<prefix>.segments.bam` and `<prefix>.segments.bam.bai`: IGV-compatible synthetic segment alignments
+- `<prefix>.segments.bam` and `<prefix>.segments.bam.bai`: IGV-compatible segment alignments
 - `<prefix>.log`: run log
 
 ## `.out` Format
