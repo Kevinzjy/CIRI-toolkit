@@ -126,6 +126,8 @@ const XA_REJECT_MIN_SPAN_REDUCTION: i32 = 1000;
 const XA_SEAMLESS_QUERY_TOLERANCE: i32 = 2;
 /// Maximum exact XA alternatives evaluated per selected alignment record.
 const XA_MAX_ALTERNATIVES_PER_RECORD: usize = 4;
+/// Maximum XA alternatives inspected when repairing a confirmed BSJ row's mate.
+const BSJ_MATE_XA_MAX_ALTERNATIVES_PER_RECORD: usize = 8;
 /// CIRI3 default `-Max/--max_span`; sidecar backward rows should not exceed the
 /// same circRNA spanning range when they are candidates for later graph work.
 const BACKWARD_MAX_SPAN: i32 = 200000;
@@ -243,6 +245,7 @@ struct AsAlignment {
     mapq: i32,
     cigar: String,
     seq: String,
+    cs: String,
     from_local_clip: bool,
     xa_alternatives: Vec<XaAlternative>,
 }
@@ -283,8 +286,10 @@ struct SegmentRecord {
     r1_align_strand: String,
     r2_align_strand: String,
     r1_cigar: String,
+    r1_cs: String,
     r1_segments: String,
     r2_cigar: String,
+    r2_cs: String,
     r2_segments: String,
 }
 
@@ -305,11 +310,26 @@ struct MateBsjEvidence {
     source_stage: String,
 }
 
+/// One CIGAR operation retained inside a selected segment block.
+///
+/// Segment tokens are reference intervals, but allele-aware `.segments` output
+/// must still know where an insertion or deletion happened inside that
+/// interval. Keeping only block start/end collapses `33M1I116M` into one long
+/// `M` run and shifts every downstream base in the reconstructed `cs` payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SegmentCigarOp {
+    len: i32,
+    op: char,
+}
+
 /// One genomic segment block in read order.
 ///
 /// CIGAR parsing first walks the alignment in reference order, then flips the
 /// query coordinates for reverse-strand records so downstream chain assembly can
 /// reason in the same read-order protocol used by the simulator truth tables.
+/// `cigar_ops` is retained only while the block boundaries still match the
+/// source alignment; boundary correction clears it when the old operation
+/// offsets would no longer be trustworthy.
 #[derive(Debug, Clone)]
 struct SegmentBlock {
     read_start: i32,
@@ -317,6 +337,7 @@ struct SegmentBlock {
     ref_start: i32,
     ref_end: i32,
     from_local_clip: bool,
+    cigar_ops: Vec<SegmentCigarOp>,
 }
 
 /// One alignment record with CIGAR-derived blocks in read order.
@@ -326,7 +347,22 @@ struct ParsedAlignment {
     chrom: String,
     strand: char,
     mapq: i32,
+    seq: String,
     blocks: Vec<SegmentBlock>,
+}
+
+/// A selected segment block plus the full read sequence it came from.
+///
+/// Boundary correction can trim or extend a block by a few bases when
+/// annotation, validated junction support, or circRNA boundaries provide a
+/// better splice coordinate. Keeping the full oriented sequence here lets the
+/// materializer re-slice query bases after those corrections instead of keeping
+/// a stale pre-correction query fragment.
+#[derive(Debug, Clone)]
+struct ChainBlockPayload {
+    block: SegmentBlock,
+    strand: char,
+    source_seq: String,
 }
 
 /// One candidate alignment chain for a single mate.
@@ -343,6 +379,7 @@ struct MateChain {
     blocks: Vec<SegmentBlock>,
     tokens: Vec<String>,
     cigar: String,
+    cs: String,
     is_bsj: bool,
     is_circular: bool,
     used_secondary: usize,
@@ -1136,10 +1173,12 @@ fn load_mate_bsj_evidence(path: &str) -> Result<HashMap<String, Vec<MateBsjEvide
 /// Spills Scan1/Scan2 mapper-block evidence for Summary-confirmed BSJ reads.
 ///
 /// The sidecar rows are deliberately compact:
-/// `read_id, stage, mate, flag, chrom, pos, mapq, cigar, read_len, clips`. Only
-/// `read_id` and the mapper fields are mandatory; `clips` stores compact
-/// `L:<seq>,R:<seq>` soft-clip subsequences for traceability, while accepted
-/// local clip placements arrive as normal-looking `scan*_local` pseudo rows.
+/// `read_id, stage, mate, flag, chrom, pos, mapq, cigar, read_len, clips,
+/// alignment_cs, raw_xa`. Only `read_id` and the mapper fields are mandatory;
+/// `clips` stores compact `L:<seq>,R:<seq>` soft-clip subsequences for
+/// traceability, while `alignment_cs` keeps allele bases in short-form cs
+/// without spilling full read sequences. The optional raw BWA `XA:Z` payload is
+/// used only for post-Summary circ-context chain selection.
 /// The important memory boundary is that rows are hash-partitioned by read ID
 /// first, then each partition is aggregated independently. This mirrors the
 /// Scan1/Scan2 spill pattern and avoids a whole-run
@@ -1238,6 +1277,8 @@ fn parse_segment_evidence_row(
         .parse::<i32>()
         .with_context(|| format!("parse segment evidence read length from {}", line))?;
     let seq = parts.get(9).copied().unwrap_or("*");
+    let cs = parts.get(10).copied().unwrap_or("*");
+    let xa = parts.get(11).copied().unwrap_or("*");
     Ok(Some(SegmentEvidenceRow {
         read_id: read_id.to_string(),
         alignment: AsAlignment {
@@ -1251,8 +1292,9 @@ fn parse_segment_evidence_row(
             } else {
                 seq.to_string()
             },
+            cs: cs.to_string(),
             from_local_clip: parts[1].contains("_local"),
-            xa_alternatives: Vec::new(),
+            xa_alternatives: parse_xa_tag(xa),
         },
         read_len,
     }))
@@ -1265,7 +1307,7 @@ fn write_segment_evidence_raw_row(
 ) -> Result<()> {
     writeln!(
         writer,
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         row.read_id,
         row.alignment.flag,
         row.alignment.chr,
@@ -1278,6 +1320,8 @@ fn write_segment_evidence_raw_row(
             &row.alignment.seq
         },
         u8::from(row.alignment.from_local_clip),
+        row.alignment.cs,
+        format_xa_alternatives(&row.alignment.xa_alternatives),
         row.read_len
     )?;
     Ok(())
@@ -1320,6 +1364,8 @@ fn aggregate_segment_evidence_partition(
             continue;
         };
         let from_local_clip = parts.next().is_some_and(|value| value == "1");
+        let cs = parts.next().unwrap_or("*");
+        let xa = parts.next().unwrap_or("*");
         groups
             .entry(read_id.to_string())
             .or_default()
@@ -1334,8 +1380,9 @@ fn aggregate_segment_evidence_partition(
                 } else {
                     seq.to_string()
                 },
+                cs: cs.to_string(),
                 from_local_clip,
-                xa_alternatives: Vec::new(),
+                xa_alternatives: parse_xa_alternatives_field(xa),
             });
     }
     let mut writer = SegmentScanShardWriter::new(retained_path)?;
@@ -1360,6 +1407,8 @@ fn aggregate_segment_evidence_partition(
                 record.mapq,
                 record.cigar.clone(),
                 record.seq.clone(),
+                record.cs.clone(),
+                format_xa_alternatives(&record.xa_alternatives),
             ))
         });
         writer.write_read_result(&read_id, &records, false, &[], &[])?;
@@ -1788,6 +1837,7 @@ fn spill_legacy_non_bsj_segment_evidence(
                 } else {
                     seq.to_string()
                 },
+                cs: "*".to_string(),
                 from_local_clip: parts[1].contains("_local"),
                 xa_alternatives: Vec::new(),
             });
@@ -1823,10 +1873,11 @@ fn parse_non_bsj_group_records(payload: &str, line: &str) -> Result<Vec<AsAlignm
             continue;
         }
         // This parser is on the 10+ GiB non-BSJ sidecar path. The current
-        // compact protocol has six fields, while the older verbose protocol
-        // has eight fields; keeping the first eight slots on the stack avoids
-        // one short Vec allocation for every alignment payload.
-        let mut fields = [None; 8];
+        // compact protocol has seven fields, while older compact sidecars have
+        // six and the older verbose protocol has eight. Keeping the first nine
+        // slots on the stack avoids one short Vec allocation for every
+        // alignment payload while leaving room for the optional cs field.
+        let mut fields = [None; 9];
         let mut field_count = 0usize;
         for field in encoded.split('|') {
             if field_count < fields.len() {
@@ -1837,11 +1888,12 @@ fn parse_non_bsj_group_records(payload: &str, line: &str) -> Result<Vec<AsAlignm
                 break;
             }
         }
-        let (flag_idx, chrom_idx, pos_idx, mapq_idx, cigar_idx, seq_idx) = match field_count {
+        let (flag_idx, chrom_idx, pos_idx, mapq_idx, cigar_idx, seq_idx, cs_idx) = match field_count
+        {
             0..=5 => continue,
-            6 => (0, 1, 2, 3, 4, 5),
-            7 => continue,
-            _ => (1, 2, 3, 4, 5, 7),
+            6 => (0, 1, 2, 3, 4, 5, None),
+            7 => (0, 1, 2, 3, 4, 5, Some(6)),
+            _ => (1, 2, 3, 4, 5, 7, None),
         };
         let field = |idx: usize| fields[idx].expect("validated non-BSJ sidecar field");
         let flag_text = field(flag_idx);
@@ -1850,6 +1902,10 @@ fn parse_non_bsj_group_records(payload: &str, line: &str) -> Result<Vec<AsAlignm
         let mapq_text = field(mapq_idx);
         let cigar = field(cigar_idx);
         let seq = field(seq_idx);
+        let cs = cs_idx
+            .and_then(|idx| fields[idx])
+            .filter(|value| !value.is_empty())
+            .unwrap_or("*");
         let flag = flag_text
             .parse::<i32>()
             .with_context(|| format!("parse non-BSJ grouped flag from {}", line))?;
@@ -1859,7 +1915,7 @@ fn parse_non_bsj_group_records(payload: &str, line: &str) -> Result<Vec<AsAlignm
         let mapq = mapq_text
             .parse::<i32>()
             .with_context(|| format!("parse non-BSJ grouped MAPQ from {}", line))?;
-        let key = (flag, chrom, pos, mapq, cigar, seq);
+        let key = (flag, chrom, pos, mapq, cigar, seq, cs);
         if !seen.insert(key) {
             continue;
         }
@@ -1874,6 +1930,7 @@ fn parse_non_bsj_group_records(payload: &str, line: &str) -> Result<Vec<AsAlignm
             } else {
                 seq.to_string()
             },
+            cs: cs.to_string(),
             from_local_clip: false,
             xa_alternatives: Vec::new(),
         });
@@ -2185,6 +2242,7 @@ where
             mapq,
             cigar,
             seq,
+            cs: "*".to_string(),
             from_local_clip: false,
             xa_alternatives,
         });
@@ -2276,6 +2334,7 @@ where
             mapq,
             cigar: cigar_buf.clone(),
             seq: seq_buf.clone(),
+            cs: "*".to_string(),
             from_local_clip: false,
             xa_alternatives,
         });
@@ -2385,7 +2444,7 @@ impl SegmentScanShardWriter {
         for record in records {
             writeln!(
                 self.writer,
-                "A\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "A\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 read_id,
                 record.flag,
                 record.chr,
@@ -2398,6 +2457,7 @@ impl SegmentScanShardWriter {
                     &record.seq
                 },
                 u8::from(record.from_local_clip),
+                record.cs,
                 format_xa_alternatives(&record.xa_alternatives)
             )?;
         }
@@ -2420,7 +2480,7 @@ impl SegmentScanShardWriter {
         for record in segment_records {
             writeln!(
                 self.writer,
-                "S\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "S\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 record.read_id,
                 record.type_name,
                 record.circ_id,
@@ -2434,8 +2494,10 @@ impl SegmentScanShardWriter {
                 record.r1_align_strand,
                 record.r2_align_strand,
                 record.r1_cigar,
+                record.r1_cs,
                 record.r1_segments,
                 record.r2_cigar,
+                record.r2_cs,
                 record.r2_segments
             )?;
         }
@@ -2540,6 +2602,7 @@ where
             }
             Some("A") if parts.len() >= 10 => {
                 if let Some(group) = current.as_mut() {
+                    let has_cs = parts.len() >= 11;
                     group.records.push(AsAlignment {
                         flag: parts[2].parse().unwrap_or(0),
                         chr: parts[3].to_string(),
@@ -2551,8 +2614,17 @@ where
                         } else {
                             parts[7].to_string()
                         },
+                        cs: if has_cs {
+                            parts[9].to_string()
+                        } else {
+                            "*".to_string()
+                        },
                         from_local_clip: parts[8] == "1",
-                        xa_alternatives: parse_xa_alternatives_field(parts[9]),
+                        xa_alternatives: parse_xa_alternatives_field(if has_cs {
+                            parts[10]
+                        } else {
+                            parts[9]
+                        }),
                     });
                 }
             }
@@ -2606,29 +2678,36 @@ where
 /// Parses one shard-local preliminary segment row.
 fn segment_record_from_shard_fields(parts: &[&str]) -> Option<SegmentRecord> {
     let has_alignment_strands = parts.len() >= 16;
+    let has_cs = parts.len() >= 18;
     let (
         r1_align_strand,
         r2_align_strand,
         r1_cigar_idx,
+        r1_cs_idx,
         r1_segments_idx,
         r2_cigar_idx,
+        r2_cs_idx,
         r2_segments_idx,
     ) = if has_alignment_strands {
         (
             parts.get(10)?.to_string(),
             parts.get(11)?.to_string(),
             12usize,
-            13usize,
-            14usize,
-            15usize,
+            if has_cs { Some(13usize) } else { None },
+            if has_cs { 14usize } else { 13usize },
+            if has_cs { 15usize } else { 14usize },
+            if has_cs { Some(16usize) } else { None },
+            if has_cs { 17usize } else { 15usize },
         )
     } else {
         (
             "NA".to_string(),
             "NA".to_string(),
             10usize,
+            None,
             11usize,
             12usize,
+            None,
             13usize,
         )
     };
@@ -2650,8 +2729,18 @@ fn segment_record_from_shard_fields(parts: &[&str]) -> Option<SegmentRecord> {
         r1_align_strand,
         r2_align_strand,
         r1_cigar: parts.get(r1_cigar_idx)?.to_string(),
+        r1_cs: r1_cs_idx
+            .and_then(|idx| parts.get(idx))
+            .copied()
+            .unwrap_or("NA")
+            .to_string(),
         r1_segments: parts.get(r1_segments_idx)?.to_string(),
         r2_cigar: parts.get(r2_cigar_idx)?.to_string(),
+        r2_cs: r2_cs_idx
+            .and_then(|idx| parts.get(idx))
+            .copied()
+            .unwrap_or("NA")
+            .to_string(),
         r2_segments: parts.get(r2_segments_idx)?.to_string(),
     })
 }
@@ -2904,6 +2993,7 @@ fn bam_record_to_as_alignment(
         mapq,
         cigar: cigar_buf.clone(),
         seq: seq_buf.clone(),
+        cs: "*".to_string(),
         from_local_clip: false,
         xa_alternatives: parse_xa_from_bam_record(record)?,
     })
@@ -3522,6 +3612,12 @@ fn non_bsj_local_clip_alignments(
                             mapq: record.mapq.saturating_sub(1),
                             cigar,
                             seq: String::new(),
+                            // Local clip placements are admitted only as full
+                            // exact matches against the reference window, so a
+                            // short-form match run is enough for later BAM
+                            // sequence reconstruction without storing the full
+                            // read.
+                            cs: format!(":{}", clip_seq.len()),
                             from_local_clip: true,
                             xa_alternatives: Vec::new(),
                         },
@@ -5100,13 +5196,31 @@ fn build_bsj_segment_record(
         junction_hints,
         correction,
     );
+    repair_bsj_non_bsj_mates_by_xa(
+        &mut chains,
+        records,
+        circ,
+        read_len,
+        token_strand,
+        junction_hints,
+        correction,
+    );
+    repair_bsj_non_bsj_mates_by_circ_records(
+        &mut chains,
+        records,
+        circ,
+        read_len,
+        token_strand,
+        junction_hints,
+        correction,
+    );
     apply_mate_bsj_evidence(&mut chains, mate_bsj_evidence, circ);
     if chains[0].is_none() && chains[1].is_none() {
         return None;
     }
     let (r1_align_strand, r2_align_strand) = primary_mate_alignment_strands(records);
-    let (r1_segments, r1_cigar, is_r1_bsj) = chain_text(chains[0].as_ref());
-    let (r2_segments, r2_cigar, is_r2_bsj) = chain_text(chains[1].as_ref());
+    let (r1_segments, r1_cigar, r1_cs, is_r1_bsj) = chain_text(chains[0].as_ref());
+    let (r2_segments, r2_cigar, r2_cs, is_r2_bsj) = chain_text(chains[1].as_ref());
     Some(SegmentRecord {
         read_id: read_id.to_string(),
         type_name: "bsj",
@@ -5121,8 +5235,10 @@ fn build_bsj_segment_record(
         r1_align_strand,
         r2_align_strand,
         r1_cigar,
+        r1_cs,
         r1_segments,
         r2_cigar,
+        r2_cs,
         r2_segments,
     })
 }
@@ -5182,8 +5298,8 @@ fn build_backward_segment_record(
         return None;
     }
     let (r1_align_strand, r2_align_strand) = primary_mate_alignment_strands(records);
-    let (r1_segments, r1_cigar, _) = chain_text(chains[0].as_ref());
-    let (r2_segments, r2_cigar, _) = chain_text(chains[1].as_ref());
+    let (r1_segments, r1_cigar, r1_cs, _) = chain_text(chains[0].as_ref());
+    let (r2_segments, r2_cigar, r2_cs, _) = chain_text(chains[1].as_ref());
     Some(SegmentRecord {
         read_id: read_id.to_string(),
         type_name: "backward",
@@ -5198,8 +5314,10 @@ fn build_backward_segment_record(
         r1_align_strand,
         r2_align_strand,
         r1_cigar,
+        r1_cs,
         r1_segments,
         r2_cigar,
+        r2_cs,
         r2_segments,
     })
 }
@@ -5267,8 +5385,8 @@ fn build_outward_segment_record(
         return None;
     }
     let (r1_align_strand, r2_align_strand) = primary_mate_alignment_strands(records);
-    let (r1_segments, r1_cigar, _) = chain_text(chains[0].as_ref());
-    let (r2_segments, r2_cigar, _) = chain_text(chains[1].as_ref());
+    let (r1_segments, r1_cigar, r1_cs, _) = chain_text(chains[0].as_ref());
+    let (r2_segments, r2_cigar, r2_cs, _) = chain_text(chains[1].as_ref());
     Some(SegmentRecord {
         read_id: read_id.to_string(),
         type_name: "outward",
@@ -5283,8 +5401,10 @@ fn build_outward_segment_record(
         r1_align_strand,
         r2_align_strand,
         r1_cigar,
+        r1_cs,
         r1_segments,
         r2_cigar,
+        r2_cs,
         r2_segments,
     })
 }
@@ -5717,6 +5837,7 @@ fn alignment_from_xa(record: &AsAlignment, alternative: &XaAlternative) -> AsAli
         mapq: 0,
         cigar: alternative.cigar.clone(),
         seq: record.seq.clone(),
+        cs: "*".to_string(),
         from_local_clip: false,
         xa_alternatives: Vec::new(),
     }
@@ -5936,6 +6057,11 @@ fn build_chain_from_pool(
                 chrom: record.chr.clone(),
                 strand,
                 mapq: record.mapq,
+                seq: oriented_chain_sequence(
+                    record,
+                    read_len,
+                    correction.and_then(|ctx| ctx.reference.get(&record.chr)),
+                ),
                 blocks,
             });
     }
@@ -5987,6 +6113,264 @@ fn build_chain_from_pool(
     best
 }
 
+/// Returns the SAM-oriented read sequence used by mapper tags.
+///
+/// Full SAM/BAM records and minimap2-style `cs` tags both use the SAM sequence
+/// orientation: for reverse-strand records, the aligned SEQ substring already
+/// matches the forward reference. Reverse-strand block coordinates are flipped
+/// separately for read-chain ordering, so query slicing converts those
+/// read-order coordinates back to SAM coordinates instead of reverse
+/// complementing the sequence here.
+fn oriented_chain_sequence(
+    record: &AsAlignment,
+    read_len: i32,
+    reference_seq: Option<&String>,
+) -> String {
+    if record.seq.is_empty()
+        || record.seq == "*"
+        || record.seq.starts_with("L:")
+        || record.seq.starts_with("R:")
+    {
+        let Some(seq) = sequence_from_short_cs(
+            &record.cigar,
+            &record.cs,
+            record.pos,
+            read_len,
+            reference_seq,
+            if record.seq.starts_with("L:") || record.seq.starts_with("R:") {
+                Some(record.seq.as_str())
+            } else {
+                None
+            },
+        ) else {
+            return String::new();
+        };
+        return seq.to_ascii_uppercase();
+    }
+    record.seq.to_ascii_uppercase()
+}
+
+/// Extracts a 1-based inclusive query slice from an already oriented sequence.
+fn query_subseq(seq: &str, read_start: i32, read_end: i32) -> String {
+    if seq.is_empty() || read_start <= 0 || read_end < read_start {
+        return String::new();
+    }
+    let start = (read_start - 1) as usize;
+    let end = read_end as usize;
+    seq.get(start..end).unwrap_or("").to_string()
+}
+
+/// Reconstructs a full-length query skeleton from short-form cs and CIGAR.
+///
+/// Scan1/Scan2 sidecars now store cs instead of full read sequence to keep temp
+/// I/O bounded. Soft-clipped positions are filled with `N`; aligned positions
+/// are reconstructed from `:`, `*`, `+`, and reference-backed match runs so
+/// downstream block slicing can still materialize chain-level cs.
+fn sequence_from_short_cs(
+    cigar: &str,
+    cs: &str,
+    pos: i32,
+    read_len: i32,
+    reference_seq: Option<&String>,
+    clip_payload: Option<&str>,
+) -> Option<String> {
+    if cs == "*" || cs == "NA" || read_len <= 0 || pos <= 0 {
+        return None;
+    }
+    let reference_seq = reference_seq?;
+    let mut out = vec![b'N'; read_len as usize];
+    let mut read_idx = 0usize;
+    let mut ref_idx = (pos - 1) as usize;
+    let mut cs_ops = CsOpStream::new(cs);
+    for (len, op) in parse_cigar_ops_basic(cigar)? {
+        let len = len as usize;
+        match op {
+            'M' | '=' | 'X' => {
+                let mut filled = 0usize;
+                while filled < len {
+                    match cs_ops.next_op()? {
+                        CsOp::Match(count) => {
+                            let take = count.min(len - filled);
+                            let ref_start = ref_idx;
+                            let ref_end = ref_start + take;
+                            let dst_start = read_idx + filled;
+                            let dst_end = dst_start + take;
+                            out.get_mut(dst_start..dst_end)?
+                                .copy_from_slice(reference_seq.get(ref_start..ref_end)?.as_bytes());
+                            ref_idx += take;
+                            filled += take;
+                            if count > take {
+                                cs_ops.push_front(CsOp::Match(count - take));
+                            }
+                        }
+                        CsOp::Sub(query) => {
+                            *out.get_mut(read_idx + filled)? = query.to_ascii_uppercase() as u8;
+                            ref_idx += 1;
+                            filled += 1;
+                        }
+                        CsOp::Ins(seq) => {
+                            let bytes = seq.as_bytes();
+                            let dst_start = read_idx + filled;
+                            let dst_end = dst_start + bytes.len();
+                            out.get_mut(dst_start..dst_end)?.copy_from_slice(bytes);
+                            filled += bytes.len();
+                        }
+                        CsOp::Del(seq) => {
+                            ref_idx += seq.len();
+                        }
+                        CsOp::Skip(len) => {
+                            ref_idx += len;
+                        }
+                    }
+                }
+                read_idx += len;
+            }
+            'I' => {
+                if let CsOp::Ins(seq) = cs_ops.next_op()? {
+                    let bytes = seq.as_bytes();
+                    let take = bytes.len().min(len);
+                    out.get_mut(read_idx..read_idx + take)?
+                        .copy_from_slice(&bytes[..take]);
+                }
+                read_idx += len;
+            }
+            'S' | 'H' => read_idx += len,
+            'D' => {
+                let _ = cs_ops.next_op()?;
+                ref_idx += len;
+            }
+            'N' => {
+                let _ = cs_ops.next_op()?;
+                ref_idx += len;
+            }
+            'P' => {}
+            _ => return None,
+        }
+    }
+    if let Some(payload) = clip_payload {
+        fill_soft_clips_from_payload(cigar, &mut out, payload)?;
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Restores sidecar-retained soft clips into a SAM-oriented query skeleton.
+///
+/// Short-form cs intentionally omits soft-clipped bases. Scan1/Scan2 keep those
+/// bases in a compact `L:<seq>,R:<seq>` payload, still in SAM record
+/// orientation. Filling them before any `0x10` reverse-complement step prevents
+/// reverse-strand chains from being materialized with `N` bases at the BSJ
+/// flank.
+fn fill_soft_clips_from_payload(cigar: &str, out: &mut [u8], payload: &str) -> Option<()> {
+    if payload == "*" || payload.is_empty() {
+        return Some(());
+    }
+    let ops = parse_cigar_ops_basic(cigar)?;
+    for (side, seq) in parse_clip_payload(payload) {
+        let bytes = seq.as_bytes();
+        match side {
+            'L' => {
+                let (len, op) = ops.first().copied()?;
+                if op != 'S' || len as usize != bytes.len() || bytes.len() > out.len() {
+                    return None;
+                }
+                out.get_mut(..bytes.len())?.copy_from_slice(bytes);
+            }
+            'R' => {
+                let (len, op) = ops.last().copied()?;
+                if op != 'S' || len as usize != bytes.len() || bytes.len() > out.len() {
+                    return None;
+                }
+                let start = out.len() - bytes.len();
+                out.get_mut(start..)?.copy_from_slice(bytes);
+            }
+            _ => return None,
+        }
+    }
+    Some(())
+}
+
+enum CsOp {
+    Match(usize),
+    Sub(char),
+    Ins(String),
+    Del(String),
+    Skip(usize),
+}
+
+struct CsOpStream<'a> {
+    raw: &'a str,
+    pos: usize,
+    pending: Option<CsOp>,
+}
+
+impl<'a> CsOpStream<'a> {
+    fn new(raw: &'a str) -> Self {
+        Self {
+            raw,
+            pos: 0,
+            pending: None,
+        }
+    }
+
+    fn push_front(&mut self, op: CsOp) {
+        self.pending = Some(op);
+    }
+
+    fn next_op(&mut self) -> Option<CsOp> {
+        if self.pending.is_some() {
+            return self.pending.take();
+        }
+        let op = self.raw.as_bytes().get(self.pos).copied()? as char;
+        self.pos += 1;
+        match op {
+            ':' => Some(CsOp::Match(self.take_number()?)),
+            '*' => {
+                let _ref_base = self.take_base()?;
+                let query_base = self.take_base()?;
+                Some(CsOp::Sub(query_base))
+            }
+            '+' => Some(CsOp::Ins(self.take_bases())),
+            '-' => Some(CsOp::Del(self.take_bases())),
+            '~' | '<' => {
+                self.pos = (self.pos + 2).min(self.raw.len());
+                let len = self.take_number()?;
+                self.pos = (self.pos + 2).min(self.raw.len());
+                Some(CsOp::Skip(len))
+            }
+            _ => None,
+        }
+    }
+
+    fn take_number(&mut self) -> Option<usize> {
+        let start = self.pos;
+        while self
+            .raw
+            .as_bytes()
+            .get(self.pos)
+            .is_some_and(u8::is_ascii_digit)
+        {
+            self.pos += 1;
+        }
+        (self.pos > start).then(|| self.raw[start..self.pos].parse().ok())?
+    }
+
+    fn take_base(&mut self) -> Option<char> {
+        let ch = self.raw.as_bytes().get(self.pos).copied()? as char;
+        self.pos += 1;
+        Some(ch)
+    }
+
+    fn take_bases(&mut self) -> String {
+        let start = self.pos;
+        while self.raw.as_bytes().get(self.pos).is_some_and(|base| {
+            matches!(base.to_ascii_lowercase(), b'a' | b'c' | b'g' | b't' | b'n')
+        }) {
+            self.pos += 1;
+        }
+        self.raw[start..self.pos].to_ascii_uppercase()
+    }
+}
+
 /// Parses one alignment into read-order segment blocks.
 fn parse_alignment_blocks(record: &AsAlignment, read_len: i32) -> Option<Vec<SegmentBlock>> {
     if record.cigar == "*" || record.cigar.is_empty() || record.chr == "*" {
@@ -6020,21 +6404,25 @@ fn parse_alignment_blocks(record: &AsAlignment, read_len: i32) -> Option<Vec<Seg
                     ref_start: ref_pos,
                     ref_end: ref_pos + count - 1,
                     from_local_clip: record.from_local_clip,
+                    cigar_ops: Vec::new(),
                 });
                 block.read_end = read_pos + count - 1;
                 block.ref_end = ref_pos + count - 1;
+                block.cigar_ops.push(SegmentCigarOp { len: count, op });
                 read_pos += count;
                 ref_pos += count;
             }
             'I' => {
                 if let Some(block) = current.as_mut() {
                     block.read_end += count;
+                    block.cigar_ops.push(SegmentCigarOp { len: count, op });
                 }
                 read_pos += count;
             }
             'D' => {
                 if let Some(block) = current.as_mut() {
                     block.ref_end += count;
+                    block.cigar_ops.push(SegmentCigarOp { len: count, op });
                 }
                 ref_pos += count;
             }
@@ -6099,7 +6487,7 @@ fn materialize_chain(
     }
     let chrom = records.first()?.chrom.clone();
     let mut order_strand = records.first()?.strand;
-    let mut blocks = Vec::new();
+    let mut chain_blocks = Vec::new();
     let mut used_secondary = 0usize;
     let mut used_supplementary = 0usize;
     let mut query_coverage = 0i32;
@@ -6108,15 +6496,29 @@ fn materialize_chain(
         used_supplementary += usize::from(is_supplementary(record.flag));
         for block in &record.blocks {
             query_coverage += block.read_end - block.read_start + 1;
-            blocks.push(block.clone());
+            chain_blocks.push(ChainBlockPayload {
+                block: block.clone(),
+                strand: record.strand,
+                source_seq: record.seq.clone(),
+            });
         }
     }
-    blocks.sort_by_key(|block| (block.read_start, block.read_end, block.ref_start));
+    chain_blocks.sort_by_key(|payload| {
+        (
+            payload.block.read_start,
+            payload.block.read_end,
+            payload.block.ref_start,
+        )
+    });
     if reverse_chain_order {
-        blocks.reverse();
+        chain_blocks.reverse();
         order_strand = opposite_strand(order_strand);
     }
+    let mut chain_payloads = chain_blocks;
+    let mut blocks = payload_blocks(&chain_payloads);
     apply_circ_boundary_corrections(&mut blocks, circ);
+    sync_payload_blocks_after_boundary_correction(&mut chain_payloads, &blocks, read_len);
+    blocks = payload_blocks(&chain_payloads);
     let mut is_bsj = false;
     let mut is_circular = false;
     for pair in blocks.windows(2) {
@@ -6135,7 +6537,8 @@ fn materialize_chain(
         }
     }
 
-    let mut output_blocks = blocks.clone();
+    let mut output_payloads = chain_payloads.clone();
+    let mut output_blocks = payload_blocks(&output_payloads);
     let boundary_gap_idxs = if is_bsj {
         circ.and_then(|circ| read_order_bsj_gap_index(&output_blocks, circ, order_strand))
             .into_iter()
@@ -6153,8 +6556,14 @@ fn materialize_chain(
         correction,
         token_strand,
     );
-    let (tokens, _token_spans, cigar) = materialize_read_chain_output(
+    sync_payload_blocks_after_boundary_correction(&mut output_payloads, &output_blocks, read_len);
+    output_blocks = payload_blocks(&output_payloads);
+    let query_seqs = payload_query_seqs(&output_payloads, read_len);
+    let reference_seq = correction.and_then(|ctx| ctx.reference.get(&chrom).map(String::as_str));
+    let (tokens, _token_spans, cigar, cs) = materialize_read_chain_output(
         &output_blocks,
+        &query_seqs,
+        reference_seq,
         token_strand,
         &boundary_gap_idxs,
         read_len,
@@ -6167,12 +6576,91 @@ fn materialize_chain(
         blocks: output_blocks,
         tokens,
         cigar,
+        cs,
         is_bsj,
         is_circular,
         used_secondary,
         used_supplementary,
         query_coverage,
     })
+}
+
+/// Returns the current block view for chain payloads.
+fn payload_blocks(payloads: &[ChainBlockPayload]) -> Vec<SegmentBlock> {
+    payloads
+        .iter()
+        .map(|payload| payload.block.clone())
+        .collect()
+}
+
+/// Re-slices query sequence after all selected block boundaries are final.
+///
+/// Reverse-strand blocks are stored in read-chain coordinates after CIGAR
+/// parsing, while their source sequence remains SAM-oriented. The coordinate
+/// conversion here mirrors the earlier block flip and prevents `cs` and BAM
+/// `SEQ` from mixing a corrected reference block with an older or
+/// reverse-complemented query interval.
+fn payload_query_seqs(payloads: &[ChainBlockPayload], read_len: i32) -> Vec<String> {
+    payloads
+        .iter()
+        .map(|payload| {
+            let (read_start, read_end) = if payload.strand == '-' {
+                (
+                    read_len - payload.block.read_end + 1,
+                    read_len - payload.block.read_start + 1,
+                )
+            } else {
+                (payload.block.read_start, payload.block.read_end)
+            };
+            query_subseq(&payload.source_seq, read_start, read_end)
+        })
+        .collect()
+}
+
+/// Synchronizes query coordinates with reference-side boundary corrections.
+///
+/// Boundary correction functions currently operate on reference coordinates
+/// only. For the `.segments` cs field and `.segments.bam` SEQ field, the query
+/// interval must move by the same edge deltas. Reverse-strand alignments map
+/// reference start/end to the opposite query edges after block normalization, so
+/// they use the inverted edge deltas. If the corrected interval cannot be
+/// represented within the available read sequence, the block keeps its original
+/// coordinates rather than emitting a confidently wrong sequence.
+fn sync_payload_blocks_after_boundary_correction(
+    payloads: &mut [ChainBlockPayload],
+    corrected_blocks: &[SegmentBlock],
+    read_len: i32,
+) {
+    if payloads.len() != corrected_blocks.len() {
+        return;
+    }
+    for (payload, corrected) in payloads.iter_mut().zip(corrected_blocks.iter()) {
+        let original = payload.block.clone();
+        let mut synced = corrected.clone();
+        let start_delta = synced.ref_start - original.ref_start;
+        let end_delta = synced.ref_end - original.ref_end;
+        if start_delta != 0 || end_delta != 0 {
+            synced.cigar_ops.clear();
+        }
+        if payload.strand == '-' {
+            synced.read_start = original.read_start - end_delta;
+            synced.read_end = original.read_end - start_delta;
+        } else {
+            synced.read_start = original.read_start + start_delta;
+            synced.read_end = original.read_end + end_delta;
+        }
+        let available_read_len = if payload.source_seq.is_empty() {
+            read_len
+        } else {
+            payload.source_seq.len() as i32
+        };
+        if synced.read_start >= 1
+            && synced.read_end >= synced.read_start
+            && synced.read_end <= available_read_len
+        {
+            payload.block = synced;
+        }
+    }
 }
 
 /// Builds read-chain segment tokens and the matching CIRI-specific CIGAR.
@@ -6185,14 +6673,18 @@ fn materialize_chain(
 /// into a linear-looking `A|B|C` chain.
 fn materialize_read_chain_output(
     blocks: &[SegmentBlock],
+    query_seqs: &[String],
+    reference_seq: Option<&str>,
     token_strand: char,
     boundary_gap_idxs: &[usize],
     read_len: i32,
     reverse_chain_order: bool,
-) -> (Vec<String>, Vec<(i32, i32)>, String) {
+) -> (Vec<String>, Vec<(i32, i32)>, String, String) {
     let mut token_spans = Vec::with_capacity(blocks.len());
     let mut tokens = Vec::with_capacity(blocks.len() + boundary_gap_idxs.len());
     let mut cigar = String::new();
+    let mut cs = String::new();
+    let mut cs_available = reference_seq.is_some() && query_seqs.len() == blocks.len();
     if let Some(first) = blocks.first() {
         let leading_clip = if reverse_chain_order {
             read_len - first.read_end
@@ -6213,12 +6705,22 @@ fn materialize_read_chain_output(
                 'N'
             };
             let _ = write!(&mut cigar, "{}{}", gap, op);
+            if let Some(chr_seq) = reference_seq {
+                cs.push_str(&segment_gap_cs(prev, block, chr_seq, op == 'B'));
+            }
             if op == 'B' {
                 tokens.push("<bsj>".to_string());
             }
         }
-        let len = block.ref_end - block.ref_start + 1;
-        let _ = write!(&mut cigar, "{}M", len.max(0));
+        let block_cigar = segment_block_cigar(block);
+        cigar.push_str(&block_cigar);
+        if let Some(chr_seq) = reference_seq {
+            let block_cs = segment_block_cs(block, query_seqs.get(idx), chr_seq);
+            if block_cs == "*" {
+                cs_available = false;
+            }
+            cs.push_str(&block_cs);
+        }
         tokens.push(format!(
             "{}-{}:{}",
             block.ref_start, block.ref_end, token_strand
@@ -6235,7 +6737,194 @@ fn materialize_read_chain_output(
             let _ = write!(&mut cigar, "{}S", trailing_clip);
         }
     }
-    (tokens, token_spans, cigar)
+    let cs = if cs_available && !cs.is_empty() {
+        cs
+    } else {
+        "*".to_string()
+    };
+    (tokens, token_spans, cigar, cs)
+}
+
+/// Returns the CIGAR operations for one output segment block.
+///
+/// Boundary-corrected blocks intentionally drop their source operation list,
+/// because the old indel offsets no longer describe the corrected reference
+/// slice. Unchanged mapper blocks keep their internal `I/D` placement so the
+/// public `.segments` CIGAR can round-trip with the allele-aware `cs` field.
+fn segment_block_cigar(block: &SegmentBlock) -> String {
+    let ops = valid_segment_cigar_ops(block);
+    if ops.is_empty() {
+        let len = block.ref_end - block.ref_start + 1;
+        return format!("{}M", len.max(0));
+    }
+    let mut cigar = String::new();
+    for op in ops {
+        let _ = write!(&mut cigar, "{}{}", op.len, op.op);
+    }
+    cigar
+}
+
+/// Returns source CIGAR ops only when they still match the block spans.
+fn valid_segment_cigar_ops(block: &SegmentBlock) -> &[SegmentCigarOp] {
+    if block.cigar_ops.is_empty() {
+        return &[];
+    }
+    let query_len: i32 = block
+        .cigar_ops
+        .iter()
+        .filter(|op| matches!(op.op, 'M' | '=' | 'X' | 'I'))
+        .map(|op| op.len)
+        .sum();
+    let ref_len: i32 = block
+        .cigar_ops
+        .iter()
+        .filter(|op| matches!(op.op, 'M' | '=' | 'X' | 'D'))
+        .map(|op| op.len)
+        .sum();
+    if query_len == block.read_end - block.read_start + 1
+        && ref_len == block.ref_end - block.ref_start + 1
+    {
+        &block.cigar_ops
+    } else {
+        &[]
+    }
+}
+
+/// Encodes one aligned block as short-form cs against the reference.
+///
+/// Unchanged mapper blocks use their retained internal `M/I/D` operations, so
+/// insertions and deletions remain at their original query/reference offsets.
+/// Boundary-corrected blocks fall back to one contiguous `M` comparison; this
+/// is less expressive, but avoids claiming an indel position after annotation
+/// or circ-boundary snapping has moved the block edges.
+fn segment_block_cs(block: &SegmentBlock, query: Option<&String>, reference_seq: &str) -> String {
+    let Some(query) = query else {
+        return "*".to_string();
+    };
+    if query.is_empty() || block.ref_start <= 0 || block.ref_end < block.ref_start {
+        return "*".to_string();
+    }
+    let start = (block.ref_start - 1) as usize;
+    let end = block.ref_end as usize;
+    let Some(reference) = reference_seq.get(start..end) else {
+        return "*".to_string();
+    };
+    let mut out = String::new();
+    let ops = valid_segment_cigar_ops(block);
+    if !ops.is_empty() {
+        let mut ref_offset = 0usize;
+        let mut query_offset = 0usize;
+        let mut matches = 0usize;
+        for op in ops {
+            let len = op.len as usize;
+            match op.op {
+                'M' | '=' | 'X' => {
+                    let ref_slice = reference.get(ref_offset..ref_offset + len);
+                    let query_slice = query.get(query_offset..query_offset + len);
+                    let (Some(ref_slice), Some(query_slice)) = (ref_slice, query_slice) else {
+                        return "*".to_string();
+                    };
+                    append_match_or_sub_cs(&mut out, &mut matches, ref_slice, query_slice);
+                    ref_offset += len;
+                    query_offset += len;
+                }
+                'I' => {
+                    flush_cs_match(&mut out, &mut matches);
+                    let Some(inserted) = query.get(query_offset..query_offset + len) else {
+                        return "*".to_string();
+                    };
+                    out.push('+');
+                    out.push_str(&inserted.to_ascii_lowercase());
+                    query_offset += len;
+                }
+                'D' => {
+                    flush_cs_match(&mut out, &mut matches);
+                    let Some(deleted) = reference.get(ref_offset..ref_offset + len) else {
+                        return "*".to_string();
+                    };
+                    out.push('-');
+                    out.push_str(&deleted.to_ascii_lowercase());
+                    ref_offset += len;
+                }
+                _ => return "*".to_string(),
+            }
+        }
+        flush_cs_match(&mut out, &mut matches);
+        if ref_offset != reference.len() || query_offset != query.len() {
+            return "*".to_string();
+        }
+    } else {
+        let mut matches = 0usize;
+        append_match_or_sub_cs(&mut out, &mut matches, reference, query);
+        flush_cs_match(&mut out, &mut matches);
+    }
+    if out.is_empty() {
+        format!(":{}", query.len().min(reference.len()))
+    } else {
+        out
+    }
+}
+
+/// Appends `:`/`*` cs operations for a same-span reference/query comparison.
+fn append_match_or_sub_cs(out: &mut String, matches: &mut usize, reference: &str, query: &str) {
+    for (ref_base, query_base) in reference.bytes().zip(query.bytes()) {
+        if ref_base.eq_ignore_ascii_case(&query_base) {
+            *matches += 1;
+            continue;
+        }
+        flush_cs_match(out, matches);
+        out.push('*');
+        out.push(ref_base.to_ascii_lowercase() as char);
+        out.push(query_base.to_ascii_lowercase() as char);
+    }
+    if query.len() > reference.len() {
+        flush_cs_match(out, matches);
+        out.push('+');
+        out.push_str(&query[reference.len()..].to_ascii_lowercase());
+    } else if reference.len() > query.len() {
+        flush_cs_match(out, matches);
+        out.push('-');
+        out.push_str(&reference[query.len()..].to_ascii_lowercase());
+    }
+}
+
+/// Encodes an internal splice or CIRI back-splice jump in cs syntax.
+fn segment_gap_cs(
+    left: &SegmentBlock,
+    right: &SegmentBlock,
+    reference_seq: &str,
+    is_bsj: bool,
+) -> String {
+    let op = if is_bsj { '<' } else { '~' };
+    let gap = interval_gap(left, right).max(0);
+    let (low_end, high_start) = if left.ref_end < right.ref_start {
+        (left.ref_end, right.ref_start)
+    } else if right.ref_end < left.ref_start {
+        (right.ref_end, left.ref_start)
+    } else {
+        (
+            left.ref_end.min(right.ref_end),
+            left.ref_start.max(right.ref_start),
+        )
+    };
+    let donor = reference_dinucleotide_lower(reference_seq, low_end + 1)
+        .unwrap_or_else(|| "nn".to_string());
+    let acceptor = reference_dinucleotide_lower(reference_seq, high_start - 2)
+        .unwrap_or_else(|| "nn".to_string());
+    format!("{op}{donor}{gap}{acceptor}")
+}
+
+/// Appends a pending short-form cs match run.
+fn flush_cs_match(out: &mut String, matches: &mut usize) {
+    if *matches > 0 {
+        let _ = write!(out, ":{}", *matches);
+        *matches = 0;
+    }
+}
+
+/// Returns a lowercase 1-based two-base reference slice for cs splice signals.
+fn reference_dinucleotide_lower(chr_seq: &str, start: i32) -> Option<String> {
+    reference_dinucleotide(chr_seq, start).map(|seq| seq.to_ascii_lowercase())
 }
 
 /// Returns the read-chain gap index where the selected blocks cross BSJ.
@@ -6762,10 +7451,10 @@ fn is_bsj_transition(
     circ: &CircRecord,
     order_strand: char,
 ) -> bool {
-    let prev_near_start = prev.ref_start <= circ.start + 6;
-    let prev_near_end = prev.ref_end >= circ.end - 6;
-    let next_near_start = next.ref_start <= circ.start + 6;
-    let next_near_end = next.ref_end >= circ.end - 6;
+    let prev_near_start = (prev.ref_start - circ.start).abs() <= 6;
+    let prev_near_end = (prev.ref_end - circ.end).abs() <= 6;
+    let next_near_start = (next.ref_start - circ.start).abs() <= 6;
+    let next_near_end = (next.ref_end - circ.end).abs() <= 6;
     ((prev_near_start && next_near_end) || (prev_near_end && next_near_start))
         && wraps_in_read_order(prev, next, order_strand)
 }
@@ -6804,6 +7493,247 @@ fn apply_mate_bsj_evidence(
     }
 }
 
+/// Repairs the non-BSJ mate of a confirmed BSJ row with circ-compatible XA hits.
+///
+/// This is intentionally narrower than BSJ detection. Scan1/Scan2 have already
+/// decided that the read supports `circ`; XA is used only to choose the mate
+/// segment representation for `.segments`. BWA-MEM can prefer one long primary
+/// alignment in a paralogous region even when an `XA:Z` clipped alternative
+/// lands inside the confirmed circRNA span. In that situation the circ-context
+/// XA is a better read-level segment, but it must not create a new BSJ call.
+fn repair_bsj_non_bsj_mates_by_xa(
+    chains: &mut [Option<MateChain>; 2],
+    records: &[AsAlignment],
+    circ: &CircRecord,
+    read_len: i32,
+    token_strand: char,
+    junction_hints: &[(i32, i32)],
+    correction: Option<&SegmentCorrectionContext<'_>>,
+) {
+    for mate_idx in 0..chains.len() {
+        let Some(current) = chains[mate_idx].as_ref() else {
+            continue;
+        };
+        if current.is_bsj {
+            continue;
+        }
+        let current_rank = bsj_mate_context_rank(current, circ);
+        let mut best: Option<((i32, i32, i32, i32, i32, i32), MateChain)> = None;
+        for (record_idx, record) in records.iter().enumerate() {
+            if mate_bucket(record.flag) != mate_idx || record.xa_alternatives.is_empty() {
+                continue;
+            }
+            for alternative in record
+                .xa_alternatives
+                .iter()
+                .filter(|alternative| {
+                    bsj_mate_xa_is_circ_compatible(record, alternative, circ, read_len)
+                })
+                .take(BSJ_MATE_XA_MAX_ALTERNATIVES_PER_RECORD)
+            {
+                let mut candidate_records = records.to_vec();
+                candidate_records[record_idx] = alignment_from_xa(record, alternative);
+                let candidate_chains = build_pair_chains(
+                    &candidate_records,
+                    read_len,
+                    Some(circ),
+                    "bsj",
+                    token_strand,
+                    junction_hints,
+                    correction,
+                );
+                let Some(candidate) = candidate_chains[mate_idx].clone() else {
+                    continue;
+                };
+                if chain_circ_overlap_bases(&candidate, circ) == 0 {
+                    continue;
+                }
+                let rank = bsj_mate_context_rank(&candidate, circ);
+                if rank <= current_rank {
+                    continue;
+                }
+                if best.as_ref().is_none_or(|(best_rank, _)| rank > *best_rank) {
+                    best = Some((rank, candidate));
+                }
+            }
+        }
+        if let Some((_, repaired)) = best {
+            chains[mate_idx] = Some(repaired);
+        }
+    }
+}
+
+/// Repairs a confirmed BSJ row's mate with already retained circ-local blocks.
+///
+/// Some BWA-MEM records land a long mate primary in a paralogous locus and keep
+/// only short circ-compatible evidence as a local-clip pseudo row or
+/// supplementary block. For a Summary-confirmed BSJ read, a non-BSJ mate with
+/// zero overlap to the confirmed circRNA is a worse representation than a
+/// shorter retained block inside the same circRNA span. This repair is narrower
+/// than the general chain builder: it only fires for non-BSJ mates that
+/// currently have no circ overlap, and it never creates or rescues a BSJ call.
+fn repair_bsj_non_bsj_mates_by_circ_records(
+    chains: &mut [Option<MateChain>; 2],
+    records: &[AsAlignment],
+    circ: &CircRecord,
+    read_len: i32,
+    token_strand: char,
+    junction_hints: &[(i32, i32)],
+    correction: Option<&SegmentCorrectionContext<'_>>,
+) {
+    for mate_idx in 0..chains.len() {
+        let Some(current) = chains[mate_idx].as_ref() else {
+            continue;
+        };
+        if current.is_bsj || chain_outside_circ_bases(current, circ) == 0 {
+            continue;
+        }
+        let target_records: Vec<AsAlignment> = records
+            .iter()
+            .filter(|record| {
+                mate_bucket(record.flag) == mate_idx
+                    && alignment_record_circ_overlap_bases(record, circ, read_len)
+                        >= MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH
+            })
+            .cloned()
+            .collect();
+        if target_records.is_empty() {
+            continue;
+        }
+        let mut candidate_records: Vec<AsAlignment> = records
+            .iter()
+            .filter(|record| mate_bucket(record.flag) != mate_idx)
+            .cloned()
+            .collect();
+        candidate_records.extend(target_records);
+        let candidate_chains = build_pair_chains(
+            &candidate_records,
+            read_len,
+            Some(circ),
+            "bsj",
+            token_strand,
+            junction_hints,
+            correction,
+        );
+        let Some(candidate) = candidate_chains[mate_idx].clone() else {
+            continue;
+        };
+        if chain_circ_overlap_bases(&candidate, circ) == 0 {
+            continue;
+        }
+        if bsj_mate_context_rank(&candidate, circ) > bsj_mate_context_rank(current, circ) {
+            chains[mate_idx] = Some(candidate);
+        }
+    }
+}
+
+/// Returns whether one XA alternative is eligible for BSJ mate repair.
+fn bsj_mate_xa_is_circ_compatible(
+    record: &AsAlignment,
+    alternative: &XaAlternative,
+    circ: &CircRecord,
+    read_len: i32,
+) -> bool {
+    if alternative.chr != circ.chr || alternative.strand != strand_char(record.flag) {
+        return false;
+    }
+    let alt_record = alignment_from_xa(record, alternative);
+    let Some((start, end)) = alignment_ref_span(&alt_record, read_len) else {
+        return false;
+    };
+    interval_overlap_bases(start, end, circ.start, circ.end) >= MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH
+}
+
+/// Returns how many reference bases from one raw alignment overlap a circ span.
+fn alignment_record_circ_overlap_bases(
+    record: &AsAlignment,
+    circ: &CircRecord,
+    read_len: i32,
+) -> i32 {
+    if record.chr != circ.chr {
+        return 0;
+    }
+    let Some((start, end)) = alignment_ref_span(record, read_len) else {
+        return 0;
+    };
+    interval_overlap_bases(start, end, circ.start, circ.end)
+}
+
+/// Ranks one non-BSJ mate chain by compatibility with the confirmed circRNA.
+fn bsj_mate_context_rank(chain: &MateChain, circ: &CircRecord) -> (i32, i32, i32, i32, i32, i32) {
+    let same_chr = i32::from(chain.chrom == circ.chr);
+    let overlap = chain_circ_overlap_bases(chain, circ);
+    let outside = chain_outside_circ_bases(chain, circ);
+    let distance = chain_distance_to_circ(chain, circ);
+    (
+        same_chr,
+        -outside,
+        overlap,
+        -distance,
+        chain.query_coverage,
+        -(chain.used_secondary as i32 + chain.used_supplementary as i32),
+    )
+}
+
+/// Returns the selected bases that overlap a circRNA's outer span.
+fn chain_circ_overlap_bases(chain: &MateChain, circ: &CircRecord) -> i32 {
+    if chain.chrom != circ.chr {
+        return 0;
+    }
+    chain
+        .blocks
+        .iter()
+        .map(|block| interval_overlap_bases(block.ref_start, block.ref_end, circ.start, circ.end))
+        .sum()
+}
+
+/// Returns selected aligned bases outside the confirmed circRNA span.
+fn chain_outside_circ_bases(chain: &MateChain, circ: &CircRecord) -> i32 {
+    chain
+        .blocks
+        .iter()
+        .map(|block| {
+            let len = block.ref_end - block.ref_start + 1;
+            if chain.chrom != circ.chr {
+                len
+            } else {
+                len - interval_overlap_bases(block.ref_start, block.ref_end, circ.start, circ.end)
+            }
+        })
+        .sum()
+}
+
+/// Returns the minimum genomic distance from a chain to a circRNA span.
+fn chain_distance_to_circ(chain: &MateChain, circ: &CircRecord) -> i32 {
+    if chain.chrom != circ.chr {
+        return i32::MAX / 4;
+    }
+    chain
+        .blocks
+        .iter()
+        .map(|block| interval_distance(block.ref_start, block.ref_end, circ.start, circ.end))
+        .min()
+        .unwrap_or(i32::MAX / 4)
+}
+
+/// Returns the inclusive overlap length between two genomic intervals.
+fn interval_overlap_bases(left_start: i32, left_end: i32, right_start: i32, right_end: i32) -> i32 {
+    let start = left_start.max(right_start);
+    let end = left_end.min(right_end);
+    (end - start + 1).max(0)
+}
+
+/// Returns zero for overlapping intervals, otherwise their separating distance.
+fn interval_distance(left_start: i32, left_end: i32, right_start: i32, right_end: i32) -> i32 {
+    if left_end < right_start {
+        right_start - left_end
+    } else if right_end < left_start {
+        left_start - right_end
+    } else {
+        0
+    }
+}
+
 /// Returns whether a mate-level BSJ row belongs to the confirmed circRNA row.
 fn evidence_matches_circ(evidence: &MateBsjEvidence, circ: &CircRecord) -> bool {
     evidence.chr == circ.chr
@@ -6812,14 +7742,15 @@ fn evidence_matches_circ(evidence: &MateBsjEvidence, circ: &CircRecord) -> bool 
         && (evidence.strand == circ.strand || evidence.strand == "NA" || circ.strand == "NA")
 }
 
-/// Converts one optional chain to output segment text, CIGAR, and BSJ flag.
-fn chain_text(chain: Option<&MateChain>) -> (String, String, usize) {
+/// Converts one optional chain to output segment text, CIGAR, cs, and BSJ flag.
+fn chain_text(chain: Option<&MateChain>) -> (String, String, String, usize) {
     chain.map_or_else(
-        || ("NA".to_string(), "NA".to_string(), 0),
+        || ("NA".to_string(), "NA".to_string(), "NA".to_string(), 0),
         |chain| {
             (
                 chain.tokens.join("|"),
                 chain.cigar.clone(),
+                chain.cs.clone(),
                 usize::from(chain.is_bsj),
             )
         },
@@ -6914,12 +7845,12 @@ fn write_segments(path: &str, records: &[SegmentRecord]) -> Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     writeln!(
         writer,
-        "read_id\ttype\tcirc_id\tchrom\tstart\tend\tstrand\tis_circular\tis_r1_bsj\tis_r2_bsj\tr1_align_strand\tr2_align_strand\tr1_cigar\tr1_segments\tr2_cigar\tr2_segments"
+        "read_id\ttype\tcirc_id\tchrom\tstart\tend\tstrand\tis_circular\tis_r1_bsj\tis_r2_bsj\tr1_align_strand\tr2_align_strand\tr1_cigar\tr1_cs\tr1_segments\tr2_cigar\tr2_cs\tr2_segments"
     )?;
     for record in records {
         writeln!(
             writer,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             record.read_id,
             record.type_name,
             record.circ_id,
@@ -6933,8 +7864,10 @@ fn write_segments(path: &str, records: &[SegmentRecord]) -> Result<()> {
             record.r1_align_strand,
             record.r2_align_strand,
             record.r1_cigar,
+            record.r1_cs,
             record.r1_segments,
             record.r2_cigar,
+            record.r2_cs,
             record.r2_segments
         )?;
     }
@@ -8982,6 +9915,7 @@ mod tests {
             mapq: 60,
             cigar: "10S90M".to_string(),
             seq: "A".repeat(100),
+            cs: "*".to_string(),
             from_local_clip: false,
             xa_alternatives: Vec::new(),
         };
@@ -9005,6 +9939,7 @@ mod tests {
                 mapq: 60,
                 cigar: "50M50S".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -9015,6 +9950,7 @@ mod tests {
                 mapq: 60,
                 cigar: "50S50M".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -9046,6 +9982,7 @@ mod tests {
                 mapq: 60,
                 cigar: "1S150M21S".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -9056,6 +9993,7 @@ mod tests {
                 mapq: 60,
                 cigar: "1S50M100N50M21S".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -9121,6 +10059,7 @@ mod tests {
                 mapq: 60,
                 cigar: "1S150M21S".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -9131,6 +10070,7 @@ mod tests {
                 mapq: 60,
                 cigar: "1S50M100N50M21S".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -9183,6 +10123,7 @@ mod tests {
                 mapq: 60,
                 cigar: "150M".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -9193,6 +10134,7 @@ mod tests {
                 mapq: 60,
                 cigar: "100M".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -9238,6 +10180,7 @@ mod tests {
                 mapq: 60,
                 cigar: "1S100M21S".to_string(),
                 seq: "A".repeat(122),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -9248,6 +10191,7 @@ mod tests {
                 mapq: 60,
                 cigar: "1S100M21S".to_string(),
                 seq: "A".repeat(122),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -9258,6 +10202,7 @@ mod tests {
                 mapq: 60,
                 cigar: "100M".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -9268,6 +10213,7 @@ mod tests {
                 mapq: 60,
                 cigar: "100M".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -9288,6 +10234,7 @@ mod tests {
                 mapq: 9,
                 cigar: "1S100M21S".to_string(),
                 seq: "A".repeat(122),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -9298,6 +10245,7 @@ mod tests {
                 mapq: 60,
                 cigar: "1S100M21S".to_string(),
                 seq: "A".repeat(122),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -9317,6 +10265,7 @@ mod tests {
             mapq: 60,
             cigar: "51M".to_string(),
             seq: "A".repeat(51),
+            cs: "*".to_string(),
             from_local_clip: false,
             xa_alternatives: Vec::new(),
         };
@@ -9327,6 +10276,7 @@ mod tests {
             mapq: 60,
             cigar: "101M".to_string(),
             seq: "A".repeat(101),
+            cs: "*".to_string(),
             from_local_clip: false,
             xa_alternatives: Vec::new(),
         };
@@ -9348,6 +10298,7 @@ mod tests {
             mapq: 60,
             cigar: "51M".to_string(),
             seq: "A".repeat(51),
+            cs: "*".to_string(),
             from_local_clip: false,
             xa_alternatives: Vec::new(),
         };
@@ -9358,6 +10309,7 @@ mod tests {
             mapq: 60,
             cigar: "51M".to_string(),
             seq: "A".repeat(51),
+            cs: "*".to_string(),
             from_local_clip: false,
             xa_alternatives: Vec::new(),
         };
@@ -9379,6 +10331,7 @@ mod tests {
             mapq: 60,
             cigar: "21M".to_string(),
             seq: "A".repeat(151),
+            cs: "*".to_string(),
             from_local_clip: false,
             xa_alternatives: Vec::new(),
         };
@@ -9389,6 +10342,7 @@ mod tests {
             mapq: 60,
             cigar: "21M".to_string(),
             seq: "A".repeat(151),
+            cs: "*".to_string(),
             from_local_clip: false,
             xa_alternatives: Vec::new(),
         };
@@ -9410,6 +10364,7 @@ mod tests {
             mapq: 60,
             cigar: "15S51M30S".to_string(),
             seq: "A".repeat(96),
+            cs: "*".to_string(),
             from_local_clip: false,
             xa_alternatives: Vec::new(),
         };
@@ -9420,6 +10375,7 @@ mod tests {
             mapq: 60,
             cigar: "15S51M30S".to_string(),
             seq: "A".repeat(96),
+            cs: "*".to_string(),
             from_local_clip: false,
             xa_alternatives: Vec::new(),
         };
@@ -9441,6 +10397,7 @@ mod tests {
             mapq: 60,
             cigar: "109S21M21S".to_string(),
             seq: "A".repeat(151),
+            cs: "*".to_string(),
             from_local_clip: false,
             xa_alternatives: Vec::new(),
         };
@@ -9451,6 +10408,7 @@ mod tests {
             mapq: 60,
             cigar: "1S21M129S".to_string(),
             seq: "A".repeat(151),
+            cs: "*".to_string(),
             from_local_clip: false,
             xa_alternatives: Vec::new(),
         };
@@ -10353,6 +11311,7 @@ mod tests {
             mapq: 60,
             cigar: "130M20S".to_string(),
             seq: format!("{}{}", "G".repeat(130), clip),
+            cs: "*".to_string(),
             from_local_clip: false,
             xa_alternatives: Vec::new(),
         }];
@@ -10397,7 +11356,10 @@ mod tests {
         let enriched = add_non_bsj_local_clip_alignments(&records, &state);
 
         assert!(enriched.iter().any(|record| {
-            record.from_local_clip && record.pos == 300 && record.cigar == "130S20M"
+            record.from_local_clip
+                && record.pos == 300
+                && record.cigar == "130S20M"
+                && record.cs == ":20"
         }));
     }
 
@@ -10411,6 +11373,7 @@ mod tests {
                 mapq: 0,
                 cigar: "27S123M".to_string(),
                 seq: "A".repeat(150),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10421,6 +11384,7 @@ mod tests {
                 mapq: 0,
                 cigar: "29M121H".to_string(),
                 seq: "A".repeat(29),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: vec![XaAlternative {
                     chr: "chr1".to_string(),
@@ -10448,6 +11412,7 @@ mod tests {
                 mapq: 0,
                 cigar: "50M50S".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10458,6 +11423,7 @@ mod tests {
                 mapq: 0,
                 cigar: "50S50M".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: vec![XaAlternative {
                     chr: "chr1".to_string(),
@@ -10485,6 +11451,7 @@ mod tests {
                 mapq: 0,
                 cigar: "42S108M".to_string(),
                 seq: "A".repeat(150),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10495,6 +11462,7 @@ mod tests {
                 mapq: 0,
                 cigar: "44M106H".to_string(),
                 seq: "A".repeat(44),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: vec![
                     XaAlternative {
@@ -10531,6 +11499,7 @@ mod tests {
                 mapq: 0,
                 cigar: "60S90M".to_string(),
                 seq: "A".repeat(150),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10541,6 +11510,7 @@ mod tests {
                 mapq: 0,
                 cigar: "62M88H".to_string(),
                 seq: "A".repeat(62),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: vec![XaAlternative {
                     chr: "chr1".to_string(),
@@ -10557,6 +11527,7 @@ mod tests {
                 mapq: 55,
                 cigar: "85M65S".to_string(),
                 seq: "A".repeat(150),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10567,6 +11538,7 @@ mod tests {
                 mapq: 0,
                 cigar: "83H67M".to_string(),
                 seq: "A".repeat(67),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: vec![XaAlternative {
                     chr: "chr1".to_string(),
@@ -10594,6 +11566,7 @@ mod tests {
                 mapq: 0,
                 cigar: "44S106M".to_string(),
                 seq: "A".repeat(150),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: vec![XaAlternative {
                     chr: "chr1".to_string(),
@@ -10610,6 +11583,7 @@ mod tests {
                 mapq: 0,
                 cigar: "46M104H".to_string(),
                 seq: "A".repeat(46),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: vec![XaAlternative {
                     chr: "chr1".to_string(),
@@ -10626,6 +11600,7 @@ mod tests {
                 mapq: 23,
                 cigar: "123M27S".to_string(),
                 seq: "A".repeat(150),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10636,6 +11611,7 @@ mod tests {
                 mapq: 0,
                 cigar: "121H29M".to_string(),
                 seq: "A".repeat(29),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: vec![XaAlternative {
                     chr: "chr1".to_string(),
@@ -10663,6 +11639,7 @@ mod tests {
                 mapq: 0,
                 cigar: "50M50S".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10673,6 +11650,7 @@ mod tests {
                 mapq: 0,
                 cigar: "50S50M".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: vec![XaAlternative {
                     chr: "chr1".to_string(),
@@ -10700,6 +11678,7 @@ mod tests {
                 mapq: 60,
                 cigar: "50M50S".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10710,6 +11689,7 @@ mod tests {
                 mapq: 0,
                 cigar: "50S50M".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: vec![
                     XaAlternative {
@@ -10750,6 +11730,7 @@ mod tests {
                 mapq: 60,
                 cigar: "50M50S".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10760,6 +11741,7 @@ mod tests {
                 mapq: 60,
                 cigar: "50S50M".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10781,6 +11763,7 @@ mod tests {
                 mapq: 60,
                 cigar: "115M35S".to_string(),
                 seq: "A".repeat(150),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10791,6 +11774,7 @@ mod tests {
                 mapq: 60,
                 cigar: "115H35M".to_string(),
                 seq: "A".repeat(35),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10801,6 +11785,7 @@ mod tests {
                 mapq: 60,
                 cigar: "22S80M48S".to_string(),
                 seq: "A".repeat(150),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10811,6 +11796,7 @@ mod tests {
                 mapq: 60,
                 cigar: "101H49M".to_string(),
                 seq: "A".repeat(49),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10821,6 +11807,7 @@ mod tests {
                 mapq: 0,
                 cigar: "23M127H".to_string(),
                 seq: "A".repeat(23),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: vec![XaAlternative {
                     chr: "chr1".to_string(),
@@ -10855,6 +11842,7 @@ mod tests {
                 mapq: 60,
                 cigar: "50M50S".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10865,6 +11853,7 @@ mod tests {
                 mapq: 60,
                 cigar: "50S50M".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10875,6 +11864,7 @@ mod tests {
                 mapq: 60,
                 cigar: "100M".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10902,8 +11892,10 @@ mod tests {
                 r1_align_strand: "NA".to_string(),
                 r2_align_strand: "NA".to_string(),
                 r1_cigar: "NA".to_string(),
+                r1_cs: "NA".to_string(),
                 r1_segments: "NA".to_string(),
                 r2_cigar: "NA".to_string(),
+                r2_cs: "NA".to_string(),
                 r2_segments: "NA".to_string(),
             },
             SegmentRecord {
@@ -10920,8 +11912,10 @@ mod tests {
                 r1_align_strand: "NA".to_string(),
                 r2_align_strand: "NA".to_string(),
                 r1_cigar: "NA".to_string(),
+                r1_cs: "NA".to_string(),
                 r1_segments: "NA".to_string(),
                 r2_cigar: "NA".to_string(),
+                r2_cs: "NA".to_string(),
                 r2_segments: "NA".to_string(),
             },
             SegmentRecord {
@@ -10938,8 +11932,10 @@ mod tests {
                 r1_align_strand: "NA".to_string(),
                 r2_align_strand: "NA".to_string(),
                 r1_cigar: "NA".to_string(),
+                r1_cs: "NA".to_string(),
                 r1_segments: "NA".to_string(),
                 r2_cigar: "NA".to_string(),
+                r2_cs: "NA".to_string(),
                 r2_segments: "NA".to_string(),
             },
         ];
@@ -10974,6 +11970,7 @@ mod tests {
                 mapq: 60,
                 cigar: "50M50S".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -10984,6 +11981,7 @@ mod tests {
                 mapq: 60,
                 cigar: "50S50M".to_string(),
                 seq: "A".repeat(100),
+                cs: "*".to_string(),
                 from_local_clip: false,
                 xa_alternatives: Vec::new(),
             },
@@ -11015,6 +12013,7 @@ mod tests {
             chrom: "chr1".to_string(),
             strand: '+',
             mapq: 60,
+            seq: "A".repeat(1000),
             blocks: vec![
                 SegmentBlock {
                     read_start: 1,
@@ -11022,6 +12021,7 @@ mod tests {
                     ref_start: 200,
                     ref_end: 209,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
                 SegmentBlock {
                     read_start: 11,
@@ -11029,6 +12029,7 @@ mod tests {
                     ref_start: 300,
                     ref_end: 349,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
                 SegmentBlock {
                     read_start: 61,
@@ -11036,6 +12037,7 @@ mod tests {
                     ref_start: 100,
                     ref_end: 149,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
             ],
         }];
@@ -11056,6 +12058,345 @@ mod tests {
     }
 
     #[test]
+    fn materialize_chain_emits_short_cs_with_custom_bsj_op() {
+        let mut chr = vec![b'N'; 220];
+        chr[99..109].copy_from_slice(b"ACGTACGTAA");
+        chr[109..111].copy_from_slice(b"GT");
+        chr[197..199].copy_from_slice(b"AG");
+        chr[199..209].copy_from_slice(b"CCCCCCCCCC");
+        let mut reference = HashMap::new();
+        reference.insert("chr1".to_string(), String::from_utf8(chr).unwrap());
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: None,
+            junction_support: None,
+        };
+        let circ = CircRecord {
+            id: "chr1:100|209".to_string(),
+            chr: "chr1".to_string(),
+            start: 100,
+            end: 209,
+            junction_read_count: "1".to_string(),
+            gene_id: "GENE1".to_string(),
+            strand: "+".to_string(),
+        };
+        let parsed = vec![ParsedAlignment {
+            flag: 0,
+            chrom: "chr1".to_string(),
+            strand: '+',
+            mapq: 60,
+            seq: "CCCCCCCCCCACGTTCGTAA".to_string(),
+            blocks: vec![
+                SegmentBlock {
+                    read_start: 1,
+                    read_end: 10,
+                    ref_start: 200,
+                    ref_end: 209,
+                    from_local_clip: false,
+                    cigar_ops: Vec::new(),
+                },
+                SegmentBlock {
+                    read_start: 11,
+                    read_end: 20,
+                    ref_start: 100,
+                    ref_end: 109,
+                    from_local_clip: false,
+                    cigar_ops: Vec::new(),
+                },
+            ],
+        }];
+
+        let chain = materialize_chain(&parsed, 20, Some(&circ), '+', &[], Some(&correction), false)
+            .unwrap();
+
+        assert_eq!(chain.cigar, "10M90B10M");
+        assert_eq!(chain.cs, ":10<gt90ag:4*at:5");
+    }
+
+    #[test]
+    fn materialize_chain_preserves_internal_indel_position_in_cs() {
+        let mut chr = vec![b'N'; 120];
+        chr[99..109].copy_from_slice(b"AAAAACCCCC");
+        let mut reference = HashMap::new();
+        reference.insert("chr1".to_string(), String::from_utf8(chr).unwrap());
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: None,
+            junction_support: None,
+        };
+        let parsed = vec![ParsedAlignment {
+            flag: 0,
+            chrom: "chr1".to_string(),
+            strand: '+',
+            mapq: 60,
+            seq: "AAAAAGCCCCC".to_string(),
+            blocks: vec![SegmentBlock {
+                read_start: 1,
+                read_end: 11,
+                ref_start: 100,
+                ref_end: 109,
+                from_local_clip: false,
+                cigar_ops: vec![
+                    SegmentCigarOp { len: 5, op: 'M' },
+                    SegmentCigarOp { len: 1, op: 'I' },
+                    SegmentCigarOp { len: 5, op: 'M' },
+                ],
+            }],
+        }];
+
+        let chain =
+            materialize_chain(&parsed, 11, None, '+', &[], Some(&correction), false).unwrap();
+
+        assert_eq!(chain.cigar, "5M1I5M");
+        assert_eq!(chain.cs, ":5+g:5");
+    }
+
+    #[test]
+    fn materialize_chain_reslices_query_after_internal_boundary_correction() {
+        let mut annotation = Annotation::new();
+        annotation
+            .chr_exon_end_map
+            .insert("chr1\t103".to_string(), "GENE1\t+".to_string());
+        annotation
+            .chr_exon_start_map
+            .insert("chr1\t201".to_string(), "GENE1\t+".to_string());
+        annotation
+            .transcript_splice_map
+            .insert("chr1\t103\t201\t+".to_string());
+        let mut chr = vec![b'N'; 230];
+        chr[99..103].copy_from_slice(b"ACGT");
+        chr[103..105].copy_from_slice(b"GT");
+        chr[198..200].copy_from_slice(b"AG");
+        chr[200..204].copy_from_slice(b"GGAA");
+        let mut reference = HashMap::new();
+        reference.insert("chr1".to_string(), String::from_utf8(chr).unwrap());
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: Some(&annotation),
+            junction_support: None,
+        };
+        let parsed = vec![ParsedAlignment {
+            flag: 0,
+            chrom: "chr1".to_string(),
+            strand: '+',
+            mapq: 60,
+            seq: "ACGTCCGGAA".to_string(),
+            blocks: vec![
+                SegmentBlock {
+                    read_start: 1,
+                    read_end: 5,
+                    ref_start: 100,
+                    ref_end: 104,
+                    from_local_clip: false,
+                    cigar_ops: Vec::new(),
+                },
+                SegmentBlock {
+                    read_start: 6,
+                    read_end: 10,
+                    ref_start: 200,
+                    ref_end: 204,
+                    from_local_clip: false,
+                    cigar_ops: Vec::new(),
+                },
+            ],
+        }];
+
+        let chain =
+            materialize_chain(&parsed, 10, None, '+', &[], Some(&correction), false).unwrap();
+
+        assert_eq!(
+            chain.tokens,
+            vec!["100-103:+".to_string(), "201-204:+".to_string()]
+        );
+        assert_eq!(chain.cigar, "4M97N4M");
+        assert_eq!(chain.cs, ":4~gt97ag:4");
+    }
+
+    #[test]
+    fn materialize_chain_reslices_query_after_circ_boundary_correction() {
+        let mut chr = vec![b'N'; 220];
+        chr[99..143].copy_from_slice("ACGT".repeat(11).as_bytes());
+        chr[143..145].copy_from_slice(b"GT");
+        chr[187..189].copy_from_slice(b"AG");
+        chr[189..199].copy_from_slice(b"CCCCCCCCCC");
+        let mut reference = HashMap::new();
+        reference.insert("chr1".to_string(), String::from_utf8(chr).unwrap());
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: None,
+            junction_support: None,
+        };
+        let circ = CircRecord {
+            id: "chr1:100|199".to_string(),
+            chr: "chr1".to_string(),
+            start: 100,
+            end: 199,
+            junction_read_count: "1".to_string(),
+            gene_id: "GENE1".to_string(),
+            strand: "+".to_string(),
+        };
+        let right_query = "ACGT".repeat(11);
+        let parsed = vec![ParsedAlignment {
+            flag: 0,
+            chrom: "chr1".to_string(),
+            strand: '+',
+            mapq: 60,
+            seq: format!("CCCCCCCCCCT{right_query}"),
+            blocks: vec![
+                SegmentBlock {
+                    read_start: 1,
+                    read_end: 10,
+                    ref_start: 190,
+                    ref_end: 199,
+                    from_local_clip: false,
+                    cigar_ops: Vec::new(),
+                },
+                SegmentBlock {
+                    read_start: 11,
+                    read_end: 55,
+                    ref_start: 99,
+                    ref_end: 143,
+                    from_local_clip: false,
+                    cigar_ops: Vec::new(),
+                },
+            ],
+        }];
+
+        let chain = materialize_chain(&parsed, 55, Some(&circ), '+', &[], Some(&correction), false)
+            .unwrap();
+
+        assert_eq!(
+            chain.tokens,
+            vec![
+                "190-199:+".to_string(),
+                "<bsj>".to_string(),
+                "100-143:+".to_string()
+            ]
+        );
+        assert_eq!(chain.cigar, "10M46B44M");
+        assert_eq!(chain.cs, ":10<gt46ag:44");
+    }
+
+    #[test]
+    fn materialize_chain_reslices_reverse_query_from_opposite_edge() {
+        let mut chr = vec![b'N'; 120];
+        chr[99..103].copy_from_slice(b"ACGT");
+        let mut reference = HashMap::new();
+        reference.insert("chr1".to_string(), String::from_utf8(chr).unwrap());
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: None,
+            junction_support: None,
+        };
+        let circ = CircRecord {
+            id: "chr1:100|103".to_string(),
+            chr: "chr1".to_string(),
+            start: 100,
+            end: 103,
+            junction_read_count: "1".to_string(),
+            gene_id: "GENE1".to_string(),
+            strand: "-".to_string(),
+        };
+        let parsed = vec![ParsedAlignment {
+            flag: 0x10,
+            chrom: "chr1".to_string(),
+            strand: '-',
+            mapq: 60,
+            seq: "TACGT".to_string(),
+            blocks: vec![SegmentBlock {
+                read_start: 1,
+                read_end: 5,
+                ref_start: 99,
+                ref_end: 103,
+                from_local_clip: false,
+                cigar_ops: Vec::new(),
+            }],
+        }];
+
+        let chain =
+            materialize_chain(&parsed, 5, Some(&circ), '-', &[], Some(&correction), false).unwrap();
+
+        assert_eq!(chain.tokens, vec!["100-103:-".to_string()]);
+        assert_eq!(chain.cigar, "4M1S");
+        assert_eq!(chain.cs, ":4");
+    }
+
+    #[test]
+    fn short_cs_reconstruction_restores_clips_and_hard_clip_offsets() {
+        let reference = "NNNNNNNNNACGATTTT".to_string();
+
+        let soft =
+            sequence_from_short_cs("2S4M", ":4", 10, 6, Some(&reference), Some("L:TT")).unwrap();
+        assert_eq!(soft, "TTACGA");
+
+        let hard = sequence_from_short_cs("3H4M", ":4", 10, 7, Some(&reference), None).unwrap();
+        assert_eq!(hard, "NNNACGA");
+    }
+
+    #[test]
+    fn materialize_chain_reverse_order_cs_uses_output_query_orientation() {
+        let mut reference = HashMap::new();
+        reference.insert("chr1".to_string(), "NNNNNNNNNACGA".to_string());
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: None,
+            junction_support: None,
+        };
+        let parsed = vec![ParsedAlignment {
+            flag: 0x10,
+            chrom: "chr1".to_string(),
+            strand: '-',
+            mapq: 60,
+            seq: "NNACGA".to_string(),
+            blocks: vec![SegmentBlock {
+                read_start: 1,
+                read_end: 4,
+                ref_start: 10,
+                ref_end: 13,
+                from_local_clip: false,
+                cigar_ops: Vec::new(),
+            }],
+        }];
+
+        let chain = materialize_chain(&parsed, 6, None, '+', &[], Some(&correction), true).unwrap();
+
+        assert_eq!(chain.cigar, "2S4M");
+        assert_eq!(chain.cs, ":4");
+    }
+
+    #[test]
+    fn materialize_chain_reverse_alignment_cs_uses_sam_sequence_orientation() {
+        let mut reference = HashMap::new();
+        reference.insert("chr1".to_string(), "NNNNNNNNNACGA".to_string());
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: None,
+            junction_support: None,
+        };
+        let parsed = vec![ParsedAlignment {
+            flag: 0x10,
+            chrom: "chr1".to_string(),
+            strand: '-',
+            mapq: 60,
+            seq: "NNACGA".to_string(),
+            blocks: vec![SegmentBlock {
+                read_start: 1,
+                read_end: 4,
+                ref_start: 10,
+                ref_end: 13,
+                from_local_clip: false,
+                cigar_ops: Vec::new(),
+            }],
+        }];
+
+        let chain =
+            materialize_chain(&parsed, 6, None, '+', &[], Some(&correction), false).unwrap();
+
+        assert_eq!(chain.cigar, "4M2S");
+        assert_eq!(chain.cs, ":4");
+    }
+
+    #[test]
     fn bsj_marker_uses_start_side_block_for_reverse_wrap_order() {
         let circ = CircRecord {
             id: "chr1:100|349".to_string(),
@@ -11071,6 +12412,7 @@ mod tests {
             chrom: "chr1".to_string(),
             strand: '-',
             mapq: 60,
+            seq: "A".repeat(1000),
             blocks: vec![
                 SegmentBlock {
                     read_start: 1,
@@ -11078,6 +12420,7 @@ mod tests {
                     ref_start: 100,
                     ref_end: 149,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
                 SegmentBlock {
                     read_start: 51,
@@ -11085,6 +12428,7 @@ mod tests {
                     ref_start: 300,
                     ref_end: 349,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
                 SegmentBlock {
                     read_start: 111,
@@ -11092,6 +12436,7 @@ mod tests {
                     ref_start: 200,
                     ref_end: 209,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
             ],
         }];
@@ -11129,6 +12474,7 @@ mod tests {
             mapq: 60,
             cigar: "10S90M".to_string(),
             seq: "A".repeat(100),
+            cs: "*".to_string(),
             from_local_clip: false,
             xa_alternatives: Vec::new(),
         }];
@@ -11152,18 +12498,142 @@ mod tests {
     }
 
     #[test]
+    fn bsj_segments_repair_non_bsj_mate_with_circ_context_xa() {
+        let circ = CircRecord {
+            id: "chr1:1000|2000".to_string(),
+            chr: "chr1".to_string(),
+            start: 1000,
+            end: 2000,
+            junction_read_count: "1".to_string(),
+            gene_id: "GENE1".to_string(),
+            strand: "+".to_string(),
+        };
+        let records = vec![
+            AsAlignment {
+                flag: 0x40,
+                chr: "chr1".to_string(),
+                pos: 100000,
+                mapq: 60,
+                cigar: "33M1I116M".to_string(),
+                seq: "A".repeat(150),
+                cs: "*".to_string(),
+                from_local_clip: false,
+                xa_alternatives: vec![XaAlternative {
+                    chr: "chr1".to_string(),
+                    strand: '+',
+                    pos: 1500,
+                    cigar: "45S105M".to_string(),
+                    edit_distance: 0,
+                }],
+            },
+            AsAlignment {
+                flag: 0x80,
+                chr: "chr1".to_string(),
+                pos: 1900,
+                mapq: 60,
+                cigar: "80M70S".to_string(),
+                seq: "A".repeat(150),
+                cs: "*".to_string(),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+        ];
+        let evidence = vec![MateBsjEvidence {
+            mate_bucket: 1,
+            chr: "chr1".to_string(),
+            start: 1000,
+            end: 2000,
+            strand: "+".to_string(),
+            priority: 0,
+            source_stage: "scan2".to_string(),
+        }];
+
+        let record =
+            build_bsj_segment_record("read1", &records, &circ, &evidence, &[], None, 150).unwrap();
+
+        assert_eq!(record.r1_segments, "1500-1604:+");
+        assert_eq!(record.r1_cigar, "45S105M");
+        assert_eq!(record.is_r1_bsj, 0);
+        assert_eq!(record.is_r2_bsj, 1);
+    }
+
+    #[test]
+    fn bsj_segments_repair_mate_before_bsj_evidence_label() {
+        let circ = CircRecord {
+            id: "chr1:93298946|93299217".to_string(),
+            chr: "chr1".to_string(),
+            start: 93298946,
+            end: 93299217,
+            junction_read_count: "1".to_string(),
+            gene_id: "GENE1".to_string(),
+            strand: "+".to_string(),
+        };
+        let records = vec![
+            AsAlignment {
+                flag: 0x80 | 0x10,
+                chr: "chr1".to_string(),
+                pos: 91489476,
+                mapq: 60,
+                cigar: "32S118M".to_string(),
+                seq: "A".repeat(150),
+                cs: "*".to_string(),
+                from_local_clip: false,
+                xa_alternatives: vec![XaAlternative {
+                    chr: "chr1".to_string(),
+                    strand: '-',
+                    pos: 93298944,
+                    cigar: "31S72M47S".to_string(),
+                    edit_distance: 0,
+                }],
+            },
+            AsAlignment {
+                flag: 0x80 | 0x10 | 0x800,
+                chr: "chr1".to_string(),
+                pos: 93299185,
+                mapq: 60,
+                cigar: "34M116H".to_string(),
+                seq: "A".repeat(34),
+                cs: "*".to_string(),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+        ];
+        let evidence = vec![MateBsjEvidence {
+            mate_bucket: 1,
+            chr: "chr1".to_string(),
+            start: circ.start,
+            end: circ.end,
+            strand: "+".to_string(),
+            priority: 2,
+            source_stage: "scan2".to_string(),
+        }];
+
+        let record =
+            build_bsj_segment_record("read1", &records, &circ, &evidence, &[], None, 150).unwrap();
+
+        assert_eq!(
+            record.r2_segments,
+            "93299185-93299218:+|<bsj>|93298946-93299015:+"
+        );
+        assert_eq!(record.is_r2_bsj, 1);
+        assert!(!record.r2_segments.contains("91489476"));
+    }
+
+    #[test]
     fn materialize_chain_preserves_terminal_soft_clips_in_output_cigar() {
         let parsed = vec![ParsedAlignment {
             flag: 0,
             chrom: "chr1".to_string(),
             strand: '+',
             mapq: 60,
+            seq: "A".repeat(1000),
             blocks: vec![SegmentBlock {
                 read_start: 11,
                 read_end: 90,
                 ref_start: 100,
                 ref_end: 179,
                 from_local_clip: false,
+                cigar_ops: Vec::new(),
             }],
         }];
 
@@ -11192,6 +12662,7 @@ mod tests {
                 ref_start: 100,
                 ref_end: 149,
                 from_local_clip: false,
+                cigar_ops: Vec::new(),
             },
             SegmentBlock {
                 read_start: 91,
@@ -11199,6 +12670,7 @@ mod tests {
                 ref_start: 150,
                 ref_end: 199,
                 from_local_clip: false,
+                cigar_ops: Vec::new(),
             },
         );
         let high_then_low = (low_then_high.1.clone(), low_then_high.0.clone());
@@ -11237,12 +12709,14 @@ mod tests {
                 chrom: "chr1".to_string(),
                 strand: '-',
                 mapq: 60,
+                seq: "A".repeat(1000),
                 blocks: vec![SegmentBlock {
                     read_start: 1,
                     read_end: 29,
                     ref_start: 93811203,
                     ref_end: 93811231,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 }],
             },
             ParsedAlignment {
@@ -11250,12 +12724,14 @@ mod tests {
                 chrom: "chr1".to_string(),
                 strand: '-',
                 mapq: 60,
+                seq: "A".repeat(1000),
                 blocks: vec![SegmentBlock {
                     read_start: 29,
                     read_end: 83,
                     ref_start: 93806014,
                     ref_end: 93806068,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 }],
             },
             ParsedAlignment {
@@ -11263,12 +12739,14 @@ mod tests {
                 chrom: "chr1".to_string(),
                 strand: '-',
                 mapq: 60,
+                seq: "A".repeat(1000),
                 blocks: vec![SegmentBlock {
                     read_start: 83,
                     read_end: 150,
                     ref_start: 93811273,
                     ref_end: 93811340,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 }],
             },
         ];
@@ -11307,6 +12785,7 @@ mod tests {
             chrom: "chr1".to_string(),
             strand: '+',
             mapq: 60,
+            seq: "A".repeat(1000),
             blocks: vec![
                 SegmentBlock {
                     read_start: 1,
@@ -11314,6 +12793,7 @@ mod tests {
                     ref_start: 171292245,
                     ref_end: 171292332,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
                 SegmentBlock {
                     read_start: 89,
@@ -11321,6 +12801,7 @@ mod tests {
                     ref_start: 171300777,
                     ref_end: 171300834,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
             ],
         }];
@@ -11367,6 +12848,7 @@ mod tests {
             chrom: "chr1".to_string(),
             strand: '+',
             mapq: 60,
+            seq: "A".repeat(1000),
             blocks: vec![
                 SegmentBlock {
                     read_start: 1,
@@ -11374,6 +12856,7 @@ mod tests {
                     ref_start: 100,
                     ref_end: 196,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
                 SegmentBlock {
                     read_start: 98,
@@ -11381,6 +12864,7 @@ mod tests {
                     ref_start: 300,
                     ref_end: 350,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
             ],
         }];
@@ -11413,6 +12897,7 @@ mod tests {
             chrom: "chr1".to_string(),
             strand: '+',
             mapq: 60,
+            seq: "A".repeat(1000),
             blocks: vec![
                 SegmentBlock {
                     read_start: 1,
@@ -11420,6 +12905,7 @@ mod tests {
                     ref_start: 100,
                     ref_end: 199,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
                 SegmentBlock {
                     read_start: 131,
@@ -11427,6 +12913,7 @@ mod tests {
                     ref_start: 340,
                     ref_end: 359,
                     from_local_clip: true,
+                    cigar_ops: Vec::new(),
                 },
             ],
         }];
@@ -11486,6 +12973,7 @@ mod tests {
             chrom: "chr1".to_string(),
             strand: '+',
             mapq: 60,
+            seq: "A".repeat(1000),
             blocks: vec![
                 SegmentBlock {
                     read_start: 1,
@@ -11493,6 +12981,7 @@ mod tests {
                     ref_start: 100,
                     ref_end: 199,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
                 SegmentBlock {
                     read_start: 131,
@@ -11500,6 +12989,7 @@ mod tests {
                     ref_start: 340,
                     ref_end: 359,
                     from_local_clip: true,
+                    cigar_ops: Vec::new(),
                 },
             ],
         }];
@@ -11549,6 +13039,7 @@ mod tests {
             chrom: "chr1".to_string(),
             strand: '+',
             mapq: 60,
+            seq: "A".repeat(1000),
             blocks: vec![
                 SegmentBlock {
                     read_start: 1,
@@ -11556,6 +13047,7 @@ mod tests {
                     ref_start: 300,
                     ref_end: 349,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
                 SegmentBlock {
                     read_start: 51,
@@ -11563,6 +13055,7 @@ mod tests {
                     ref_start: 100,
                     ref_end: 150,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
                 SegmentBlock {
                     read_start: 102,
@@ -11570,6 +13063,7 @@ mod tests {
                     ref_start: 198,
                     ref_end: 249,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
             ],
         }];
@@ -11617,6 +13111,7 @@ mod tests {
             chrom: "chr1".to_string(),
             strand: '+',
             mapq: 60,
+            seq: "A".repeat(1000),
             blocks: vec![
                 SegmentBlock {
                     read_start: 1,
@@ -11624,6 +13119,7 @@ mod tests {
                     ref_start: 100,
                     ref_end: 151,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
                 SegmentBlock {
                     read_start: 53,
@@ -11631,6 +13127,7 @@ mod tests {
                     ref_start: 198,
                     ref_end: 250,
                     from_local_clip: false,
+                    cigar_ops: Vec::new(),
                 },
             ],
         }];

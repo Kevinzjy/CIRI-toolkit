@@ -10,15 +10,22 @@ use crate::runtime::{
     emit_perf_line, emit_trace_line, scan2_profile_enabled, should_trace_read, with_trace_hg2_scope,
 };
 use crate::utils::{
-    bam_shard_count, bsj_is_summary_priority, bsj_payload_start, clip_sequence_payload,
-    local_clip_evidence_lines, part_path, reverse_complement, AlignmentRecord,
+    alignment_short_cs, bam_shard_count, bsj_is_summary_priority, bsj_payload_start,
+    clip_sequence_payload, local_clip_evidence_lines, part_path, reverse_complement,
+    AlignmentRecord,
 };
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use noodles::sam::{
     self,
-    alignment::{record::Sequence as _, Record as _},
+    alignment::{
+        record::{
+            data::field::{Tag, Value},
+            Data as _, Sequence as _,
+        },
+        Record as _,
+    },
 };
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -77,6 +84,57 @@ pub struct Scan2 {
 pub struct Scan2SegmentArtifacts {
     /// Shard-local non-BSJ topology sidecars retained for direct segments input.
     pub non_bsj_segment_evidence_paths: Vec<String>,
+}
+
+/// Returns a stable text payload for one optional `XA:Z` field.
+///
+/// Scan2 writes `*` for missing alternatives, but otherwise preserves raw BWA
+/// XA syntax so the post-Summary segments phase can parse alternatives without
+/// a second pass over BAM/SAM.
+fn xa_payload(raw: &str) -> &str {
+    if raw.is_empty() {
+        "*"
+    } else {
+        raw
+    }
+}
+
+/// Extracts a raw BWA `XA:Z` payload from one SAM record.
+///
+/// XA never feeds Scan2 rescue or FSJ counting. It is carried only as sidecar
+/// evidence for later circ-context segment chain selection.
+fn raw_xa_from_sam_record(record: &sam::Record) -> Result<String> {
+    let tag = Tag::new(b'X', b'A');
+    let data = record.data();
+    let Some(value) = data.get(&tag).transpose()? else {
+        return Ok(String::new());
+    };
+    let Value::String(raw) = value else {
+        return Ok(String::new());
+    };
+    let Ok(raw) = std::str::from_utf8(raw.as_ref()) else {
+        return Ok(String::new());
+    };
+    Ok(raw.to_string())
+}
+
+/// Extracts a raw BWA `XA:Z` payload from one BAM record.
+///
+/// Malformed optional tags are treated as absent because XA is a post-Summary
+/// representation hint, not required evidence for CIRI3 parity decisions.
+fn raw_xa_from_bam_record(record: &noodles::bam::Record) -> Result<String> {
+    let tag = Tag::new(b'X', b'A');
+    let data = record.data();
+    let Some(value) = data.get(&tag).transpose()? else {
+        return Ok(String::new());
+    };
+    let Value::String(raw) = value else {
+        return Ok(String::new());
+    };
+    let Ok(raw) = std::str::from_utf8(raw.as_ref()) else {
+        return Ok(String::new());
+    };
+    Ok(raw.to_string())
 }
 
 #[derive(Clone)]
@@ -1109,6 +1167,7 @@ impl Scan2 {
         read_id: &str,
         stage: &str,
         alignments: &[AlignmentRecord<'a>],
+        reference: &HashMap<String, String>,
     ) -> Vec<String> {
         let mut rows = Vec::new();
         for aln in alignments {
@@ -1117,8 +1176,15 @@ impl Scan2 {
             }
             let mate = if aln.flag & 0x40 != 0 { "R1" } else { "R2" };
             let clips = clip_sequence_payload(aln.cigar.as_ref(), aln.seq.as_ref());
+            let cs = alignment_short_cs(
+                aln.cigar.as_ref(),
+                aln.seq.as_ref(),
+                aln.chrom.as_ref(),
+                aln.pos,
+                reference,
+            );
             rows.push(format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 read_id,
                 stage,
                 mate,
@@ -1128,7 +1194,9 @@ impl Scan2 {
                 aln.mapq,
                 aln.cigar,
                 aln.seq.len(),
-                clips
+                clips,
+                cs,
+                xa_payload(aln.xa.as_ref())
             ));
         }
         rows
@@ -1141,11 +1209,13 @@ impl Scan2 {
     /// decide whether a group is worth re-evaluating after Summary. Soft clips
     /// are stored as compact `L:/R:` payloads so local clip placement remains
     /// available without repeating full read sequences across every alignment.
-    /// The short `N` stage and six-field alignment payload keep the large
-    /// whole-genome sidecar cheaper to write and parse.
+    /// The short `N` stage and compact alignment payload also carries
+    /// short-form cs so sequence-aware `.segments.bam` can be reconstructed
+    /// without rescanning FASTQ/BAM.
     fn non_bsj_segment_evidence_lines<'a>(
         read_id: &str,
         alignments: &[AlignmentRecord<'a>],
+        reference: &HashMap<String, String>,
     ) -> Vec<String> {
         if !Self::may_support_non_bsj_segments(alignments) {
             return Vec::new();
@@ -1156,9 +1226,16 @@ impl Scan2 {
                 continue;
             }
             let clips = clip_sequence_payload(aln.cigar.as_ref(), aln.seq.as_ref());
+            let cs = alignment_short_cs(
+                aln.cigar.as_ref(),
+                aln.seq.as_ref(),
+                aln.chrom.as_ref(),
+                aln.pos,
+                reference,
+            );
             records.push(format!(
-                "{}|{}|{}|{}|{}|{}",
-                aln.flag, aln.chrom, aln.pos, aln.mapq, aln.cigar, clips
+                "{}|{}|{}|{}|{}|{}|{}",
+                aln.flag, aln.chrom, aln.pos, aln.mapq, aln.cigar, clips, cs
             ));
         }
         if records.is_empty() {
@@ -1469,7 +1546,7 @@ impl Scan2 {
         bsj_lines: &[String],
         reference: &HashMap<String, String>,
     ) -> Vec<String> {
-        let mut rows = Self::segment_evidence_lines(read_id, stage, alignments);
+        let mut rows = Self::segment_evidence_lines(read_id, stage, alignments, reference);
         let refs: Vec<&AlignmentRecord<'_>> = alignments.iter().collect();
         rows.extend(local_clip_evidence_lines(
             read_id,
@@ -1690,6 +1767,7 @@ impl Scan2 {
                 mapq,
                 cigar: Cow::Owned(cigar_buf.clone()),
                 seq: Cow::Owned(seq),
+                xa: Cow::Owned(raw_xa_from_sam_record(&record)?),
             };
             all_alignments.push(alignment.clone());
             alignments.push(alignment);
@@ -1818,7 +1896,11 @@ impl Scan2 {
                 });
                 let non_bsj_evidence =
                     if local_lines.is_empty() && display_lines.is_empty() && !scan1_claimed {
-                        Self::non_bsj_segment_evidence_lines(&owned.read_id, &owned.all_alignments)
+                        Self::non_bsj_segment_evidence_lines(
+                            &owned.read_id,
+                            &owned.all_alignments,
+                            chr_tcga_map,
+                        )
                     } else {
                         Vec::new()
                     };
@@ -2167,9 +2249,11 @@ impl Scan2 {
                             let non_bsj_started = profile.map(|_| Instant::now());
                             let mut rows = 0_u64;
                             let mut bytes = 0_u64;
-                            for line in
-                                Self::non_bsj_segment_evidence_lines(&id_str, &all_alignments)
-                            {
+                            for line in Self::non_bsj_segment_evidence_lines(
+                                &id_str,
+                                &all_alignments,
+                                chr_tcga_map,
+                            ) {
                                 rows += 1;
                                 bytes += line.len() as u64 + 1;
                                 writeln!(non_bsj_segments_writer, "{}", line)?;
@@ -2269,6 +2353,7 @@ impl Scan2 {
                 mapq,
                 cigar: Cow::Owned(cigar_buf.clone()),
                 seq: Cow::Owned(seq),
+                xa: Cow::Owned(raw_xa_from_bam_record(&record)?),
             };
             all_alignments.push(alignment.clone());
             alignments.push(alignment);
@@ -2388,7 +2473,9 @@ impl Scan2 {
                     let non_bsj_started = profile.map(|_| Instant::now());
                     let mut rows = 0_u64;
                     let mut bytes = 0_u64;
-                    for line in Self::non_bsj_segment_evidence_lines(&id_str, &all_alignments) {
+                    for line in
+                        Self::non_bsj_segment_evidence_lines(&id_str, &all_alignments, chr_tcga_map)
+                    {
                         rows += 1;
                         bytes += line.len() as u64 + 1;
                         writeln!(non_bsj_segments_writer, "{}", line)?;
