@@ -8,8 +8,10 @@
 //! representation of confirmed BSJ reads that can be compared directly against
 //! simulator truth before full-length path reconstruction is re-enabled on top
 //! of it. Full-length reconstruction is likewise a sidecar: it consumes the
-//! completed segment rows and writes one major isoform per Summary-confirmed
-//! circRNA without changing CIRI3 `.out` or `.bsj` decisions.
+//! completed segment rows and writes one rank 1 major isoform per
+//! Summary-confirmed circRNA without changing CIRI3 `.out` or `.bsj`
+//! decisions. Multi-sample major isoform switching can later reuse the same
+//! structure fields without changing the core BSJ contract.
 
 use anyhow::{anyhow, bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -26,6 +28,7 @@ use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 use crate::annotation::Annotation;
@@ -81,6 +84,13 @@ const MAJOR_MAX_UNSPLICED_EXON_LEN: i32 = MAX_EXON_LENGTH;
 /// Outward reads are useful weak completion evidence during path selection, but
 /// they do not localize a BSJ range precisely enough to certify mature phasing.
 const MAJOR_MIN_MATURE_LINK_SUPPORT: f64 = 1.0;
+/// Minimum continuous anchor on both sides of a candidate junction-exclusion span.
+///
+/// A continuous block that merely overruns a splice boundary by a few bases can
+/// be caused by mapper microhomology. Requiring anchors on both sides keeps
+/// junction-exclusive evidence reserved for reads that truly span across the
+/// candidate intron rather than touch both boundary coordinates by a short drift.
+const MAJOR_EXCLUSIVE_JUNCTION_MIN_ANCHOR: i32 = MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH;
 /// Smallest non-BSJ assignment probability retained for isoform graph support.
 ///
 /// Backward/outward rows have no exact Summary BSJ. The isoform stage therefore
@@ -226,12 +236,12 @@ pub struct SegmentRunSummary {
     pub outward_segments: usize,
 }
 
-/// User-facing counts produced by the major-isoform reconstruction stage.
+/// User-facing counts produced by the isoform reconstruction stage.
 ///
-/// The GTF is the complete per-circRNA audit output, while FASTA is stricter
-/// and contains only sequence-ready isoforms. Keeping both counts visible helps
-/// users distinguish "reconstructed structure exists" from "trusted sequence
-/// was emitted".
+/// The GTF is the complete per-circRNA audit output: every circRNA has one rank
+/// 1 major record. FASTA is stricter and contains only sequence-ready isoforms,
+/// so both counts remain visible to distinguish "reconstructed structure
+/// exists" from "trusted sequence was emitted".
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IsoformRunSummary {
     /// Isoform records written to `<prefix>.isoforms.gtf`.
@@ -533,9 +543,9 @@ struct MajorCircIndexEntry {
 
 /// Major isoform selected for one Summary-confirmed circRNA.
 ///
-/// The output is deliberately single-isoform for now. `structure_hash` and
-/// `sample_id` are emitted so later multi-sample code can compare major
-/// isoform switching without changing the file contract again.
+/// The output remains one record per circRNA. Rank and sample fields stay
+/// internal so sorting and FASTA headers can remain stable while the public GTF
+/// schema stays compact.
 #[derive(Debug, Clone)]
 struct MajorIsoformRecord {
     circ_id: String,
@@ -551,8 +561,9 @@ struct MajorIsoformRecord {
     segment_coverage_pct: f64,
     path_score: f64,
     bsj_reads: usize,
-    structure_hash: u64,
     isoform_len: i32,
+    isoform_rank: usize,
+    isoform_class: String,
     isoform_origin: String,
     estimate_reason: String,
 }
@@ -617,7 +628,7 @@ struct MajorBlockBuildStatus {
     unphased_single_exon: bool,
 }
 
-/// Column indexes required to rebuild major isoforms from `<prefix>.segments`.
+/// Column indexes required to rebuild isoforms from `<prefix>.segments`.
 ///
 /// Header-driven lookup keeps the isoform stage coupled to the public segments
 /// contract instead of to the in-memory `SegmentRecord` layout, which is the
@@ -1447,6 +1458,7 @@ fn load_non_bsj_segment_evidence(
     state: &mut ScanState,
     mut on_spill_done: impl FnMut() -> Result<()>,
 ) -> Result<Vec<SegmentScanShardPaths>> {
+    let profile = segments_profile_enabled().then(NonBsjSidecarProfile::default);
     let shard_paths = {
         let ctx = SegmentScanContext::from_state(state);
         let grouped_inputs = paths
@@ -1454,7 +1466,13 @@ fn load_non_bsj_segment_evidence(
             .map(|path| non_bsj_sidecar_is_grouped(path))
             .collect::<Result<Vec<_>>>()?;
         if paths.len() > 1 && grouped_inputs.iter().all(|is_grouped| *is_grouped) {
-            spill_grouped_non_bsj_segment_evidence_shards(paths, out_prefix, 0, &ctx)?
+            spill_grouped_non_bsj_segment_evidence_shards(
+                paths,
+                out_prefix,
+                0,
+                &ctx,
+                profile.as_ref(),
+            )?
         } else {
             let mut shard_paths = Vec::new();
             for (path, is_grouped) in paths.iter().zip(grouped_inputs) {
@@ -1464,6 +1482,7 @@ fn load_non_bsj_segment_evidence(
                         out_prefix,
                         shard_paths.len(),
                         &ctx,
+                        profile.as_ref(),
                     )?;
                     shard_paths.append(&mut paths);
                 } else {
@@ -1479,6 +1498,9 @@ fn load_non_bsj_segment_evidence(
             shard_paths
         }
     };
+    if let Some(profile) = &profile {
+        profile.report();
+    }
     on_spill_done()?;
     Ok(shard_paths)
 }
@@ -1513,6 +1535,7 @@ fn spill_grouped_non_bsj_segment_evidence_mmap(
     out_prefix: &str,
     shard_offset: usize,
     ctx: &SegmentScanContext<'_>,
+    profile: Option<&NonBsjSidecarProfile>,
 ) -> Result<Vec<SegmentScanShardPaths>> {
     let file =
         File::open(path).with_context(|| format!("open non-BSJ segment evidence {}", path))?;
@@ -1535,7 +1558,7 @@ fn spill_grouped_non_bsj_segment_evidence_mmap(
         .enumerate()
         .map(|(idx, (start, end))| {
             let paths = SegmentScanShardPaths::new(out_prefix, shard_offset + idx);
-            process_grouped_non_bsj_sidecar_shard(&mmap, start, end, ctx, &pb, &paths)?;
+            process_grouped_non_bsj_sidecar_shard(&mmap, start, end, ctx, &pb, &paths, profile)?;
             Ok(paths)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1563,6 +1586,7 @@ fn spill_grouped_non_bsj_segment_evidence_shards(
     out_prefix: &str,
     shard_offset: usize,
     ctx: &SegmentScanContext<'_>,
+    profile: Option<&NonBsjSidecarProfile>,
 ) -> Result<Vec<SegmentScanShardPaths>> {
     let total_bytes = paths.iter().try_fold(0_u64, |acc, path| {
         Ok::<u64, anyhow::Error>(acc + std::fs::metadata(path)?.len())
@@ -1582,7 +1606,7 @@ fn spill_grouped_non_bsj_segment_evidence_shards(
         .enumerate()
         .map(|(idx, path)| {
             let output_paths = SegmentScanShardPaths::new(out_prefix, shard_offset + idx);
-            process_grouped_non_bsj_sidecar_file(path, ctx, &pb, &output_paths)?;
+            process_grouped_non_bsj_sidecar_file(path, ctx, &pb, &output_paths, profile)?;
             Ok(output_paths)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1609,6 +1633,7 @@ fn process_grouped_non_bsj_sidecar_file(
     ctx: &SegmentScanContext<'_>,
     pb: &ProgressBar,
     paths: &SegmentScanShardPaths,
+    profile: Option<&NonBsjSidecarProfile>,
 ) -> Result<()> {
     let file = File::open(path).with_context(|| format!("open non-BSJ segment evidence {path}"))?;
     if file.metadata()?.len() == 0 {
@@ -1629,8 +1654,15 @@ fn process_grouped_non_bsj_sidecar_file(
         pending_progress += bytes;
         let line = line.trim_end_matches(['\n', '\r']);
         if !line.is_empty() {
-            if let Some((read_id, records)) = parse_non_bsj_group_line(line, ctx)? {
-                process_backward_group_to_writer(read_id, &records, ctx, &mut writer)?;
+            if let Some((read_id, payload)) = non_bsj_group_payload(line, ctx) {
+                process_borrowed_non_bsj_group_to_writer(
+                    read_id,
+                    payload,
+                    line,
+                    ctx,
+                    &mut writer,
+                    profile,
+                )?;
             }
         }
         if pending_progress >= 4 * 1024 * 1024 {
@@ -1680,6 +1712,67 @@ fn next_line_start(mmap: &Mmap, pos: usize) -> usize {
     mmap.len()
 }
 
+#[derive(Default)]
+struct NonBsjSidecarProfile {
+    groups: AtomicU64,
+    parsed_alignments: AtomicU64,
+    topology_groups: AtomicU64,
+    backward_shape_groups: AtomicU64,
+    backward_chain_shape_groups: AtomicU64,
+    outward_groups: AtomicU64,
+    raw_candidate_groups: AtomicU64,
+    raw_candidate_count: AtomicU64,
+    retained_groups: AtomicU64,
+    validated_candidate_groups: AtomicU64,
+    validated_candidate_count: AtomicU64,
+    materialized_groups: AtomicU64,
+    materialized_alignments: AtomicU64,
+    drop_no_route: AtomicU64,
+    drop_no_raw_candidate: AtomicU64,
+    drop_no_valid_candidate: AtomicU64,
+    drop_no_segment_record: AtomicU64,
+    backward_attempt_groups: AtomicU64,
+    outward_attempt_groups: AtomicU64,
+    backward_retained_groups: AtomicU64,
+    outward_retained_groups: AtomicU64,
+}
+
+impl NonBsjSidecarProfile {
+    fn add(&self, counter: &AtomicU64, value: u64) {
+        counter.fetch_add(value, AtomicOrdering::Relaxed);
+    }
+
+    fn report(&self) {
+        eprintln!(
+            "[CIRI_PROFILE_SEGMENTS] non_bsj_sidecar_groups: groups={} parsed_alignments={} topology={} backward_shape={} outward={} raw_candidate_groups={} raw_candidate_count={} validated_candidate_groups={} validated_candidate_count={} materialized_groups={} retained={} materialized_alignments={}",
+            self.groups.load(AtomicOrdering::Relaxed),
+            self.parsed_alignments.load(AtomicOrdering::Relaxed),
+            self.topology_groups.load(AtomicOrdering::Relaxed),
+            self.backward_shape_groups.load(AtomicOrdering::Relaxed),
+            self.outward_groups.load(AtomicOrdering::Relaxed),
+            self.raw_candidate_groups.load(AtomicOrdering::Relaxed),
+            self.raw_candidate_count.load(AtomicOrdering::Relaxed),
+            self.validated_candidate_groups.load(AtomicOrdering::Relaxed),
+            self.validated_candidate_count.load(AtomicOrdering::Relaxed),
+            self.materialized_groups.load(AtomicOrdering::Relaxed),
+            self.retained_groups.load(AtomicOrdering::Relaxed),
+            self.materialized_alignments.load(AtomicOrdering::Relaxed),
+        );
+        eprintln!(
+            "[CIRI_PROFILE_SEGMENTS] non_bsj_sidecar_routes: backward_chain_shape={} backward_attempt={} outward_attempt={} backward_retained={} outward_retained={} drop_no_route={} drop_no_raw_candidate={} drop_no_valid_candidate={} drop_no_segment_record={}",
+            self.backward_chain_shape_groups.load(AtomicOrdering::Relaxed),
+            self.backward_attempt_groups.load(AtomicOrdering::Relaxed),
+            self.outward_attempt_groups.load(AtomicOrdering::Relaxed),
+            self.backward_retained_groups.load(AtomicOrdering::Relaxed),
+            self.outward_retained_groups.load(AtomicOrdering::Relaxed),
+            self.drop_no_route.load(AtomicOrdering::Relaxed),
+            self.drop_no_raw_candidate.load(AtomicOrdering::Relaxed),
+            self.drop_no_valid_candidate.load(AtomicOrdering::Relaxed),
+            self.drop_no_segment_record.load(AtomicOrdering::Relaxed),
+        );
+    }
+}
+
 /// Processes one mmap shard of grouped non-BSJ read evidence.
 fn process_grouped_non_bsj_sidecar_shard(
     mmap: &Mmap,
@@ -1688,6 +1781,7 @@ fn process_grouped_non_bsj_sidecar_shard(
     ctx: &SegmentScanContext<'_>,
     pb: &ProgressBar,
     paths: &SegmentScanShardPaths,
+    profile: Option<&NonBsjSidecarProfile>,
 ) -> Result<()> {
     let mut writer = SegmentScanShardWriter::new(paths)?;
     let mut pos = start;
@@ -1708,8 +1802,15 @@ fn process_grouped_non_bsj_sidecar_shard(
             let line = std::str::from_utf8(&mmap[line_start..line_end]).with_context(|| {
                 format!("parse UTF-8 non-BSJ sidecar line at byte {line_start}")
             })?;
-            if let Some((read_id, records)) = parse_non_bsj_group_line(line, ctx)? {
-                process_backward_group_to_writer(&read_id, &records, ctx, &mut writer)?;
+            if let Some((read_id, payload)) = non_bsj_group_payload(line, ctx) {
+                process_borrowed_non_bsj_group_to_writer(
+                    read_id,
+                    payload,
+                    line,
+                    ctx,
+                    &mut writer,
+                    profile,
+                )?;
             }
         }
         if pos.saturating_sub(last_progress) >= 4 * 1024 * 1024 {
@@ -1725,26 +1826,737 @@ fn process_grouped_non_bsj_sidecar_shard(
     Ok(())
 }
 
-/// Parses one current-format grouped non-BSJ sidecar line.
-fn parse_non_bsj_group_line<'a>(
+/// Returns the read ID and encoded payload for a current non-BSJ group line.
+///
+/// The grouped sidecar can contain tens of GiB on real data. Separating this
+/// lightweight header parse from full alignment materialization lets the hot
+/// path reject ordinary linear read groups before allocating owned `String`
+/// fields for every alignment.
+fn non_bsj_group_payload<'a>(
     line: &'a str,
     ctx: &SegmentScanContext<'_>,
-) -> Result<Option<(&'a str, Vec<AsAlignment>)>> {
+) -> Option<(&'a str, &'a str)> {
     let mut parts = line.splitn(3, '\t');
-    let Some(read_id) = parts.next() else {
-        return Ok(None);
-    };
-    let Some(stage) = parts.next() else {
-        return Ok(None);
-    };
-    let Some(payload) = parts.next() else {
-        return Ok(None);
-    };
+    let read_id = parts.next()?;
+    let stage = parts.next()?;
+    let payload = parts.next()?;
     if !is_non_bsj_group_stage(stage) || ctx.junction_read_to_circ.contains_key(read_id) {
-        return Ok(None);
+        return None;
     }
-    let records = parse_non_bsj_group_records(payload, line)?;
-    Ok(Some((read_id, records)))
+    Some((read_id, payload))
+}
+
+/// Borrowed alignment fields used by the non-BSJ group retention gate.
+///
+/// This mirrors the compact sidecar payload without taking ownership. Stage 2
+/// keeps topology and motif checks on these borrowed fields and only converts
+/// them into owned `AsAlignment` records after a group is known to be retained.
+#[derive(Clone, Copy)]
+struct NonBsjAlignmentView<'a> {
+    flag: i32,
+    chr: &'a str,
+    pos: i32,
+    mapq: i32,
+    cigar: &'a str,
+    seq: &'a str,
+    cs: &'a str,
+}
+
+/// Parses compact non-BSJ alignment fields as borrowed views.
+fn parse_non_bsj_group_views<'a>(
+    payload: &'a str,
+    line: &str,
+) -> Result<Vec<NonBsjAlignmentView<'a>>> {
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    for encoded in payload.split(';') {
+        if encoded.is_empty() {
+            continue;
+        }
+        let mut fields = [None; 9];
+        let mut field_count = 0usize;
+        for field in encoded.split('|') {
+            if field_count < fields.len() {
+                fields[field_count] = Some(field);
+            }
+            field_count += 1;
+            if field_count >= fields.len() {
+                break;
+            }
+        }
+        let (flag_idx, chrom_idx, pos_idx, mapq_idx, cigar_idx, seq_idx, cs_idx) = match field_count
+        {
+            0..=5 => continue,
+            6 => (0, 1, 2, 3, 4, 5, None),
+            7 => (0, 1, 2, 3, 4, 5, Some(6)),
+            _ => (1, 2, 3, 4, 5, 7, None),
+        };
+        let field = |idx: usize| fields[idx].expect("validated non-BSJ sidecar field");
+        let chr = field(chrom_idx);
+        let cigar = field(cigar_idx);
+        let seq = field(seq_idx);
+        let cs = cs_idx
+            .and_then(|idx| fields[idx])
+            .filter(|value| !value.is_empty())
+            .unwrap_or("*");
+        let flag = field(flag_idx)
+            .parse::<i32>()
+            .with_context(|| format!("parse non-BSJ grouped flag from {}", line))?;
+        let pos = field(pos_idx)
+            .parse::<i32>()
+            .with_context(|| format!("parse non-BSJ grouped position from {}", line))?;
+        let mapq = field(mapq_idx)
+            .parse::<i32>()
+            .with_context(|| format!("parse non-BSJ grouped MAPQ from {}", line))?;
+        let key = (flag, chr, pos, mapq, cigar, seq, cs);
+        if !seen.insert(key) {
+            continue;
+        }
+        records.push(NonBsjAlignmentView {
+            flag,
+            chr,
+            pos,
+            mapq,
+            cigar,
+            seq,
+            cs,
+        });
+    }
+    Ok(records)
+}
+
+/// Streams one borrowed non-BSJ group into retained shard rows when it survives.
+///
+/// The compact Scan2 sidecar is large enough that parsing it twice dominates
+/// `Scanning exons 1/4` on real data. This path performs all cheap topology and
+/// splice-candidate checks on borrowed fields, and only allocates owned
+/// `AsAlignment` records for groups that will actually be retained.
+fn process_borrowed_non_bsj_group_to_writer(
+    read_id: &str,
+    payload: &str,
+    line: &str,
+    ctx: &SegmentScanContext<'_>,
+    writer: &mut SegmentScanShardWriter,
+    profile: Option<&NonBsjSidecarProfile>,
+) -> Result<()> {
+    if let Some(profile) = profile {
+        profile.add(&profile.groups, 1);
+    }
+    let views = parse_non_bsj_group_views(payload, line)?;
+    if let Some(profile) = profile {
+        profile.add(&profile.parsed_alignments, views.len() as u64);
+    }
+    if views.is_empty() {
+        return Ok(());
+    }
+    let is_outward = is_outward_pair_group_view(&views, ctx);
+    let may_backward = may_have_backward_candidate_shape_view(&views);
+    let may_backward_chain =
+        may_backward && borrowed_group_has_backward_chain_topology(&views, ctx.read_len);
+    if !is_outward && !may_backward_chain {
+        if let Some(profile) = profile {
+            profile.add(&profile.drop_no_route, 1);
+        }
+        return Ok(());
+    }
+    if let Some(profile) = profile {
+        profile.add(&profile.topology_groups, 1);
+        if may_backward {
+            profile.add(&profile.backward_shape_groups, 1);
+        }
+        if may_backward_chain {
+            profile.add(&profile.backward_chain_shape_groups, 1);
+        }
+        if is_outward {
+            profile.add(&profile.outward_groups, 1);
+        }
+    }
+
+    // Outward groups keep the old backward-candidate check so a possible
+    // backward interpretation still wins the same priority as before. The new
+    // chain-shape gate is used only to drop non-outward groups that cannot form
+    // a circular read-chain topology.
+    let candidates = if may_backward_chain || (is_outward && may_backward) {
+        mapping_check1_backward_candidate_views(read_id, &views, ctx)
+    } else {
+        Vec::new()
+    };
+    if let Some(profile) = profile {
+        if !candidates.is_empty() {
+            profile.add(&profile.raw_candidate_groups, 1);
+            profile.add(&profile.raw_candidate_count, candidates.len() as u64);
+        } else if (may_backward_chain || is_outward) && !is_outward {
+            profile.add(&profile.drop_no_raw_candidate, 1);
+        }
+    }
+    let candidates = validate_splice_candidates(candidates, ctx.reference, ctx.annotation);
+    if let Some(profile) = profile {
+        if !candidates.is_empty() {
+            profile.add(&profile.validated_candidate_groups, 1);
+            profile.add(&profile.validated_candidate_count, candidates.len() as u64);
+        } else if (may_backward_chain || is_outward) && !is_outward {
+            profile.add(&profile.drop_no_valid_candidate, 1);
+        }
+    }
+    if !is_outward && candidates.is_empty() {
+        return Ok(());
+    }
+
+    let records = materialize_non_bsj_group_records(&views);
+    if let Some(profile) = profile {
+        profile.add(&profile.materialized_groups, 1);
+        if !candidates.is_empty() {
+            profile.add(&profile.backward_attempt_groups, 1);
+        }
+        if is_outward {
+            profile.add(&profile.outward_attempt_groups, 1);
+        }
+    }
+    let (segment_records, enriched_records) =
+        prebuild_non_bsj_segment_records(read_id, &records, is_outward, &candidates, ctx);
+    if segment_records.is_empty() {
+        if let Some(profile) = profile {
+            profile.add(&profile.drop_no_segment_record, 1);
+        }
+        return Ok(());
+    }
+    if let Some(profile) = profile {
+        profile.add(&profile.retained_groups, 1);
+        profile.add(&profile.materialized_alignments, records.len() as u64);
+        if segment_records
+            .iter()
+            .any(|record| record.type_name == "backward")
+        {
+            profile.add(&profile.backward_retained_groups, 1);
+        }
+        if segment_records
+            .iter()
+            .any(|record| record.type_name == "outward")
+        {
+            profile.add(&profile.outward_retained_groups, 1);
+        }
+    }
+    if is_outward {
+        let retained_records = enriched_records.as_deref().unwrap_or(&records);
+        writer.write_read_result(
+            read_id,
+            retained_records,
+            true,
+            &candidates,
+            &segment_records,
+        )?;
+    } else {
+        writer.write_read_result(read_id, &records, false, &candidates, &segment_records)?;
+    }
+    Ok(())
+}
+
+/// Materializes sidecar views only after the group is known to be retained.
+fn materialize_non_bsj_group_records(views: &[NonBsjAlignmentView<'_>]) -> Vec<AsAlignment> {
+    views
+        .iter()
+        .map(|view| AsAlignment {
+            flag: view.flag,
+            chr: view.chr.to_string(),
+            pos: view.pos,
+            mapq: view.mapq,
+            cigar: view.cigar.to_string(),
+            seq: if view.seq == "*" {
+                String::new()
+            } else {
+                view.seq.to_string()
+            },
+            cs: view.cs.to_string(),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        })
+        .collect()
+}
+
+struct BorrowedChainBlock {
+    read_start: i32,
+    read_end: i32,
+    ref_start: i32,
+}
+
+struct BorrowedParsedAlignment<'a> {
+    flag: i32,
+    chr: &'a str,
+    strand: char,
+    mapq: i32,
+    blocks: Vec<BorrowedChainBlock>,
+}
+
+/// Tests the final backward-chain topology condition on borrowed CIGAR blocks.
+///
+/// This mirrors the inexpensive parts of `build_pair_chains` before allocating
+/// owned `AsAlignment` records. Non-outward groups that fail this route check
+/// cannot produce a backward `SegmentRecord`, while outward groups remain on
+/// the legacy backward-candidate path to preserve backward-over-outward
+/// priority when both interpretations are possible.
+fn borrowed_group_has_backward_chain_topology(
+    records: &[NonBsjAlignmentView<'_>],
+    read_len: i32,
+) -> bool {
+    let parsed = records
+        .iter()
+        .filter_map(|record| {
+            let blocks = parse_borrowed_chain_blocks(record, read_len)?;
+            Some(BorrowedParsedAlignment {
+                flag: record.flag,
+                chr: record.chr,
+                strand: strand_char(record.flag),
+                mapq: record.mapq,
+                blocks,
+            })
+        })
+        .collect::<Vec<_>>();
+    for mate in [0usize, 1usize] {
+        let reverse_chain_order = mate == 1;
+        for record in parsed
+            .iter()
+            .filter(|record| mate_bucket(record.flag) == mate)
+        {
+            if borrowed_pool_has_backward_wrap(
+                &parsed,
+                mate,
+                record.chr,
+                record.strand,
+                false,
+                reverse_chain_order,
+            ) || borrowed_pool_has_backward_wrap(
+                &parsed,
+                mate,
+                record.chr,
+                record.strand,
+                true,
+                reverse_chain_order,
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn borrowed_pool_has_backward_wrap(
+    parsed: &[BorrowedParsedAlignment<'_>],
+    mate: usize,
+    chr: &str,
+    strand: char,
+    include_secondary: bool,
+    reverse_chain_order: bool,
+) -> bool {
+    let mut group = parsed
+        .iter()
+        .filter(|record| {
+            mate_bucket(record.flag) == mate
+                && record.chr == chr
+                && record.strand == strand
+                && (include_secondary || !is_secondary(record.flag))
+        })
+        .collect::<Vec<_>>();
+    if group.is_empty() {
+        return false;
+    }
+    group.sort_by_key(|record| {
+        (
+            record
+                .blocks
+                .first()
+                .map(|block| block.read_start)
+                .unwrap_or(i32::MAX),
+            usize::from(is_secondary(record.flag)),
+            usize::from(is_supplementary(record.flag)),
+            -record.mapq,
+        )
+    });
+    let mut selected: Vec<&BorrowedParsedAlignment<'_>> = Vec::new();
+    for record in group {
+        if let Some(last) = selected.last_mut() {
+            if borrowed_query_overlap(last, record) > 6 {
+                if borrowed_parsed_alignment_rank(record) > borrowed_parsed_alignment_rank(last) {
+                    *last = record;
+                }
+                continue;
+            }
+        }
+        selected.push(record);
+    }
+    let mut blocks = selected
+        .iter()
+        .flat_map(|record| record.blocks.iter())
+        .collect::<Vec<_>>();
+    blocks.sort_by_key(|block| (block.read_start, block.read_end, block.ref_start));
+    let order_strand = if reverse_chain_order {
+        blocks.reverse();
+        opposite_strand(strand)
+    } else {
+        strand
+    };
+    blocks
+        .windows(2)
+        .any(|pair| borrowed_wraps_in_read_order(pair[0], pair[1], order_strand))
+}
+
+fn parse_borrowed_chain_blocks(
+    record: &NonBsjAlignmentView<'_>,
+    read_len: i32,
+) -> Option<Vec<BorrowedChainBlock>> {
+    if record.cigar == "*" || record.cigar.is_empty() || record.chr == "*" {
+        return None;
+    }
+    let mut ref_pos = record.pos;
+    let mut read_pos = 1;
+    let mut blocks = Vec::new();
+    let mut current: Option<BorrowedChainBlock> = None;
+    let mut count = 0i32;
+    let mut has_count = false;
+    for mut op in record.cigar.chars() {
+        if op.is_ascii_digit() {
+            count = count
+                .checked_mul(10)?
+                .checked_add(op.to_digit(10)? as i32)?;
+            has_count = true;
+            continue;
+        }
+        if !has_count {
+            return None;
+        }
+        if op == 'H' {
+            op = 'S';
+        }
+        match op {
+            'M' | '=' | 'X' => {
+                let block = current.get_or_insert(BorrowedChainBlock {
+                    read_start: read_pos,
+                    read_end: read_pos + count - 1,
+                    ref_start: ref_pos,
+                });
+                block.read_end = read_pos + count - 1;
+                read_pos += count;
+                ref_pos += count;
+            }
+            'I' => {
+                if let Some(block) = current.as_mut() {
+                    block.read_end += count;
+                }
+                read_pos += count;
+            }
+            'D' => {
+                ref_pos += count;
+            }
+            'N' => {
+                if let Some(block) = current.take() {
+                    blocks.push(block);
+                }
+                ref_pos += count;
+            }
+            'S' | 'H' => {
+                if let Some(block) = current.take() {
+                    blocks.push(block);
+                }
+                read_pos += count;
+            }
+            'P' => {}
+            _ => return None,
+        }
+        count = 0;
+        has_count = false;
+    }
+    if has_count {
+        return None;
+    }
+    if let Some(block) = current.take() {
+        blocks.push(block);
+    }
+    if blocks.is_empty() {
+        return None;
+    }
+    if record.flag & 0x10 != 0 {
+        for block in &mut blocks {
+            let flipped_start = read_len - block.read_end + 1;
+            let flipped_end = read_len - block.read_start + 1;
+            block.read_start = flipped_start;
+            block.read_end = flipped_end;
+        }
+        blocks.reverse();
+    }
+    Some(blocks)
+}
+
+fn borrowed_query_overlap(
+    left: &BorrowedParsedAlignment<'_>,
+    right: &BorrowedParsedAlignment<'_>,
+) -> i32 {
+    let left_start = left
+        .blocks
+        .first()
+        .map(|block| block.read_start)
+        .unwrap_or(0);
+    let left_end = left.blocks.last().map(|block| block.read_end).unwrap_or(0);
+    let right_start = right
+        .blocks
+        .first()
+        .map(|block| block.read_start)
+        .unwrap_or(0);
+    let right_end = right.blocks.last().map(|block| block.read_end).unwrap_or(0);
+    (left_end.min(right_end) - left_start.max(right_start) + 1).max(0)
+}
+
+fn borrowed_parsed_alignment_rank(record: &BorrowedParsedAlignment<'_>) -> (i32, i32, i32, i32) {
+    (
+        i32::from(!is_secondary(record.flag)),
+        i32::from(!is_supplementary(record.flag)),
+        record.mapq,
+        record
+            .blocks
+            .iter()
+            .map(|block| block.read_end - block.read_start + 1)
+            .sum(),
+    )
+}
+
+fn borrowed_wraps_in_read_order(
+    prev: &BorrowedChainBlock,
+    next: &BorrowedChainBlock,
+    strand: char,
+) -> bool {
+    match strand {
+        '+' => next.ref_start < prev.ref_start,
+        '-' => next.ref_start > prev.ref_start,
+        _ => false,
+    }
+}
+
+/// Borrowed-form equivalent of the backward candidate shape prefilter.
+fn may_have_backward_candidate_shape_view(records: &[NonBsjAlignmentView<'_>]) -> bool {
+    let mut buckets: HashMap<(&str, i32), (usize, bool)> = HashMap::new();
+    for record in records {
+        if record.chr == "*" || record.cigar == "*" {
+            continue;
+        }
+        let key = (record.chr, reverse_bit(record.flag));
+        let entry = buckets.entry(key).or_insert((0, false));
+        entry.0 += 1;
+        entry.1 |= record.cigar.contains('S') || record.cigar.contains('H');
+        if entry.0 >= 2 && entry.1 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Borrowed-form equivalent of outward pair detection for the prefilter.
+fn is_outward_pair_group_view(
+    records: &[NonBsjAlignmentView<'_>],
+    ctx: &SegmentScanContext<'_>,
+) -> bool {
+    let Some((r1, r2)) = primary_mate_pair_view(records) else {
+        return false;
+    };
+    if r1.chr != r2.chr || r1.chr == "*" || r1.mapq < ctx.min_mapq || r2.mapq < ctx.min_mapq {
+        return false;
+    }
+    if has_linear_mate_pair_mapping_view(records, ctx) {
+        return false;
+    }
+    let Some(r1_span) = alignment_ref_span_view(r1) else {
+        return false;
+    };
+    let Some(r2_span) = alignment_ref_span_view(r2) else {
+        return false;
+    };
+    if !has_3p_outward_pair_geometry_view(r1, r1_span, r2, r2_span) {
+        return false;
+    }
+    let span_start = r1_span.0.min(r2_span.0);
+    let span_end = r1_span.1.max(r2_span.1);
+    span_end - span_start + 1 <= BACKWARD_MAX_SPAN
+}
+
+/// Borrowed-form equivalent of the linear mate-pair negative filter.
+fn has_linear_mate_pair_mapping_view(
+    records: &[NonBsjAlignmentView<'_>],
+    ctx: &SegmentScanContext<'_>,
+) -> bool {
+    for i in 0..records.len() {
+        let left = &records[i];
+        if left.flag & 0x4 != 0 || left.chr == "*" || left.mapq < ctx.min_mapq {
+            continue;
+        }
+        for right in &records[i + 1..] {
+            if right.flag & 0x4 != 0
+                || right.chr == "*"
+                || right.mapq < ctx.min_mapq
+                || left.chr != right.chr
+                || mate_bucket(left.flag) == mate_bucket(right.flag)
+            {
+                continue;
+            }
+            let Some(left_span) = alignment_ref_span_view(left) else {
+                continue;
+            };
+            let Some(right_span) = alignment_ref_span_view(right) else {
+                continue;
+            };
+            let span = left_span.0.min(right_span.0)..=left_span.1.max(right_span.1);
+            if *span.end() - *span.start() + 1 <= BACKWARD_MAX_SPAN
+                && has_linear_pair_geometry_view(left, left_span, right, right_span)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Borrowed-form equivalent of ordinary linear mate orientation.
+fn has_linear_pair_geometry_view(
+    left: &NonBsjAlignmentView<'_>,
+    left_span: (i32, i32),
+    right: &NonBsjAlignmentView<'_>,
+    right_span: (i32, i32),
+) -> bool {
+    let left_reverse = is_reverse_strand(left.flag);
+    let right_reverse = is_reverse_strand(right.flag);
+    if left_reverse == right_reverse {
+        return false;
+    }
+    let (forward_span, reverse_span) = if left_reverse {
+        (right_span, left_span)
+    } else {
+        (left_span, right_span)
+    };
+    forward_span != reverse_span
+        && forward_span.0 <= reverse_span.0
+        && forward_span.1 <= reverse_span.1
+}
+
+/// Borrowed-form equivalent of broad outward-facing geometry.
+fn has_3p_outward_pair_geometry_view(
+    r1: &NonBsjAlignmentView<'_>,
+    r1_span: (i32, i32),
+    r2: &NonBsjAlignmentView<'_>,
+    r2_span: (i32, i32),
+) -> bool {
+    let r1_reverse = is_reverse_strand(r1.flag);
+    let r2_reverse = is_reverse_strand(r2.flag);
+    if r1_reverse == r2_reverse {
+        return false;
+    }
+    let (reverse_span, forward_span) = if r1_reverse {
+        (r1_span, r2_span)
+    } else {
+        (r2_span, r1_span)
+    };
+    let (reverse_record, forward_record) = if r1_reverse { (r1, r2) } else { (r2, r1) };
+    if reverse_span == forward_span {
+        return has_paired_outward_terminal_clip_view(reverse_record, forward_record);
+    }
+    forward_span.0 - reverse_span.0 >= OUTWARD_MIN_PAIR_OFFSET
+        && forward_span.1 - reverse_span.1 >= OUTWARD_MIN_PAIR_OFFSET
+}
+
+/// Borrowed-form equivalent of paired outward terminal clip evidence.
+fn has_paired_outward_terminal_clip_view(
+    reverse_record: &NonBsjAlignmentView<'_>,
+    forward_record: &NonBsjAlignmentView<'_>,
+) -> bool {
+    let Some((reverse_5p, reverse_3p)) = terminal_query_clips_cigar(reverse_record.cigar) else {
+        return false;
+    };
+    let Some((forward_5p, forward_3p)) = terminal_query_clips_cigar(forward_record.cigar) else {
+        return false;
+    };
+    reverse_3p >= OUTWARD_MIN_TERMINAL_CLIP
+        && forward_3p >= OUTWARD_MIN_TERMINAL_CLIP
+        && reverse_3p - forward_5p >= OUTWARD_MIN_TERMINAL_CLIP
+        && forward_3p - reverse_5p >= OUTWARD_MIN_TERMINAL_CLIP
+}
+
+/// Selects the single primary R1/R2 pair from borrowed sidecar fields.
+fn primary_mate_pair_view<'a>(
+    records: &'a [NonBsjAlignmentView<'a>],
+) -> Option<(&'a NonBsjAlignmentView<'a>, &'a NonBsjAlignmentView<'a>)> {
+    let mut r1: Option<&'a NonBsjAlignmentView<'a>> = None;
+    let mut r2: Option<&'a NonBsjAlignmentView<'a>> = None;
+    for record in records {
+        if is_secondary(record.flag) || is_supplementary(record.flag) || record.flag & 0x4 != 0 {
+            continue;
+        }
+        match mate_bucket(record.flag) {
+            0 if r1.is_none() => r1 = Some(record),
+            0 => return None,
+            1 if r2.is_none() => r2 = Some(record),
+            1 => return None,
+            _ => return None,
+        }
+    }
+    Some((r1?, r2?))
+}
+
+/// Returns the reference span implied by borrowed CIGAR fields.
+fn alignment_ref_span_view(record: &NonBsjAlignmentView<'_>) -> Option<(i32, i32)> {
+    if record.cigar == "*" || record.cigar.is_empty() || record.chr == "*" {
+        return None;
+    }
+    let mut ref_pos = record.pos;
+    let mut start = i32::MAX;
+    let mut end = i32::MIN;
+    let mut count = 0i32;
+    let mut has_count = false;
+    let mut saw_block = false;
+    for op in record.cigar.chars() {
+        if op.is_ascii_digit() {
+            count = count
+                .checked_mul(10)?
+                .checked_add(op.to_digit(10)? as i32)?;
+            has_count = true;
+            continue;
+        }
+        if !has_count {
+            return None;
+        }
+        match op {
+            'M' | '=' | 'X' => {
+                start = start.min(ref_pos);
+                end = end.max(ref_pos + count - 1);
+                ref_pos += count;
+                saw_block = true;
+            }
+            'D' | 'N' => {
+                if saw_block {
+                    end = end.max(ref_pos + count - 1);
+                }
+                ref_pos += count;
+            }
+            'I' | 'S' | 'H' | 'P' => {}
+            _ => return None,
+        }
+        count = 0;
+        has_count = false;
+    }
+    if has_count || !saw_block {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// Returns terminal query clips directly from a CIGAR string.
+fn terminal_query_clips_cigar(cigar: &str) -> Option<(i32, i32)> {
+    let ops = parse_cigar_ops_basic(cigar)?;
+    let five_prime = ops
+        .first()
+        .copied()
+        .filter(|(_, op)| matches!(op, 'S' | 'H'))
+        .map_or(0, |(len, _)| len);
+    let three_prime = ops
+        .last()
+        .copied()
+        .filter(|(_, op)| matches!(op, 'S' | 'H'))
+        .map_or(0, |(len, _)| len);
+    Some((five_prime, three_prime))
 }
 
 /// Loads legacy one-alignment-per-line non-BSJ sidecars with visible progress.
@@ -2583,7 +3395,7 @@ where
     F: FnMut(RetainedSegmentGroup) -> Result<()>,
 {
     let file = File::open(path).with_context(|| format!("open segments retained shard {path}"))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
     let mut line = String::new();
     let mut current: Option<RetainedSegmentGroup> = None;
     let mut pending_progress = 0usize;
@@ -3286,6 +4098,12 @@ fn build_backward_segment_record_from_group_ctx(
         Some(correction),
         ctx.read_len,
     )?;
+    // Outward groups may have already been materialized with local-clip rows by
+    // the caller; running the rescue again would rebuild the same read-local
+    // windows and can duplicate pseudo-alignments in the non-BSJ hot path.
+    if records.iter().any(|record| record.from_local_clip) {
+        return Some(base);
+    }
     let Some(enriched_records) = try_add_non_bsj_local_clip_alignments_ctx(records, ctx) else {
         return Some(base);
     };
@@ -3976,6 +4794,28 @@ fn mapping_check1_backward_candidates(
     candidates
 }
 
+/// Borrowed sidecar counterpart of `mapping_check1_backward_candidates`.
+///
+/// Keeping this path allocation-light matters because most compact non-BSJ
+/// groups never survive motif validation. It intentionally mirrors the owned
+/// implementation and only allocates the candidate rows that can pass through
+/// to validation and retained shard writing.
+fn mapping_check1_backward_candidate_views(
+    read_id: &str,
+    records: &[NonBsjAlignmentView<'_>],
+    ctx: &SegmentScanContext<'_>,
+) -> Vec<PositiveCandidate> {
+    let mut by_reverse: [Vec<&NonBsjAlignmentView<'_>>; 2] = [Vec::new(), Vec::new()];
+    for record in records {
+        let idx = if record.flag & 0x10 != 0 { 1 } else { 0 };
+        by_reverse[idx].push(record);
+    }
+    let mut candidates = Vec::new();
+    mapping_check2_backward_views(read_id, &by_reverse[1], ctx, &mut candidates);
+    mapping_check2_backward_views(read_id, &by_reverse[0], ctx, &mut candidates);
+    candidates
+}
+
 /// Accumulator-backed form of CIRI-AS `mapping_check2_add`.
 fn mapping_check2_backward(
     read_id: &str,
@@ -4017,6 +4857,59 @@ fn mapping_check2_backward(
                 i,
                 j,
                 None,
+                ctx.read_len,
+            ) {
+                candidate_chr.get_or_insert_with(|| candidate.chr.clone());
+                candidates.push(candidate);
+            }
+        }
+    }
+
+    if na_tag {
+        candidates.truncate(initial_len);
+    }
+}
+
+/// Borrowed sidecar form of CIRI-AS `mapping_check2_add`.
+fn mapping_check2_backward_views(
+    read_id: &str,
+    records: &[&NonBsjAlignmentView<'_>],
+    ctx: &SegmentScanContext<'_>,
+    candidates: &mut Vec<PositiveCandidate>,
+) {
+    if records.len() < 2 {
+        return;
+    }
+
+    let mut matches = Vec::with_capacity(records.len());
+    for record in records {
+        matches.push(msid(record.cigar, ctx.read_len));
+    }
+
+    let initial_len = candidates.len();
+    let mut candidate_chr: Option<String> = None;
+    let mut na_tag = false;
+    'read: for i in 0..records.len() - 1 {
+        for j in i + 1..records.len() {
+            let ri = records[i];
+            let rj = records[j];
+            if ri.chr != rj.chr || reverse_bit(ri.flag) != reverse_bit(rj.flag) {
+                continue;
+            }
+            if let Some(existing_chr) = &candidate_chr {
+                if existing_chr != ri.chr {
+                    na_tag = true;
+                    break 'read;
+                }
+            }
+            if let Some(candidate) = candidate_from_view_pair(
+                read_id,
+                ri,
+                rj,
+                matches[i],
+                matches[j],
+                i,
+                j,
                 ctx.read_len,
             ) {
                 candidate_chr.get_or_insert_with(|| candidate.chr.clone());
@@ -4212,6 +5105,107 @@ fn candidate_from_pair(
                     adjust2: end_adjustment2,
                     strand_hint: 0,
                     cigars: [None, Some(rx.cigar.clone()), Some(ry.cigar.clone())],
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Builds one candidate from a borrowed compact sidecar alignment pair.
+fn candidate_from_view_pair(
+    read_id: &str,
+    ri: &NonBsjAlignmentView<'_>,
+    rj: &NonBsjAlignmentView<'_>,
+    mi: Msid,
+    mj: Msid,
+    i: usize,
+    j: usize,
+    read_len: i32,
+) -> Option<PositiveCandidate> {
+    let product = mi.kind * mj.kind;
+    if product == -1 {
+        let cir_scale = mi.kind * (ri.pos + mi.clip2) + mj.kind * (rj.pos + mj.clip2);
+        if (mi.clip1 - mj.clip1).abs() <= 6
+            && cir_scale < 0
+            && ri.mapq >= MAPQ_UNI
+            && rj.mapq >= MAPQ_UNI
+            && ri.mapq + rj.mapq >= MAPQ_BOTH
+        {
+            let mut pos_com = [ri.pos + mi.clip2, rj.pos + mj.clip2];
+            pos_com.sort_unstable();
+            let end_adjustment1 = div_trunc(mi.clip1 * mi.kind + mj.clip1 * mj.kind, 2);
+            let end_adjustment2 = mi.clip1 * mi.kind + mj.clip1 * mj.kind - end_adjustment1;
+            let (x_record, y_record) = if mi.kind.cmp(&mj.kind) == Ordering::Greater {
+                (rj, ri)
+            } else {
+                (ri, rj)
+            };
+            return Some(PositiveCandidate {
+                read_id: read_id.to_string(),
+                index: 0,
+                chr: ri.chr.to_string(),
+                site2: pos_com[0] - end_adjustment2,
+                site1: pos_com[1] + end_adjustment1,
+                adjust1: end_adjustment1,
+                adjust2: end_adjustment2,
+                strand_hint: 0,
+                cigars: [
+                    Some(x_record.cigar.to_string()),
+                    Some(y_record.cigar.to_string()),
+                    None,
+                ],
+            });
+        }
+    } else if product.abs() == 10 {
+        let (x, y, mx, my, rx, ry) = if mi.kind <= mj.kind {
+            (i, j, mi, mj, ri, rj)
+        } else {
+            (j, i, mj, mi, rj, ri)
+        };
+        let _ = (x, y);
+        if mx.kind == -1 {
+            let cir_scale = ry.pos + my.ref_len - 1 - rx.pos;
+            if (read_len - my.clip2 - mx.clip1).abs() <= 6
+                && cir_scale < 0
+                && ri.mapq >= MAPQ_UNI
+                && rj.mapq >= MAPQ_UNI
+                && ri.mapq + rj.mapq >= MAPQ_BOTH
+            {
+                let end_adjustment1 = div_trunc(my.clip1 + my.ref_len - mx.clip1, 2);
+                let end_adjustment2 = my.clip1 + my.ref_len - mx.clip1 - end_adjustment1;
+                return Some(PositiveCandidate {
+                    read_id: read_id.to_string(),
+                    index: 0,
+                    chr: rx.chr.to_string(),
+                    site2: ry.pos + my.ref_len - 1 - end_adjustment2,
+                    site1: rx.pos + end_adjustment1,
+                    adjust1: end_adjustment1,
+                    adjust2: end_adjustment2,
+                    strand_hint: 0,
+                    cigars: [Some(rx.cigar.to_string()), None, Some(ry.cigar.to_string())],
+                });
+            }
+        } else {
+            let cir_scale = rx.pos + mx.ref_len - 1 - ry.pos;
+            if (mx.clip1 - my.clip1).abs() <= 6
+                && cir_scale < 0
+                && ri.mapq >= MAPQ_UNI
+                && rj.mapq >= MAPQ_UNI
+                && ri.mapq + rj.mapq >= MAPQ_BOTH
+            {
+                let end_adjustment1 = div_trunc(mx.clip1 - my.clip1, 2);
+                let end_adjustment2 = mx.clip1 - my.clip1 - end_adjustment1;
+                return Some(PositiveCandidate {
+                    read_id: read_id.to_string(),
+                    index: 0,
+                    chr: rx.chr.to_string(),
+                    site2: rx.pos + mx.ref_len - 1 - end_adjustment2,
+                    site1: ry.pos + end_adjustment1,
+                    adjust1: end_adjustment1,
+                    adjust2: end_adjustment2,
+                    strand_hint: 0,
+                    cigars: [None, Some(rx.cigar.to_string()), Some(ry.cigar.to_string())],
                 });
             }
         }
@@ -4817,23 +5811,20 @@ fn collect_sidecar_junction_support_from_shards(
     let mut support = HashMap::new();
     let pb = retained_segment_progress_bar(bsj_shards, non_bsj_shards, "")?;
     let pb_ref = pb.as_ref();
-    for shard in bsj_shards {
-        for_each_retained_segment_group(&shard.path, pb_ref, |group| {
-            if let Some(record) =
-                build_bsj_segment_record_from_retained_group(state, &group, correction, &[])?
-            {
-                collect_junction_support_from_record(&record, &mut support);
-            }
-            Ok(())
-        })?;
+    let bsj_support = bsj_shards
+        .par_iter()
+        .map(|shard| collect_bsj_junction_support_from_shard(state, shard, pb_ref, correction))
+        .collect::<Result<Vec<_>>>()?;
+    for local in bsj_support {
+        merge_junction_support(&mut support, local);
     }
-    for shard in non_bsj_shards {
-        for_each_retained_segment_group(&shard.path, pb_ref, |group| {
-            for record in &group.segment_records {
-                collect_junction_support_from_record(record, &mut support);
-            }
-            Ok(())
-        })?;
+
+    let non_bsj_support = non_bsj_shards
+        .par_iter()
+        .map(|shard| collect_non_bsj_junction_support_from_shard(shard, pb_ref))
+        .collect::<Result<Vec<_>>>()?;
+    for local in non_bsj_support {
+        merge_junction_support(&mut support, local);
     }
     if let Some(pb) = pb {
         pb.set_style(
@@ -4846,6 +5837,50 @@ fn collect_sidecar_junction_support_from_shards(
     Ok(support)
 }
 
+/// Adds shard-local support counts into the global support table.
+fn merge_junction_support(target: &mut JunctionSupportMap, source: JunctionSupportMap) {
+    for (chrom, chrom_support) in source {
+        let target_chrom = target.entry(chrom).or_default();
+        for (key, count) in chrom_support {
+            *target_chrom.entry(key).or_insert(0) += count;
+        }
+    }
+}
+
+/// Builds support counts for one BSJ retained shard in parallel finalize.
+fn collect_bsj_junction_support_from_shard(
+    state: &ScanState,
+    shard: &SegmentScanShardPaths,
+    pb: Option<&ProgressBar>,
+    correction: &SegmentCorrectionContext<'_>,
+) -> Result<JunctionSupportMap> {
+    let mut support = HashMap::new();
+    for_each_retained_segment_group(&shard.path, pb, |group| {
+        if let Some(record) =
+            build_bsj_segment_record_from_retained_group(state, &group, correction, &[])?
+        {
+            collect_junction_support_from_record(&record, &mut support);
+        }
+        Ok(())
+    })?;
+    Ok(support)
+}
+
+/// Builds support counts for one non-BSJ retained shard in parallel finalize.
+fn collect_non_bsj_junction_support_from_shard(
+    shard: &SegmentScanShardPaths,
+    pb: Option<&ProgressBar>,
+) -> Result<JunctionSupportMap> {
+    let mut support = HashMap::new();
+    for_each_retained_segment_group(&shard.path, pb, |group| {
+        for record in &group.segment_records {
+            collect_junction_support_from_record(record, &mut support);
+        }
+        Ok(())
+    })?;
+    Ok(support)
+}
+
 /// Builds final segment rows by streaming retained shards after support is known.
 fn build_corrected_sidecar_records_from_shards(
     state: &ScanState,
@@ -4855,54 +5890,33 @@ fn build_corrected_sidecar_records_from_shards(
     first_pass_correction: &SegmentCorrectionContext<'_>,
     correction: &SegmentCorrectionContext<'_>,
 ) -> Result<Vec<SegmentRecord>> {
-    let mut out = Vec::new();
     let pb = retained_segment_progress_bar(bsj_shards, non_bsj_shards, "")?;
     let pb_ref = pb.as_ref();
-    for shard in bsj_shards {
-        for_each_retained_segment_group(&shard.path, pb_ref, |group| {
-            let Some(preliminary) = build_bsj_segment_record_from_retained_group(
+    let bsj_records = bsj_shards
+        .par_iter()
+        .map(|shard| {
+            build_corrected_bsj_records_from_shard(
                 state,
-                &group,
+                shard,
+                support_index,
                 first_pass_correction,
-                &[],
-            )?
-            else {
-                return Ok(());
-            };
-            let record = if segment_record_has_supported_alternative(&preliminary, support_index) {
-                build_bsj_segment_record_from_retained_group(state, &group, correction, &[])?
-                    .unwrap_or(preliminary)
-            } else {
-                preliminary
-            };
-            out.push(record);
-            Ok(())
-        })?;
-    }
-    for shard in non_bsj_shards {
-        for_each_retained_segment_group(&shard.path, pb_ref, |group| {
-            let strand_hint = read_strand_hint_from_candidates(&group.candidates);
-            let junction_hints = read_junction_hints_from_candidates(&group.candidates);
-            for preliminary in &group.segment_records {
-                let record = if segment_record_has_supported_alternative(preliminary, support_index)
-                {
-                    rebuild_segment_record_from_retained_group(
-                        preliminary,
-                        &group,
-                        state,
-                        correction,
-                        strand_hint,
-                        &junction_hints,
-                    )
-                    .unwrap_or_else(|| preliminary.clone())
-                } else {
-                    preliminary.clone()
-                };
-                out.push(record);
-            }
-            Ok(())
-        })?;
-    }
+                correction,
+                pb_ref,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let non_bsj_records = non_bsj_shards
+        .par_iter()
+        .map(|shard| {
+            build_corrected_non_bsj_records_from_shard(
+                state,
+                shard,
+                support_index,
+                correction,
+                pb_ref,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
     if let Some(pb) = pb {
         pb.set_style(
             ProgressStyle::default_bar()
@@ -4911,6 +5925,91 @@ fn build_corrected_sidecar_records_from_shards(
         );
         pb.finish_with_message("Completed");
     }
+    let total_records = bsj_records
+        .iter()
+        .chain(&non_bsj_records)
+        .map(Vec::len)
+        .sum();
+    let mut out = Vec::with_capacity(total_records);
+    for mut records in bsj_records {
+        out.append(&mut records);
+    }
+    for mut records in non_bsj_records {
+        out.append(&mut records);
+    }
+    Ok(out)
+}
+
+/// Builds corrected BSJ records for one retained shard.
+///
+/// Each shard is read-complete and the correction inputs are immutable, so this
+/// can run on Rayon workers while the caller keeps the final sort as the stable
+/// output-order boundary.
+fn build_corrected_bsj_records_from_shard(
+    state: &ScanState,
+    shard: &SegmentScanShardPaths,
+    support_index: &JunctionSupportIndex,
+    first_pass_correction: &SegmentCorrectionContext<'_>,
+    correction: &SegmentCorrectionContext<'_>,
+    pb: Option<&ProgressBar>,
+) -> Result<Vec<SegmentRecord>> {
+    let mut out = Vec::new();
+    for_each_retained_segment_group(&shard.path, pb, |group| {
+        let Some(preliminary) = build_bsj_segment_record_from_retained_group(
+            state,
+            &group,
+            first_pass_correction,
+            &[],
+        )?
+        else {
+            return Ok(());
+        };
+        let record = if segment_record_has_supported_alternative(&preliminary, support_index) {
+            build_bsj_segment_record_from_retained_group(state, &group, correction, &[])?
+                .unwrap_or(preliminary)
+        } else {
+            preliminary
+        };
+        out.push(record);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Builds corrected non-BSJ records for one retained shard.
+///
+/// Non-BSJ correction remains read-local except for the immutable junction
+/// support table, which allows shard-level parallelism without changing the
+/// preliminary `R/A/C/S` spill protocol or keeping all retained groups resident.
+fn build_corrected_non_bsj_records_from_shard(
+    state: &ScanState,
+    shard: &SegmentScanShardPaths,
+    support_index: &JunctionSupportIndex,
+    correction: &SegmentCorrectionContext<'_>,
+    pb: Option<&ProgressBar>,
+) -> Result<Vec<SegmentRecord>> {
+    let mut out = Vec::new();
+    for_each_retained_segment_group(&shard.path, pb, |group| {
+        let strand_hint = read_strand_hint_from_candidates(&group.candidates);
+        let junction_hints = read_junction_hints_from_candidates(&group.candidates);
+        for preliminary in &group.segment_records {
+            let record = if segment_record_has_supported_alternative(preliminary, support_index) {
+                rebuild_segment_record_from_retained_group(
+                    preliminary,
+                    &group,
+                    state,
+                    correction,
+                    strand_hint,
+                    &junction_hints,
+                )
+                .unwrap_or_else(|| preliminary.clone())
+            } else {
+                preliminary.clone()
+            };
+            out.push(record);
+        }
+        Ok(())
+    })?;
     Ok(out)
 }
 
@@ -8514,6 +9613,7 @@ fn build_major_isoforms_from_segments_file(
             .then_with(|| a.start.cmp(&b.start))
             .then_with(|| a.end.cmp(&b.end))
             .then_with(|| a.circ_id.cmp(&b.circ_id))
+            .then_with(|| a.isoform_rank.cmp(&b.isoform_rank))
     });
 
     let total_isoforms = isoforms.len();
@@ -8939,7 +10039,12 @@ fn major_link_is_mature_supported(
         .is_some_and(|support| support.bsj + support.backward >= MAJOR_MIN_MATURE_LINK_SUPPORT)
 }
 
-/// Selects the major isoform path for one circRNA with phase-seed-union.
+/// Selects the single major isoform path for one circRNA.
+///
+/// The selected structure is the validated phase-seed-union path. Even when
+/// the graph contains phase-supported alternatives, the default output keeps
+/// one isoform per circRNA until multi-sample major switching or a dedicated
+/// usage model justifies exposing additional candidates.
 fn select_major_isoform(
     circ: &CircRecord,
     support: &HashMap<MajorEdge, MajorEdgeSupport>,
@@ -8952,16 +10057,41 @@ fn select_major_isoform(
     let phase_edges = major_phase_chain(circ, support);
     let seed_edges = major_seed_chain(support);
     let union_edges = major_union_chain(seed_edges, phase_edges);
-    let strand = major_isoform_strand(circ, &union_edges);
+    let mut record = major_isoform_from_edges(
+        circ,
+        &union_edges,
+        support,
+        link_support,
+        link_exclusion,
+        span_support,
+        sample_id,
+        annotation,
+    );
+    major_set_isoform_identity(&mut record, 1);
+    record
+}
+
+/// Builds one isoform record from an already selected internal-edge chain.
+fn major_isoform_from_edges(
+    circ: &CircRecord,
+    union_edges: &[MajorEdge],
+    support: &HashMap<MajorEdge, MajorEdgeSupport>,
+    link_support: &HashMap<MajorJunctionLink, MajorLinkSupport>,
+    link_exclusion: &HashMap<MajorJunctionLink, MajorLinkSupport>,
+    span_support: &[MajorAlignedSpan],
+    sample_id: &str,
+    annotation: Option<&Annotation>,
+) -> MajorIsoformRecord {
+    let strand = major_isoform_strand(circ, union_edges);
     let annotation_exons =
         major_projection_annotation_exons_for_circ(circ, annotation, span_support);
     let chain_is_phased =
-        major_chain_has_adjacent_link_support(&union_edges, link_support, link_exclusion);
+        major_chain_has_adjacent_link_support(union_edges, link_support, link_exclusion);
     let exon_build = major_exons_from_edges(
         circ.start,
         circ.end,
         strand,
-        &union_edges,
+        union_edges,
         &annotation_exons,
         support,
         link_support,
@@ -8996,10 +10126,9 @@ fn select_major_isoform(
             "low_segment_coverage_unannotated_long_exon",
         );
     }
-    let structure_hash = major_structure_hash(&circ.chr, strand, circ.start, circ.end, &exons);
     MajorIsoformRecord {
         circ_id: circ.id.clone(),
-        isoform_id: format!("{}.major", circ.id),
+        isoform_id: format!("{}.iso1", circ.id),
         sample_id: sample_id.to_string(),
         chr: circ.chr.clone(),
         start: circ.start,
@@ -9011,11 +10140,19 @@ fn select_major_isoform(
         segment_coverage_pct,
         path_score,
         bsj_reads: circ.junction_read_count.parse::<usize>().unwrap_or(0),
-        structure_hash,
         isoform_len,
+        isoform_rank: 0,
+        isoform_class: "candidate".to_string(),
         isoform_origin,
         estimate_reason,
     }
+}
+
+/// Assigns stable user-facing rank, class, and ID after candidate sorting.
+fn major_set_isoform_identity(record: &mut MajorIsoformRecord, rank: usize) {
+    record.isoform_rank = rank;
+    record.isoform_class = "major".to_string();
+    record.isoform_id = format!("{}.iso{}", record.circ_id, rank);
 }
 
 /// Builds the BSJ-phased chain and fills gaps with backward/outward evidence.
@@ -9896,9 +11033,11 @@ fn major_has_unannotated_long_exon(exons: &[(i32, i32)], annotation_exons: &[(i3
 
 /// Tests whether high-confidence continuous alignment excludes a splice edge.
 fn major_edge_has_high_conf_exclusion(edge: MajorEdge, span_support: &[MajorAlignedSpan]) -> bool {
+    let left_anchor_start = edge.donor_end - MAJOR_EXCLUSIVE_JUNCTION_MIN_ANCHOR + 1;
+    let right_anchor_end = edge.acceptor_start + MAJOR_EXCLUSIVE_JUNCTION_MIN_ANCHOR - 1;
     span_support.iter().any(|span| {
-        span.start <= edge.donor_end
-            && span.end >= edge.acceptor_start
+        span.start <= left_anchor_start
+            && span.end >= right_anchor_end
             && span.bsj + span.backward >= MAJOR_MIN_MATURE_LINK_SUPPORT
     })
 }
@@ -10006,65 +11145,41 @@ fn major_edge_weight(support: &MajorEdgeSupport) -> f64 {
 
 /// Returns a stable sample label from the output prefix.
 fn major_sample_id(out_prefix: &str) -> String {
-    std::path::Path::new(out_prefix)
+    let sample = std::path::Path::new(out_prefix)
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
-        .unwrap_or(out_prefix)
-        .to_string()
+        .unwrap_or(out_prefix);
+    sample.strip_suffix(".ciri").unwrap_or(sample).to_string()
 }
 
 /// Computes a deterministic FNV-1a hash for multi-sample structure matching.
-fn major_structure_hash(
-    chr: &str,
-    strand: char,
-    start: i32,
-    end: i32,
-    exons: &[(i32, i32)],
-) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64;
-    fn feed(hash: &mut u64, bytes: &[u8]) {
-        for byte in bytes {
-            *hash ^= u64::from(*byte);
-            *hash = hash.wrapping_mul(0x100000001b3);
-        }
-        *hash ^= 0xff;
-        *hash = hash.wrapping_mul(0x100000001b3);
-    }
-    feed(&mut hash, chr.as_bytes());
-    feed(&mut hash, strand.to_string().as_bytes());
-    feed(&mut hash, &start.to_le_bytes());
-    feed(&mut hash, &end.to_le_bytes());
-    for (exon_start, exon_end) in exons {
-        feed(&mut hash, &exon_start.to_le_bytes());
-        feed(&mut hash, &exon_end.to_le_bytes());
-    }
-    hash
-}
-
-/// Writes major isoforms as a GTF sidecar with coverage and structure metadata.
+/// Writes major isoforms as a GTF sidecar with structure audit metadata.
+///
+/// The numeric support values live in ordered attributes rather than the GTF
+/// score column because the public schema distinguishes `weakness`, `score`,
+/// and `weight`; using `.` for column six avoids a second ambiguous score.
 fn write_major_isoform_gtf(path: &str, records: &[MajorIsoformRecord]) -> Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     for record in records {
         let attrs = major_gtf_attributes(record);
         writeln!(
             writer,
-            "{}\tCIRI\tcircRNA\t{}\t{}\t{:.3}\t{}\t.\t{}",
-            record.chr, record.start, record.end, record.cov, record.strand, attrs
+            "{}\tCIRI\tcircRNA\t{}\t{}\t.\t{}\t.\t{}",
+            record.chr, record.start, record.end, record.strand, attrs
         )?;
         writeln!(
             writer,
-            "{}\tCIRI\ttranscript\t{}\t{}\t{:.3}\t{}\t.\t{}",
-            record.chr, record.start, record.end, record.cov, record.strand, attrs
+            "{}\tCIRI\ttranscript\t{}\t{}\t.\t{}\t.\t{}",
+            record.chr, record.start, record.end, record.strand, attrs
         )?;
         for (idx, (start, end)) in record.exons.iter().enumerate() {
             writeln!(
                 writer,
-                "{}\tCIRI\texon\t{}\t{}\t{:.3}\t{}\t.\t{} exon_number \"{}\";",
+                "{}\tCIRI\texon\t{}\t{}\t.\t{}\t.\t{} exon_number \"{}\";",
                 record.chr,
                 start,
                 end,
-                record.cov,
                 record.strand,
                 attrs,
                 idx + 1
@@ -10075,26 +11190,70 @@ fn write_major_isoform_gtf(path: &str, records: &[MajorIsoformRecord]) -> Result
     Ok(())
 }
 
-/// Formats the stable GTF attributes shared by circRNA/transcript/exon rows.
+/// Formats stable GTF attributes shared by circRNA/transcript/exon rows.
+///
+/// Attribute order is intentionally fixed across feature types so downstream
+/// parsers can compare rows mechanically. Exon rows append only `exon_number`
+/// after this shared block.
 fn major_gtf_attributes(record: &MajorIsoformRecord) -> String {
     format!(
-        "gene_id \"{}\"; transcript_id \"{}\"; circRNA_id \"{}\"; isoform_id \"{}\"; sample_id \"{}\"; source_gene_id \"{}\"; isoform_rank \"1\"; isoform_class \"major\"; isoform_origin \"{}\"; estimate_reason \"{}\"; path_method \"phase_seed_union\"; cov \"{:.3}\"; segment_coverage_pct \"{:.3}\"; bsj_reads \"{}\"; path_score \"{:.3}\"; exon_count \"{}\"; isoform_len \"{}\"; structure_hash \"{:016x}\";",
+        "gene_id \"{}\"; transcript_id \"{}\"; source_gene_id \"{}\"; type \"{}\"; evidence \"{}\"; weakness \"{:.3}\"; score \"{:.3}\"; bsj_reads \"{}\"; weight \"{:.3}\"; exon_count \"{}\"; isoform_len \"{}\";",
         gtf_escape(&record.circ_id),
         gtf_escape(&record.isoform_id),
-        gtf_escape(&record.circ_id),
-        gtf_escape(&record.isoform_id),
-        gtf_escape(&record.sample_id),
         gtf_escape(&record.source_gene_id),
         gtf_escape(&record.isoform_origin),
-        gtf_escape(&record.estimate_reason),
+        gtf_escape(&major_evidence_text(record)),
         record.cov,
         record.segment_coverage_pct,
         record.bsj_reads,
         record.path_score,
         record.exons.len(),
-        record.isoform_len,
-        record.structure_hash
+        record.isoform_len
     )
+}
+
+/// Summarizes mature/estimate construction evidence for GTF audit attributes.
+///
+/// Internal estimate reasons are implementation-oriented and can combine
+/// several low-level block states. The public `evidence` value keeps a stable,
+/// compact vocabulary that explains the biological limitation without exposing
+/// builder-specific method names such as `phase_seed_union`.
+fn major_evidence_text(record: &MajorIsoformRecord) -> String {
+    if record.isoform_origin == "mature" {
+        return "phased_junction".to_string();
+    }
+    let reasons: HashSet<&str> = record.estimate_reason.split(',').collect();
+    let mut evidence = Vec::new();
+    if reasons.contains("gtf_long_block_projection") || reasons.contains("inferred_internal_block")
+    {
+        evidence.push("annotation_guided");
+    }
+    if reasons.contains("unphased_junction_chain") {
+        evidence.push("unphased_junction");
+    }
+    if reasons.contains("unphased_single_exon_block") {
+        evidence.push("low_coverage_exon");
+    }
+    if reasons.contains("unresolved_long_block") {
+        evidence.push("ambiguous_exon");
+    }
+    if reasons.contains("low_segment_coverage_unannotated_long_exon") {
+        evidence.push("unconfident_long_exon");
+    }
+    if evidence.is_empty() {
+        evidence.push("estimate");
+    }
+    evidence.join(",")
+}
+
+/// Formats the exon chain for compact FASTA header display.
+fn major_cirexon_text(record: &MajorIsoformRecord) -> String {
+    record
+        .exons
+        .iter()
+        .map(|(start, end)| format!("{}-{}:{}", start, end, record.strand))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Escapes double quotes in GTF attribute values.
@@ -10102,14 +11261,14 @@ fn gtf_escape(value: &str) -> String {
     value.replace('"', "\\\"")
 }
 
-/// Counts FASTA records emitted from the selected major isoforms.
+/// Counts FASTA records emitted from selected major isoforms.
 #[derive(Debug, Clone, Copy, Default)]
 struct MajorIsoformFastaSummary {
     isoforms: usize,
     circ_rnas: usize,
 }
 
-/// Writes reference-derived FASTA sequences for the selected major isoforms.
+/// Writes reference-derived FASTA sequences for selected major isoforms.
 fn write_major_isoform_fasta(
     path: &str,
     records: &[MajorIsoformRecord],
@@ -10123,21 +11282,18 @@ fn write_major_isoform_fasta(
             continue;
         }
         let seq = major_isoform_sequence(record, reference)?;
+        let cirexon = major_cirexon_text(record);
+        let evidence = major_evidence_text(record);
         writeln!(
             writer,
-            ">{} circRNA_id={} sample_id={} isoform_origin={} estimate_reason={} cov={:.3} segment_coverage_pct={:.3} bsj_reads={} path_score={:.3} exon_count={} isoform_len={} structure_hash={:016x}",
+            ">{} circRNA_id={} sample_id={} type={} evidence={} len={} cirexon={}",
             record.isoform_id,
             record.circ_id,
             record.sample_id,
             record.isoform_origin,
-            record.estimate_reason,
-            record.cov,
-            record.segment_coverage_pct,
-            record.bsj_reads,
-            record.path_score,
-            record.exons.len(),
+            evidence,
             record.isoform_len,
-            record.structure_hash
+            cirexon
         )?;
         for chunk in seq.as_bytes().chunks(80) {
             writer.write_all(chunk)?;
@@ -10194,9 +11350,9 @@ fn major_isoform_should_emit_fasta(record: &MajorIsoformRecord) -> bool {
 
 /// Returns whether an unphased estimate is reliable enough for FASTA.
 ///
-/// The candidate still carries `unphased_junction_chain` in the header, but the
-/// coverage requirement keeps this as a high-confidence sequence set rather
-/// than the full audit table.
+/// The candidate still carries an internal unphased reason for filtering, but
+/// the public FASTA header stays compact; only high-coverage unphased estimates
+/// enter the sequence-ready subset.
 fn major_isoform_is_trusted_unphased_candidate(record: &MajorIsoformRecord) -> bool {
     !record.estimate_reason.contains("unresolved_long_block")
         && !record
@@ -10208,7 +11364,7 @@ fn major_isoform_is_trusted_unphased_candidate(record: &MajorIsoformRecord) -> b
         && record.segment_coverage_pct >= MAJOR_MIN_CANDIDATE_SEGMENT_COVERAGE_PCT
 }
 
-/// Extracts a major isoform sequence in transcript orientation.
+/// Extracts an isoform sequence in transcript orientation.
 fn major_isoform_sequence(
     record: &MajorIsoformRecord,
     reference: &HashMap<String, String>,
@@ -10220,7 +11376,7 @@ fn major_isoform_sequence(
     for &(start, end) in &record.exons {
         if start < 1 || end < start || end as usize > chr_seq.len() {
             bail!(
-                "invalid major isoform exon coordinate {}:{}-{} for {}",
+                "invalid isoform exon coordinate {}:{}-{} for {}",
                 record.chr,
                 start,
                 end,
@@ -10894,7 +12050,7 @@ mod tests {
         reference.insert("chrT".to_string(), "ACCGTTTAGGCC".to_string());
         let record = MajorIsoformRecord {
             circ_id: "chrT:1|12".to_string(),
-            isoform_id: "chrT:1|12.major".to_string(),
+            isoform_id: "chrT:1|12.iso1".to_string(),
             sample_id: "sample".to_string(),
             chr: "chrT".to_string(),
             start: 1,
@@ -10906,8 +12062,9 @@ mod tests {
             segment_coverage_pct: 100.0,
             path_score: 1.0,
             bsj_reads: 1,
-            structure_hash: 0,
             isoform_len: 8,
+            isoform_rank: 1,
+            isoform_class: "major".to_string(),
             isoform_origin: "mature".to_string(),
             estimate_reason: "none".to_string(),
         };
@@ -10922,7 +12079,7 @@ mod tests {
     fn major_isoform_fasta_skips_obvious_unresolved_estimates() {
         let mature = MajorIsoformRecord {
             circ_id: "chrT:1|12".to_string(),
-            isoform_id: "chrT:1|12.major".to_string(),
+            isoform_id: "chrT:1|12.iso1".to_string(),
             sample_id: "sample".to_string(),
             chr: "chrT".to_string(),
             start: 1,
@@ -10934,8 +12091,9 @@ mod tests {
             segment_coverage_pct: 100.0,
             path_score: 1.0,
             bsj_reads: 1,
-            structure_hash: 0,
             isoform_len: 12,
+            isoform_rank: 1,
+            isoform_class: "major".to_string(),
             isoform_origin: "mature".to_string(),
             estimate_reason: "none".to_string(),
         };
@@ -11049,14 +12207,38 @@ mod tests {
         assert!(!gtf.contains(&legacy_source));
         assert!(gtf.contains("\texon\t100\t150\t"));
         assert!(gtf.contains("\texon\t200\t300\t"));
-        assert!(gtf.contains("isoform_origin \"mature\";"));
-        assert!(gtf.contains("estimate_reason \"none\";"));
-        assert!(gtf.contains("segment_coverage_pct \"100.000\";"));
+        assert!(gtf.contains("type \"mature\";"));
+        assert!(gtf.contains("evidence \"phased_junction\";"));
+        assert!(gtf.contains("weakness \"3.000\";"));
+        assert!(gtf.contains("score \"100.000\";"));
+        assert!(gtf.contains("weight \"3.000\";"));
+        for removed_key in [
+            "circRNA_id \"",
+            "isoform_id \"",
+            "sample_id \"",
+            "isoform_rank \"",
+            "isoform_class \"",
+            "estimate_reason \"",
+            "path_method \"",
+            "cov \"",
+            "segment_coverage_pct \"",
+            "path_score \"",
+            "structure_hash \"",
+        ] {
+            assert!(
+                !gtf.contains(removed_key),
+                "{removed_key} should not be in GTF"
+            );
+        }
         let fasta = std::fs::read_to_string(format!("{}.isoforms.fa", out_prefix)).unwrap();
-        assert!(fasta.contains("isoform_len=152"));
-        assert!(fasta.contains("isoform_origin=mature"));
-        assert!(fasta.contains("estimate_reason=none"));
-        assert!(fasta.contains("segment_coverage_pct=100.000"));
+        assert!(fasta.contains(">chrT:100|300.iso1 "));
+        assert!(fasta.contains("type=mature"));
+        assert!(fasta.contains("evidence=phased_junction"));
+        assert!(fasta.contains("len=152"));
+        assert!(fasta.contains("cirexon=100-150:+,200-300:+"));
+        assert!(!fasta.contains("structure_hash="));
+        assert!(!fasta.contains("estimate_reason="));
+        assert!(!fasta.contains("segment_coverage_pct="));
         let _ = std::fs::remove_file(&segments_path);
         let _ = std::fs::remove_file(format!("{}.isoforms.gtf", out_prefix));
         let _ = std::fs::remove_file(format!("{}.isoforms.fa", out_prefix));
@@ -11378,6 +12560,32 @@ mod tests {
         assert_eq!(build.exons, vec![(100, 500)]);
         assert_eq!(build.origin(), "mature");
         assert_eq!(build.estimate_reason(), "none");
+    }
+
+    #[test]
+    fn major_isoform_requires_anchored_exclusion_across_annotation_edge() {
+        let edge = MajorEdge {
+            donor_end: 150,
+            acceptor_start: 220,
+            strand: '+',
+        };
+        let short_overrun = vec![MajorAlignedSpan {
+            start: 147,
+            end: 223,
+            bsj: 1.0,
+            backward: 0.0,
+            outward: 0.0,
+        }];
+        assert!(!major_edge_has_high_conf_exclusion(edge, &short_overrun));
+
+        let anchored_span = vec![MajorAlignedSpan {
+            start: 141,
+            end: 229,
+            bsj: 1.0,
+            backward: 0.0,
+            outward: 0.0,
+        }];
+        assert!(major_edge_has_high_conf_exclusion(edge, &anchored_span));
     }
 
     #[test]
@@ -11757,8 +12965,8 @@ mod tests {
         let gtf = std::fs::read_to_string(format!("{}.isoforms.gtf", out_prefix)).unwrap();
         assert!(gtf.contains("\texon\t100\t170\t"));
         assert!(gtf.contains("\texon\t240\t300\t"));
-        assert!(gtf.contains("isoform_origin \"estimate\";"));
-        assert!(gtf.contains("estimate_reason \"unphased_junction_chain\";"));
+        assert!(gtf.contains("type \"estimate\";"));
+        assert!(gtf.contains("evidence \"unphased_junction\";"));
         let _ = std::fs::remove_file(&segments_path);
         let _ = std::fs::remove_file(format!("{}.isoforms.gtf", out_prefix));
         let _ = std::fs::remove_file(format!("{}.isoforms.fa", out_prefix));

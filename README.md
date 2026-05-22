@@ -1,6 +1,6 @@
 # CIRI-toolkit
 
-`CIRI-toolkit` is a high-performance circRNA detection and isoform reconstruction toolkit for large-scale transcriptome data. It provides CIRI3-compatible BSJ detection, read-level circRNA segment reconstruction, major isoform sequence output, and IGV-ready review tracks.
+`CIRI-toolkit` is a high-performance circRNA detection and isoform reconstruction toolkit for large-scale transcriptome data. It provides CIRI3-compatible BSJ detection, read-level circRNA segment reconstruction, high-confidence isoform sequence output, and IGV-ready review tracks.
 
 ## Performance Benchmarking
 
@@ -88,11 +88,55 @@ The main output files are:
 - `<prefix>.out`: CIRI3-compatible circRNA result table
 - `<prefix>.bsj`: mate-level BSJ evidence display used for review/debugging
 - `<prefix>.segments`: read-level BSJ/backward/outward segments
-- `<prefix>.isoforms.gtf`: major isoform structure audit table for all reported circRNAs
-- `<prefix>.isoforms.fa`: high-confidence major circRNA isoform sequences
+- `<prefix>.isoforms.gtf`: major isoform structure audit table for all reported circRNAs; attributes use `gene_id`, `transcript_id`, `type`, `evidence`, `weakness`, `score`, `bsj_reads`, `weight`, `exon_count`, and `isoform_len`
+- `<prefix>.isoforms.fa`: high-confidence circRNA isoform sequences; FASTA IDs use `<circRNA_id>.iso1` and headers keep compact sequence/filter fields such as `type`, `evidence`, `len`, and `cirexon`
 - `<prefix>.bedpe`: IGV-compatible BSJ anchor track
 - `<prefix>.segments.bam` and `<prefix>.segments.bam.bai`: IGV-compatible segment alignments
 - `<prefix>.log`: run log
+
+### Full-length isoform sequence assembly
+
+`<prefix>.isoforms.fa` contains assembled circRNA isoform sequences, but
+not every FASTA record has the same structural confidence. The FASTA header
+includes `type` and `evidence` fields so users can choose a filtering strategy
+that matches the tolerance of their downstream analysis.
+
+Recommended filtering criteria:
+
+- For the highest-confidence sequence set, use records with `type=mature` and
+  `evidence=phased_junction`; these isoforms are supported by phased read-chain
+  evidence across the selected junction path.
+- For a balanced precision/recall set, include `type=estimate` records with
+  annotation-guided or unphased junction evidence, such as
+  `evidence=annotation_guided,unphased_junction`.
+- Records containing `ambiguous_exon`, `low_coverage_exon`, or
+  `unconfident_long_exon` are retained to preserve recall, but should be treated
+  as lower-confidence candidates in sequence-sensitive downstream analyses.
+
+## Validate isoform FASTA
+
+Use `scripts/ciri_isoform_fasta_validate.py` to verify that every FASTA record
+matches the exon chain in `<prefix>.isoforms.gtf` and the supplied reference,
+including negative-strand reverse-complement handling:
+
+```bash
+python scripts/ciri_isoform_fasta_validate.py \
+  --fasta <prefix>.isoforms.fa \
+  --gtf <prefix>.isoforms.gtf \
+  --reference <reference_fasta>
+```
+
+An optional sampled BLAT strand check can be added when the UCSC BLAT binary is
+available:
+
+```bash
+python scripts/ciri_isoform_fasta_validate.py \
+  --fasta <prefix>.isoforms.fa \
+  --gtf <prefix>.isoforms.gtf \
+  --reference <reference_fasta> \
+  --blat /data/public/software/UCSC_utility/blat/blat \
+  --blat-sample-size 100
+```
 
 ## `.out` Format
 
