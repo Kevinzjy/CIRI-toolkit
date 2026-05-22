@@ -8,8 +8,10 @@
 //! representation of confirmed BSJ reads that can be compared directly against
 //! simulator truth before full-length path reconstruction is re-enabled on top
 //! of it. Full-length reconstruction is likewise a sidecar: it consumes the
-//! completed segment rows and writes one major isoform per Summary-confirmed
-//! circRNA without changing CIRI3 `.out` or `.bsj` decisions.
+//! completed segment rows and writes one rank 1 major isoform per
+//! Summary-confirmed circRNA without changing CIRI3 `.out` or `.bsj`
+//! decisions. Multi-sample major isoform switching can later reuse the same
+//! structure fields without changing the core BSJ contract.
 
 use anyhow::{anyhow, bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -234,12 +236,12 @@ pub struct SegmentRunSummary {
     pub outward_segments: usize,
 }
 
-/// User-facing counts produced by the major-isoform reconstruction stage.
+/// User-facing counts produced by the isoform reconstruction stage.
 ///
-/// The GTF is the complete per-circRNA audit output, while FASTA is stricter
-/// and contains only sequence-ready isoforms. Keeping both counts visible helps
-/// users distinguish "reconstructed structure exists" from "trusted sequence
-/// was emitted".
+/// The GTF is the complete per-circRNA audit output: every circRNA has one rank
+/// 1 major record. FASTA is stricter and contains only sequence-ready isoforms,
+/// so both counts remain visible to distinguish "reconstructed structure
+/// exists" from "trusted sequence was emitted".
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IsoformRunSummary {
     /// Isoform records written to `<prefix>.isoforms.gtf`.
@@ -541,9 +543,9 @@ struct MajorCircIndexEntry {
 
 /// Major isoform selected for one Summary-confirmed circRNA.
 ///
-/// The output is deliberately single-isoform for now. `structure_hash` and
-/// `sample_id` are emitted so later multi-sample code can compare major
-/// isoform switching without changing the file contract again.
+/// The output remains one record per circRNA. Rank and sample fields stay
+/// internal so sorting and FASTA headers can remain stable while the public GTF
+/// schema stays compact.
 #[derive(Debug, Clone)]
 struct MajorIsoformRecord {
     circ_id: String,
@@ -559,8 +561,9 @@ struct MajorIsoformRecord {
     segment_coverage_pct: f64,
     path_score: f64,
     bsj_reads: usize,
-    structure_hash: u64,
     isoform_len: i32,
+    isoform_rank: usize,
+    isoform_class: String,
     isoform_origin: String,
     estimate_reason: String,
 }
@@ -625,7 +628,7 @@ struct MajorBlockBuildStatus {
     unphased_single_exon: bool,
 }
 
-/// Column indexes required to rebuild major isoforms from `<prefix>.segments`.
+/// Column indexes required to rebuild isoforms from `<prefix>.segments`.
 ///
 /// Header-driven lookup keeps the isoform stage coupled to the public segments
 /// contract instead of to the in-memory `SegmentRecord` layout, which is the
@@ -9610,6 +9613,7 @@ fn build_major_isoforms_from_segments_file(
             .then_with(|| a.start.cmp(&b.start))
             .then_with(|| a.end.cmp(&b.end))
             .then_with(|| a.circ_id.cmp(&b.circ_id))
+            .then_with(|| a.isoform_rank.cmp(&b.isoform_rank))
     });
 
     let total_isoforms = isoforms.len();
@@ -10035,7 +10039,12 @@ fn major_link_is_mature_supported(
         .is_some_and(|support| support.bsj + support.backward >= MAJOR_MIN_MATURE_LINK_SUPPORT)
 }
 
-/// Selects the major isoform path for one circRNA with phase-seed-union.
+/// Selects the single major isoform path for one circRNA.
+///
+/// The selected structure is the validated phase-seed-union path. Even when
+/// the graph contains phase-supported alternatives, the default output keeps
+/// one isoform per circRNA until multi-sample major switching or a dedicated
+/// usage model justifies exposing additional candidates.
 fn select_major_isoform(
     circ: &CircRecord,
     support: &HashMap<MajorEdge, MajorEdgeSupport>,
@@ -10048,16 +10057,41 @@ fn select_major_isoform(
     let phase_edges = major_phase_chain(circ, support);
     let seed_edges = major_seed_chain(support);
     let union_edges = major_union_chain(seed_edges, phase_edges);
-    let strand = major_isoform_strand(circ, &union_edges);
+    let mut record = major_isoform_from_edges(
+        circ,
+        &union_edges,
+        support,
+        link_support,
+        link_exclusion,
+        span_support,
+        sample_id,
+        annotation,
+    );
+    major_set_isoform_identity(&mut record, 1);
+    record
+}
+
+/// Builds one isoform record from an already selected internal-edge chain.
+fn major_isoform_from_edges(
+    circ: &CircRecord,
+    union_edges: &[MajorEdge],
+    support: &HashMap<MajorEdge, MajorEdgeSupport>,
+    link_support: &HashMap<MajorJunctionLink, MajorLinkSupport>,
+    link_exclusion: &HashMap<MajorJunctionLink, MajorLinkSupport>,
+    span_support: &[MajorAlignedSpan],
+    sample_id: &str,
+    annotation: Option<&Annotation>,
+) -> MajorIsoformRecord {
+    let strand = major_isoform_strand(circ, union_edges);
     let annotation_exons =
         major_projection_annotation_exons_for_circ(circ, annotation, span_support);
     let chain_is_phased =
-        major_chain_has_adjacent_link_support(&union_edges, link_support, link_exclusion);
+        major_chain_has_adjacent_link_support(union_edges, link_support, link_exclusion);
     let exon_build = major_exons_from_edges(
         circ.start,
         circ.end,
         strand,
-        &union_edges,
+        union_edges,
         &annotation_exons,
         support,
         link_support,
@@ -10092,10 +10126,9 @@ fn select_major_isoform(
             "low_segment_coverage_unannotated_long_exon",
         );
     }
-    let structure_hash = major_structure_hash(&circ.chr, strand, circ.start, circ.end, &exons);
     MajorIsoformRecord {
         circ_id: circ.id.clone(),
-        isoform_id: format!("{}.major", circ.id),
+        isoform_id: format!("{}.iso1", circ.id),
         sample_id: sample_id.to_string(),
         chr: circ.chr.clone(),
         start: circ.start,
@@ -10107,11 +10140,19 @@ fn select_major_isoform(
         segment_coverage_pct,
         path_score,
         bsj_reads: circ.junction_read_count.parse::<usize>().unwrap_or(0),
-        structure_hash,
         isoform_len,
+        isoform_rank: 0,
+        isoform_class: "candidate".to_string(),
         isoform_origin,
         estimate_reason,
     }
+}
+
+/// Assigns stable user-facing rank, class, and ID after candidate sorting.
+fn major_set_isoform_identity(record: &mut MajorIsoformRecord, rank: usize) {
+    record.isoform_rank = rank;
+    record.isoform_class = "major".to_string();
+    record.isoform_id = format!("{}.iso{}", record.circ_id, rank);
 }
 
 /// Builds the BSJ-phased chain and fills gaps with backward/outward evidence.
@@ -11104,65 +11145,41 @@ fn major_edge_weight(support: &MajorEdgeSupport) -> f64 {
 
 /// Returns a stable sample label from the output prefix.
 fn major_sample_id(out_prefix: &str) -> String {
-    std::path::Path::new(out_prefix)
+    let sample = std::path::Path::new(out_prefix)
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
-        .unwrap_or(out_prefix)
-        .to_string()
+        .unwrap_or(out_prefix);
+    sample.strip_suffix(".ciri").unwrap_or(sample).to_string()
 }
 
 /// Computes a deterministic FNV-1a hash for multi-sample structure matching.
-fn major_structure_hash(
-    chr: &str,
-    strand: char,
-    start: i32,
-    end: i32,
-    exons: &[(i32, i32)],
-) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64;
-    fn feed(hash: &mut u64, bytes: &[u8]) {
-        for byte in bytes {
-            *hash ^= u64::from(*byte);
-            *hash = hash.wrapping_mul(0x100000001b3);
-        }
-        *hash ^= 0xff;
-        *hash = hash.wrapping_mul(0x100000001b3);
-    }
-    feed(&mut hash, chr.as_bytes());
-    feed(&mut hash, strand.to_string().as_bytes());
-    feed(&mut hash, &start.to_le_bytes());
-    feed(&mut hash, &end.to_le_bytes());
-    for (exon_start, exon_end) in exons {
-        feed(&mut hash, &exon_start.to_le_bytes());
-        feed(&mut hash, &exon_end.to_le_bytes());
-    }
-    hash
-}
-
-/// Writes major isoforms as a GTF sidecar with coverage and structure metadata.
+/// Writes major isoforms as a GTF sidecar with structure audit metadata.
+///
+/// The numeric support values live in ordered attributes rather than the GTF
+/// score column because the public schema distinguishes `weakness`, `score`,
+/// and `weight`; using `.` for column six avoids a second ambiguous score.
 fn write_major_isoform_gtf(path: &str, records: &[MajorIsoformRecord]) -> Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     for record in records {
         let attrs = major_gtf_attributes(record);
         writeln!(
             writer,
-            "{}\tCIRI\tcircRNA\t{}\t{}\t{:.3}\t{}\t.\t{}",
-            record.chr, record.start, record.end, record.cov, record.strand, attrs
+            "{}\tCIRI\tcircRNA\t{}\t{}\t.\t{}\t.\t{}",
+            record.chr, record.start, record.end, record.strand, attrs
         )?;
         writeln!(
             writer,
-            "{}\tCIRI\ttranscript\t{}\t{}\t{:.3}\t{}\t.\t{}",
-            record.chr, record.start, record.end, record.cov, record.strand, attrs
+            "{}\tCIRI\ttranscript\t{}\t{}\t.\t{}\t.\t{}",
+            record.chr, record.start, record.end, record.strand, attrs
         )?;
         for (idx, (start, end)) in record.exons.iter().enumerate() {
             writeln!(
                 writer,
-                "{}\tCIRI\texon\t{}\t{}\t{:.3}\t{}\t.\t{} exon_number \"{}\";",
+                "{}\tCIRI\texon\t{}\t{}\t.\t{}\t.\t{} exon_number \"{}\";",
                 record.chr,
                 start,
                 end,
-                record.cov,
                 record.strand,
                 attrs,
                 idx + 1
@@ -11173,26 +11190,70 @@ fn write_major_isoform_gtf(path: &str, records: &[MajorIsoformRecord]) -> Result
     Ok(())
 }
 
-/// Formats the stable GTF attributes shared by circRNA/transcript/exon rows.
+/// Formats stable GTF attributes shared by circRNA/transcript/exon rows.
+///
+/// Attribute order is intentionally fixed across feature types so downstream
+/// parsers can compare rows mechanically. Exon rows append only `exon_number`
+/// after this shared block.
 fn major_gtf_attributes(record: &MajorIsoformRecord) -> String {
     format!(
-        "gene_id \"{}\"; transcript_id \"{}\"; circRNA_id \"{}\"; isoform_id \"{}\"; sample_id \"{}\"; source_gene_id \"{}\"; isoform_rank \"1\"; isoform_class \"major\"; isoform_origin \"{}\"; estimate_reason \"{}\"; path_method \"phase_seed_union\"; cov \"{:.3}\"; segment_coverage_pct \"{:.3}\"; bsj_reads \"{}\"; path_score \"{:.3}\"; exon_count \"{}\"; isoform_len \"{}\"; structure_hash \"{:016x}\";",
+        "gene_id \"{}\"; transcript_id \"{}\"; source_gene_id \"{}\"; type \"{}\"; evidence \"{}\"; weakness \"{:.3}\"; score \"{:.3}\"; bsj_reads \"{}\"; weight \"{:.3}\"; exon_count \"{}\"; isoform_len \"{}\";",
         gtf_escape(&record.circ_id),
         gtf_escape(&record.isoform_id),
-        gtf_escape(&record.circ_id),
-        gtf_escape(&record.isoform_id),
-        gtf_escape(&record.sample_id),
         gtf_escape(&record.source_gene_id),
         gtf_escape(&record.isoform_origin),
-        gtf_escape(&record.estimate_reason),
+        gtf_escape(&major_evidence_text(record)),
         record.cov,
         record.segment_coverage_pct,
         record.bsj_reads,
         record.path_score,
         record.exons.len(),
-        record.isoform_len,
-        record.structure_hash
+        record.isoform_len
     )
+}
+
+/// Summarizes mature/estimate construction evidence for GTF audit attributes.
+///
+/// Internal estimate reasons are implementation-oriented and can combine
+/// several low-level block states. The public `evidence` value keeps a stable,
+/// compact vocabulary that explains the biological limitation without exposing
+/// builder-specific method names such as `phase_seed_union`.
+fn major_evidence_text(record: &MajorIsoformRecord) -> String {
+    if record.isoform_origin == "mature" {
+        return "phased_junction".to_string();
+    }
+    let reasons: HashSet<&str> = record.estimate_reason.split(',').collect();
+    let mut evidence = Vec::new();
+    if reasons.contains("gtf_long_block_projection") || reasons.contains("inferred_internal_block")
+    {
+        evidence.push("annotation_guided");
+    }
+    if reasons.contains("unphased_junction_chain") {
+        evidence.push("unphased_junction");
+    }
+    if reasons.contains("unphased_single_exon_block") {
+        evidence.push("low_coverage_exon");
+    }
+    if reasons.contains("unresolved_long_block") {
+        evidence.push("ambiguous_exon");
+    }
+    if reasons.contains("low_segment_coverage_unannotated_long_exon") {
+        evidence.push("unconfident_long_exon");
+    }
+    if evidence.is_empty() {
+        evidence.push("estimate");
+    }
+    evidence.join(",")
+}
+
+/// Formats the exon chain for compact FASTA header display.
+fn major_cirexon_text(record: &MajorIsoformRecord) -> String {
+    record
+        .exons
+        .iter()
+        .map(|(start, end)| format!("{}-{}:{}", start, end, record.strand))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Escapes double quotes in GTF attribute values.
@@ -11200,14 +11261,14 @@ fn gtf_escape(value: &str) -> String {
     value.replace('"', "\\\"")
 }
 
-/// Counts FASTA records emitted from the selected major isoforms.
+/// Counts FASTA records emitted from selected major isoforms.
 #[derive(Debug, Clone, Copy, Default)]
 struct MajorIsoformFastaSummary {
     isoforms: usize,
     circ_rnas: usize,
 }
 
-/// Writes reference-derived FASTA sequences for the selected major isoforms.
+/// Writes reference-derived FASTA sequences for selected major isoforms.
 fn write_major_isoform_fasta(
     path: &str,
     records: &[MajorIsoformRecord],
@@ -11221,21 +11282,16 @@ fn write_major_isoform_fasta(
             continue;
         }
         let seq = major_isoform_sequence(record, reference)?;
+        let cirexon = major_cirexon_text(record);
         writeln!(
             writer,
-            ">{} circRNA_id={} sample_id={} isoform_origin={} estimate_reason={} cov={:.3} segment_coverage_pct={:.3} bsj_reads={} path_score={:.3} exon_count={} isoform_len={} structure_hash={:016x}",
+            ">{} circRNA_id={} sample_id={} type={} len={} cirexon={}",
             record.isoform_id,
             record.circ_id,
             record.sample_id,
             record.isoform_origin,
-            record.estimate_reason,
-            record.cov,
-            record.segment_coverage_pct,
-            record.bsj_reads,
-            record.path_score,
-            record.exons.len(),
             record.isoform_len,
-            record.structure_hash
+            cirexon
         )?;
         for chunk in seq.as_bytes().chunks(80) {
             writer.write_all(chunk)?;
@@ -11292,9 +11348,9 @@ fn major_isoform_should_emit_fasta(record: &MajorIsoformRecord) -> bool {
 
 /// Returns whether an unphased estimate is reliable enough for FASTA.
 ///
-/// The candidate still carries `unphased_junction_chain` in the header, but the
-/// coverage requirement keeps this as a high-confidence sequence set rather
-/// than the full audit table.
+/// The candidate still carries an internal unphased reason for filtering, but
+/// the public FASTA header stays compact; only high-coverage unphased estimates
+/// enter the sequence-ready subset.
 fn major_isoform_is_trusted_unphased_candidate(record: &MajorIsoformRecord) -> bool {
     !record.estimate_reason.contains("unresolved_long_block")
         && !record
@@ -11306,7 +11362,7 @@ fn major_isoform_is_trusted_unphased_candidate(record: &MajorIsoformRecord) -> b
         && record.segment_coverage_pct >= MAJOR_MIN_CANDIDATE_SEGMENT_COVERAGE_PCT
 }
 
-/// Extracts a major isoform sequence in transcript orientation.
+/// Extracts an isoform sequence in transcript orientation.
 fn major_isoform_sequence(
     record: &MajorIsoformRecord,
     reference: &HashMap<String, String>,
@@ -11318,7 +11374,7 @@ fn major_isoform_sequence(
     for &(start, end) in &record.exons {
         if start < 1 || end < start || end as usize > chr_seq.len() {
             bail!(
-                "invalid major isoform exon coordinate {}:{}-{} for {}",
+                "invalid isoform exon coordinate {}:{}-{} for {}",
                 record.chr,
                 start,
                 end,
@@ -11992,7 +12048,7 @@ mod tests {
         reference.insert("chrT".to_string(), "ACCGTTTAGGCC".to_string());
         let record = MajorIsoformRecord {
             circ_id: "chrT:1|12".to_string(),
-            isoform_id: "chrT:1|12.major".to_string(),
+            isoform_id: "chrT:1|12.iso1".to_string(),
             sample_id: "sample".to_string(),
             chr: "chrT".to_string(),
             start: 1,
@@ -12004,8 +12060,9 @@ mod tests {
             segment_coverage_pct: 100.0,
             path_score: 1.0,
             bsj_reads: 1,
-            structure_hash: 0,
             isoform_len: 8,
+            isoform_rank: 1,
+            isoform_class: "major".to_string(),
             isoform_origin: "mature".to_string(),
             estimate_reason: "none".to_string(),
         };
@@ -12020,7 +12077,7 @@ mod tests {
     fn major_isoform_fasta_skips_obvious_unresolved_estimates() {
         let mature = MajorIsoformRecord {
             circ_id: "chrT:1|12".to_string(),
-            isoform_id: "chrT:1|12.major".to_string(),
+            isoform_id: "chrT:1|12.iso1".to_string(),
             sample_id: "sample".to_string(),
             chr: "chrT".to_string(),
             start: 1,
@@ -12032,8 +12089,9 @@ mod tests {
             segment_coverage_pct: 100.0,
             path_score: 1.0,
             bsj_reads: 1,
-            structure_hash: 0,
             isoform_len: 12,
+            isoform_rank: 1,
+            isoform_class: "major".to_string(),
             isoform_origin: "mature".to_string(),
             estimate_reason: "none".to_string(),
         };
@@ -12147,14 +12205,37 @@ mod tests {
         assert!(!gtf.contains(&legacy_source));
         assert!(gtf.contains("\texon\t100\t150\t"));
         assert!(gtf.contains("\texon\t200\t300\t"));
-        assert!(gtf.contains("isoform_origin \"mature\";"));
-        assert!(gtf.contains("estimate_reason \"none\";"));
-        assert!(gtf.contains("segment_coverage_pct \"100.000\";"));
+        assert!(gtf.contains("type \"mature\";"));
+        assert!(gtf.contains("evidence \"phased_junction\";"));
+        assert!(gtf.contains("weakness \"3.000\";"));
+        assert!(gtf.contains("score \"100.000\";"));
+        assert!(gtf.contains("weight \"3.000\";"));
+        for removed_key in [
+            "circRNA_id \"",
+            "isoform_id \"",
+            "sample_id \"",
+            "isoform_rank \"",
+            "isoform_class \"",
+            "estimate_reason \"",
+            "path_method \"",
+            "cov \"",
+            "segment_coverage_pct \"",
+            "path_score \"",
+            "structure_hash \"",
+        ] {
+            assert!(
+                !gtf.contains(removed_key),
+                "{removed_key} should not be in GTF"
+            );
+        }
         let fasta = std::fs::read_to_string(format!("{}.isoforms.fa", out_prefix)).unwrap();
-        assert!(fasta.contains("isoform_len=152"));
-        assert!(fasta.contains("isoform_origin=mature"));
-        assert!(fasta.contains("estimate_reason=none"));
-        assert!(fasta.contains("segment_coverage_pct=100.000"));
+        assert!(fasta.contains(">chrT:100|300.iso1 "));
+        assert!(fasta.contains("type=mature"));
+        assert!(fasta.contains("len=152"));
+        assert!(fasta.contains("cirexon=100-150:+,200-300:+"));
+        assert!(!fasta.contains("structure_hash="));
+        assert!(!fasta.contains("estimate_reason="));
+        assert!(!fasta.contains("segment_coverage_pct="));
         let _ = std::fs::remove_file(&segments_path);
         let _ = std::fs::remove_file(format!("{}.isoforms.gtf", out_prefix));
         let _ = std::fs::remove_file(format!("{}.isoforms.fa", out_prefix));
@@ -12881,8 +12962,8 @@ mod tests {
         let gtf = std::fs::read_to_string(format!("{}.isoforms.gtf", out_prefix)).unwrap();
         assert!(gtf.contains("\texon\t100\t170\t"));
         assert!(gtf.contains("\texon\t240\t300\t"));
-        assert!(gtf.contains("isoform_origin \"estimate\";"));
-        assert!(gtf.contains("estimate_reason \"unphased_junction_chain\";"));
+        assert!(gtf.contains("type \"estimate\";"));
+        assert!(gtf.contains("evidence \"unphased_junction\";"));
         let _ = std::fs::remove_file(&segments_path);
         let _ = std::fs::remove_file(format!("{}.isoforms.gtf", out_prefix));
         let _ = std::fs::remove_file(format!("{}.isoforms.fa", out_prefix));
