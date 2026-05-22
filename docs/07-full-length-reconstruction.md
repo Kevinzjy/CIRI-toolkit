@@ -682,7 +682,7 @@ isoform 输出必须建立在 read-level segments 稳定的前提上。当前单
 
 已测试过单样本额外输出 mature minor：虽然能召回少量非 major truth isoform，但 minor exact-any 只有约 `80-85%`，且不少错误来自 segments 边界或 phase path 构建偏差。当前默认因此恢复为每个 circRNA 一个 major isoform；后续若多样本中出现稳定 major isoform switching，再扩展多 isoform 输出。
 
-FASTA 序列抽取本身使用 `scripts/ciri_isoform_fasta_validate.py` 回归检查：该脚本从 `<prefix>.isoforms.gtf` 的 exon chain 和 reference FASTA 重新构建每条 FASTA 序列，并验证负链 reverse-complement、`len`、`type` 和 `cirexon` header 是否一致。可选 `--blat <path>` 会按 strand/type 分层抽样运行 UCSC BLAT，检查 genomic best hit strand 是否和 GTF strand 一致。这个检查只能证明 FASTA 与 GTF/ref 的序列投影自洽；它不能证明 selected exon chain 一定是真实 isoform，后者仍需要 simulator truth 或人工 review。
+FASTA 序列抽取本身使用 `scripts/ciri_isoform_fasta_validate.py` 回归检查：该脚本从 `<prefix>.isoforms.gtf` 的 exon chain 和 reference FASTA 重新构建每条 FASTA 序列，并验证负链 reverse-complement、`type`、`evidence`、`len` 和 `cirexon` header 是否一致。可选 `--blat <path>` 会按 strand/type 分层抽样运行 UCSC BLAT，检查 genomic best hit strand 是否和 GTF strand 一致。这个检查只能证明 FASTA 与 GTF/ref 的序列投影自洽；它不能证明 selected exon chain 一定是真实 isoform，后者仍需要 simulator truth 或人工 review。
 
 ## 11. 当前 isoform 输出协议
 
@@ -734,13 +734,13 @@ CLI 的 `--continue` 也遵守这个边界：已有 `<prefix>.segments` 时只�
 
 `weight` 继承早期 `path_score` 的计算方式，用于表示 selected path 的图路径权重。它主要服务于同一 circRNA 内候选 path 排序；当前默认只输出 rank 1 major，因此 `weight` 是审计 selected path 为什么被选中的辅助字段。
 
-`<prefix>.isoforms.gtf` 是完整审计表，包含每个 circRNA 的 rank 1 major；该 major 仍可能是 `mature`、可解释的 `estimate` 或明显 unresolved / partial 的 estimate。`<prefix>.isoforms.fa` 更严格，只输出可作为 sequence candidate 使用的高可信结构。FASTA header 只保留序列识别和结构字段：
+`<prefix>.isoforms.gtf` 是完整审计表，包含每个 circRNA 的 rank 1 major；该 major 仍可能是 `mature`、可解释的 `estimate` 或明显 unresolved / partial 的 estimate。`<prefix>.isoforms.fa` 更严格，只输出可作为 sequence candidate 使用的高可信结构。FASTA header 保留序列识别字段和最常用过滤字段：
 
 ```text
->{isoform_id} circRNA_id={circ_id} sample_id={sample_id} type={mature|estimate} len={isoform_len} cirexon={start-end:strand,...}
+>{isoform_id} circRNA_id={circ_id} sample_id={sample_id} type={mature|estimate} evidence={evidence} len={isoform_len} cirexon={start-end:strand,...}
 ```
 
-FASTA 不输出 `evidence`、`weakness`、`score`、`bsj_reads`、`weight`、`exon_count`、`isoform_len` 或内部 estimate reason；这些审计字段只保留在 GTF。
+FASTA 输出 `type` 和 `evidence` 方便用户直接过滤 sequence candidate；`weakness`、`score`、`bsj_reads`、`weight`、`exon_count`、`isoform_len` 和内部 estimate reason 只保留在 GTF 审计属性里。
 
 - `mature` 一律输出 FASTA；
 - `estimate` 只有在内部 reason 和 `score` 都满足高可信条件时才输出 FASTA；当前保留 annotation/read-guided estimate 的 `score >= 50%` 规则，并额外允许没有其它不可信 reason 且 `score >= 90%` 的 high-coverage candidate；

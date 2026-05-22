@@ -22,7 +22,7 @@ CIRI-toolkit 是 CIRI3（Java）的 Rust 复现版本，目标是在保持判定
 - `stringency` 过滤、FSJ 统计、注释输出等关键能力均可运行。
 - 双端（paired-end）与单端（single-end）输入均已完成验证，当前输出与 Java CIRI3 保持一致。
 - `Scan1` 与 `Scan2` 的性能优化阶段已完成，当前版本整体性能已达到并超过 Java 基线，可作为正式功能版本持续使用。
-- 默认后处理已完成 `<prefix>.segments` 和 major isoform 阶段：主流程写完 `<prefix>.out` 后继续生成 read-level circRNA segment chain，并从稳定的 `<prefix>.segments` 重新解析生成每个 circRNA 一个 rank 1 major isoform GTF/FASTA。FASTA ID 使用 `<circRNA_id>.iso1`，header 使用 `type`、`len` 和 `cirexon` 字段保留精简结构信息。
+- 默认后处理已完成 `<prefix>.segments` 和 major isoform 阶段：主流程写完 `<prefix>.out` 后继续生成 read-level circRNA segment chain，并从稳定的 `<prefix>.segments` 重新解析生成每个 circRNA 一个 rank 1 major isoform GTF/FASTA。FASTA ID 使用 `<circRNA_id>.iso1`，header 使用 `type`、`evidence`、`len` 和 `cirexon` 字段保留精简结构与过滤信息。
 
 ## 对齐基线
 - circRNA-level：100%

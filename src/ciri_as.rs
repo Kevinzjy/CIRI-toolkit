@@ -11283,13 +11283,15 @@ fn write_major_isoform_fasta(
         }
         let seq = major_isoform_sequence(record, reference)?;
         let cirexon = major_cirexon_text(record);
+        let evidence = major_evidence_text(record);
         writeln!(
             writer,
-            ">{} circRNA_id={} sample_id={} type={} len={} cirexon={}",
+            ">{} circRNA_id={} sample_id={} type={} evidence={} len={} cirexon={}",
             record.isoform_id,
             record.circ_id,
             record.sample_id,
             record.isoform_origin,
+            evidence,
             record.isoform_len,
             cirexon
         )?;
@@ -12231,6 +12233,7 @@ mod tests {
         let fasta = std::fs::read_to_string(format!("{}.isoforms.fa", out_prefix)).unwrap();
         assert!(fasta.contains(">chrT:100|300.iso1 "));
         assert!(fasta.contains("type=mature"));
+        assert!(fasta.contains("evidence=phased_junction"));
         assert!(fasta.contains("len=152"));
         assert!(fasta.contains("cirexon=100-150:+,200-300:+"));
         assert!(!fasta.contains("structure_hash="));

@@ -362,6 +362,11 @@ def validate(args: argparse.Namespace) -> int:
                 stats["header_type_match"] += 1
             else:
                 stats["header_type_mismatch"] += 1
+        if "evidence" in header_attrs:
+            if header_attrs["evidence"] == transcript["evidence"]:
+                stats["header_evidence_match"] += 1
+            else:
+                stats["header_evidence_mismatch"] += 1
         if "cirexon" in header_attrs:
             if header_attrs["cirexon"] == expected_cirexon(transcript, exons.get(name, [])):
                 stats["header_cirexon_match"] += 1
@@ -382,6 +387,7 @@ def validate(args: argparse.Namespace) -> int:
         "opposite_strand_sequence",
         "sequence_mismatch",
         "gtf_len_mismatch",
+        "header_evidence_mismatch",
         "header_len_mismatch",
         "header_type_mismatch",
         "header_cirexon_mismatch",
