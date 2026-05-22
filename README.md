@@ -100,6 +100,26 @@ The main output files are:
 - `<prefix>.segments.bam` and `<prefix>.segments.bam.bai`: IGV-compatible segment alignments
 - `<prefix>.log`: run log
 
+## `.out` Format
+
+`<prefix>.out` uses the CIRI3-compatible 13-column format:
+
+```text
+1.  circRNA_ID
+2.  chr
+3.  circRNA_start
+4.  circRNA_end
+5.  #junction_reads
+6.  SM_MS_SMS
+7.  #non_junction_reads
+8.  junction_reads_ratio
+9.  circRNA_type
+10. gene_id
+11. strand
+12. junction_reads_ID
+13. Score
+```
+
 ## Multi-sample intergration
 
 For multi-sample integrative analysis, `ciri` provides a two pass
@@ -136,26 +156,6 @@ Recommended filtering criteria:
 - Records containing `ambiguous_exon`, `low_coverage_exon`, or
   `unconfident_long_exon` are retained to preserve recall, but should be treated
   as lower-confidence candidates in sequence-sensitive downstream analyses.
-
-## `.out` Format
-
-`<prefix>.out` uses the CIRI3-compatible 13-column format:
-
-```text
-1.  circRNA_ID
-2.  chr
-3.  circRNA_start
-4.  circRNA_end
-5.  #junction_reads
-6.  SM_MS_SMS
-7.  #non_junction_reads
-8.  junction_reads_ratio
-9.  circRNA_type
-10. gene_id
-11. strand
-12. junction_reads_ID
-13. Score
-```
 
 ## Generate a simulation dataset with `ciri-simulator`
 
