@@ -36,6 +36,7 @@ cargo build --release
 
 ```bash
 # Step 1. Align reads with BWA-MEM and write a BAM file.
+# BAM must not be coordinate sorted
 bwa mem -t <threads> -T 19 <bwa_index> <R1.fastq.gz> <R2.fastq.gz> \
   | samtools view -bS -@ <threads> -o <bam_file> -
 
@@ -56,25 +57,30 @@ CIRI-toolkit: fast circRNA detection and isoform reconstruction
 Usage: ciri [OPTIONS] --in <IN_SAM> --out <OUT_PREFIX> --ref <REF_FASTA>
 
 Required arguments:
-  -i, --in <SAM/BAM>              Input SAM/BAM file; BAM must not be coordinate-sorted
+  -i, --in <SAM/BAM>              Input SAM/BAM file
   -o, --out <PREFIX>              Output prefix
   -r, --ref <FASTA>               Reference genome FASTA
 
 Optional arguments:
   -a, --anno <GTF>                GTF annotation file
   -m, --mapq <MIN_MAPQ>           Minimum MAPQ for candidate BSJ reads (default: 10)
-  -s, --stringency <LEVEL>        Summary filter level [0/1/2] (default: 0)
+  -s, --stringency <LEVEL>        Stringency level [0/1/2] (default: 0)
   --min-span <SIZE>               Minimum circRNA span (default: 50)
   --max-span <SIZE>               Maximum circRNA span (default: 200000)
-  --linear-range-size-min <SIZE>  Linear competition search range size (default: 50000)
+  --linear-range-size-min <SIZE>  Linear competitor search range size (default: 50000)
   -t, --threads <THREADS>         Number of worker threads (default: auto)
   -M, --mem-per-thread <MEM>      Maximum memory per thread (default: 512M; e.g., 2G)
 
-Review and debugging arguments:
+Advanced arguments:
+  --circ <BED6>                   External BED6 circRNA catalog from `ciri-merge`
+  --1st-pass                      Only output `<prefix>.out` for 1st pass BSJ detection
+  --2nd-pass                      Only output `<prefix>.segments` for 2nd-pass segments detection
+
+Debugging arguments:
   --trace <READS>                 Comma-separated read IDs to trace in Scan1/Scan2
   --debug                         Keep internal pipeline temporary files
-  --perf                          Write profiling report to <prefix>.perf.log
-  --continue                      Rebuild isoforms only from existing <prefix>.out + <prefix>.segments
+  --perf                          Write profiling report to `<prefix>.perf.log`
+  --continue                      Rebuild isoforms only from existing `<prefix>.out` + `<prefix>.segments`
   -h, --help                      Print help
   -v, --version                   Print version
 ```
@@ -94,6 +100,24 @@ The main output files are:
 - `<prefix>.segments.bam` and `<prefix>.segments.bam.bai`: IGV-compatible segment alignments
 - `<prefix>.log`: run log
 
+## Multi-sample intergration
+
+For multi-sample integrative analysis, `ciri` provides a two pass
+workflow:
+
+```bash
+# Run 1st pass: BSJ detection
+ciri -i sample1.bam -o sample1_1st_pass -r ref.fa -a annotation.gtf -s 0  --1st-pass
+ciri -i sample2.bam -o sample2_1st_pass -r ref.fa -a annotation.gtf -s 0 --1st-pass
+
+# Merge detection BSJ sites
+ciri-merge -i sample1_1st_pass.out sample2_1st_pass.out -o 1st_pass.bed
+
+# Run 2nd pass: segments detection
+ciri -i sample1.bam -o sample1_2nd_pass -r ref.fa -a annotation.gtf --circ 1st_pass.bed -s 0 --2nd-pass
+ciri -i sample2.bam -o sample2_2nd_pass -r ref.fa -a annotation.gtf --circ 1st_pass.bed -s 0 --2nd-pass
+```
+
 ### Full-length isoform sequence assembly
 
 `<prefix>.isoforms.fa` contains assembled circRNA isoform sequences, but
@@ -112,31 +136,6 @@ Recommended filtering criteria:
 - Records containing `ambiguous_exon`, `low_coverage_exon`, or
   `unconfident_long_exon` are retained to preserve recall, but should be treated
   as lower-confidence candidates in sequence-sensitive downstream analyses.
-
-## Validate isoform FASTA
-
-Use `scripts/ciri_isoform_fasta_validate.py` to verify that every FASTA record
-matches the exon chain in `<prefix>.isoforms.gtf` and the supplied reference,
-including negative-strand reverse-complement handling:
-
-```bash
-python scripts/ciri_isoform_fasta_validate.py \
-  --fasta <prefix>.isoforms.fa \
-  --gtf <prefix>.isoforms.gtf \
-  --reference <reference_fasta>
-```
-
-An optional sampled BLAT strand check can be added when the UCSC BLAT binary is
-available:
-
-```bash
-python scripts/ciri_isoform_fasta_validate.py \
-  --fasta <prefix>.isoforms.fa \
-  --gtf <prefix>.isoforms.gtf \
-  --reference <reference_fasta> \
-  --blat /data/public/software/UCSC_utility/blat/blat \
-  --blat-sample-size 100
-```
 
 ## `.out` Format
 

@@ -94,7 +94,7 @@ python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI.r
 - CIRI-AS / CIRI-full 不再作为当前开发路线；后续不以完整复刻其历史输出为目标。相关文档只保留为历史参考、算法术语解释和风险清单，代码中不再使用的 CIRI-AS/cirexon/full-length path 旧实现应删除。
 - CIRI-AS sidecar 的 splice signal 阶段已明确采用 annotation-aware motif / strand / offset tie-break：当 annotation exon boundary 支持某个解释时，优先于 Perl v1.2 的 `AC/CT elsif AG/GT` 与 hash-order offset 行为；这是有意偏离 Perl 输出、追求稳定和边界可解释性的设计选择。
 - CIRI-AS sidecar 的 splice signal 阶段、annotation-aware motif / strand / offset tie-break 与 read-group 识别逻辑继续保留，用于支撑 `<prefix>.segments` 的 best-chain 选择和 segment 边界解释。
-- 当前 full-length 目标已经收敛为单样本 rank 1 major isoform 输出；下一阶段先补齐 multi-sample structure merge 和 major isoform switching 判断。只有在不同样本中观察到稳定 major isoform switching 后，再扩展多 isoform 输出与 usage 计算。
+- 当前 full-length 目标已经收敛为单样本 rank 1 major isoform 输出；two-pass cohort-aware multi-sample integration 的前两步已落地：`--1st-pass` 只输出 pass1 `.out`，独立 `ciri-merge` 合并多个样本 `.out` 生成 BED6 cohort circRNA catalog，`--circ` 可把该 catalog 注入 Scan2 作为外部 BSJ 候选。`--2nd-pass --circ` 会重新扫描每个样本并只保留 cohort-aware `.out + .bedpe + .segments + .segments.bam/.bai`；仅指定 `--circ` 而不指定 `--2nd-pass` 时，仍执行完整 cohort-aware single-sample run 并输出 isoform GTF/FASTA。后续由独立 `ciri-assemble` 读取多个 second-pass `.segments/.out` 做 cohort isoform candidate graph、per-sample usage 和 major isoform switching 审计。
 - FASTA 输出应继续保持“高可信 sequence candidate”定位：`mature` 一律输出；`estimate` 只有在内部 reason 与 GTF `score` 足够可信时输出。GTF 使用 `type/evidence/weakness/score/weight` 保留未进入 FASTA 的 unresolved/partial estimate 审计记录。
 - 独立 Rust 模拟器已作为开发 fixture 基础接入，通过 `ciri-simulator` 生成 paired FASTQ、linear-only `<prefix>.annotation.gtf`、circ/isoform-level `<prefix>.isoforms.tsv` 和 read-pair-level `<prefix>.reads.tsv`，用于后续 internal structure 和 full-length path 验证。
 - 新增模块仍应遵守小步验证原则：segments 和 rank 1 major isoform 输出保持稳定，主流程 parity 不回退；multi-sample merge 和后续可能的 multi-isoform usage 先作为后处理/sidecar 推进。
@@ -104,9 +104,10 @@ python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI.r
 - 后续若再进行性能优化或结构调整，仍必须执行完整 parity 校验，出现差异即先回到行为对齐。
 - 大规模数据路径的优化必须先确认峰值 RSS 不随 read/row 全量线性增长，再讨论 CPU 时间；不允许为了速度回退到全量 read-level 结构常驻内存。
 - 临时文件命名、清理和 debug 保留策略必须与 `docs/00-index.md`、`docs/03-performance-optimization.md` 保持一致。
+- 已由用户定稿的 clap help 文案和 README 用法说明视为用户界面契约；除非用户明确要求，不要为了同步实现细节而改写这些措辞。输出协议变化优先更新内部设计文档，确实需要改 README 或 clap 文案时先单独确认。
 - 可复用开发脚本统一放在 `scripts/`，一次性探针和分析输出放在 `tmp/`；迁入 `scripts/` 的脚本必须提供通用 CLI 参数，不依赖硬编码 `tmp/...` 路径。
-- isoform usage 或 multi-sample integration 实现前应先阅读 `docs/07-full-length-reconstruction.md`；新增 graph、usage、multi-sample merge、FASTA/GTF 输出等模块必须补齐 Rust 文档注释，说明职责边界、证据层级和不影响主流程 parity 的原因。
+- isoform usage 或 multi-sample integration 实现前应先阅读 `docs/07-full-length-reconstruction.md`；新增 `ciri-merge`、`ciri-assemble`、`--circ`、graph、usage、multi-sample merge、FASTA/GTF 输出等模块必须补齐 Rust 文档注释，说明职责边界、证据层级和不影响主流程 parity 的原因。
 - CIRI-AS / CIRI-full 相关文档当前只作为历史参考，不作为强制兼容契约；仍被当前 segments 逻辑复用的 annotation-aware offset/strand 判断，必须在代码注释和 `docs/CIRI-AS.md` 同步维护。
 
 ---
-最后更新：2026-05-20
+最后更新：2026-05-22

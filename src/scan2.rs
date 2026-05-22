@@ -4,6 +4,7 @@
 //! the de-duplicated candidate indexes expected by Java CIRI3, and then revisits
 //! the input alignments to rescue additional support while counting FSJ evidence.
 
+use crate::circ_catalog::CircCatalogRecord;
 use crate::is_bsj_hg2::{report_scan2_hg_profile, IsBSJHg2};
 use crate::misd::misd;
 use crate::runtime::{
@@ -14,7 +15,7 @@ use crate::utils::{
     clip_sequence_payload, local_clip_evidence_lines, part_path, reverse_complement,
     AlignmentRecord,
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use noodles::sam::{
@@ -135,6 +136,28 @@ fn raw_xa_from_bam_record(record: &noodles::bam::Record) -> Result<String> {
         return Ok(String::new());
     };
     Ok(raw.to_string())
+}
+
+/// Returns a fixed-width reference window, padding out-of-range bases with `N`.
+///
+/// External BED catalogs can legally point close to chromosome ends. Scan2 needs
+/// two signal bases in the same payload slots as Scan1-derived candidates, so
+/// padding keeps the payload well-formed while the downstream sequence validator
+/// still decides whether any read truly supports the boundary.
+fn reference_window_or_n(seq: &str, start: i32, end: i32) -> String {
+    let bytes = seq.as_bytes();
+    let mut out = String::with_capacity((end - start).max(0) as usize);
+    for pos in start..end {
+        if pos >= 0 {
+            let idx = pos as usize;
+            if idx < bytes.len() {
+                out.push(bytes[idx] as char);
+                continue;
+            }
+        }
+        out.push('N');
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -575,6 +598,123 @@ impl Scan2 {
             list.sort_by_key(|x| (x.site, x.order));
         }
         Ok(())
+    }
+
+    /// Adds cohort-level external BSJ sites to the Scan2 candidate indexes.
+    ///
+    /// `--circ` candidates come from BED6 catalog coordinates rather than from
+    /// Scan1 read evidence. They are therefore appended after the Java-parity
+    /// Scan1 candidates: default runs stay unchanged, while a second-pass run can
+    /// test additional cohort-supported BSJ boundaries against this sample's own
+    /// reads. The left/right signal fields are reconstructed from the reference
+    /// so the existing `is_bsj_hg2` validator can remain the single source of
+    /// sequence-match decisions.
+    pub fn add_external_circ_candidates(
+        &mut self,
+        candidates: &[CircCatalogRecord],
+        reference: &HashMap<String, String>,
+    ) -> Result<usize> {
+        let mut seen = HashSet::new();
+        let mut next_order = 0usize;
+        for (chrom, list) in &self.index1 {
+            for candidate in list {
+                next_order = next_order.max(candidate.order + 1);
+                if candidate.data.len() >= 3 {
+                    seen.insert(format!(
+                        "{}\t{}\t{}\t{}",
+                        chrom, candidate.data[0], candidate.data[1], candidate.data[2]
+                    ));
+                }
+            }
+        }
+
+        let mut added = 0usize;
+        let bucket_size = self.seq_len.max(1);
+        for candidate in candidates {
+            if candidate.start < 1 || candidate.end < candidate.start {
+                bail!(
+                    "invalid external circ candidate {}:{}-{}",
+                    candidate.chrom,
+                    candidate.start,
+                    candidate.end
+                );
+            }
+            let Some(chr_seq) = reference.get(&candidate.chrom) else {
+                bail!(
+                    "external circ candidate {}:{}-{} uses chromosome absent from reference",
+                    candidate.chrom,
+                    candidate.start,
+                    candidate.end
+                );
+            };
+            if candidate.end as usize > chr_seq.len() {
+                bail!(
+                    "external circ candidate {}:{}-{} exceeds reference length {}",
+                    candidate.chrom,
+                    candidate.start,
+                    candidate.end,
+                    chr_seq.len()
+                );
+            }
+            let dedup_key = format!(
+                "{}\t{}\t{}\t{}",
+                candidate.chrom, candidate.start, candidate.end, candidate.strand
+            );
+            if !seen.insert(dedup_key) {
+                continue;
+            }
+            let signal_left =
+                reference_window_or_n(chr_seq, candidate.start - 3, candidate.start - 1);
+            let signal_right = reference_window_or_n(chr_seq, candidate.end, candidate.end + 2);
+            let payload = vec![
+                candidate.start.to_string(),
+                candidate.end.to_string(),
+                candidate.strand.clone(),
+                signal_left,
+                signal_right,
+                "1".to_string(),
+            ];
+            self.fsj_map
+                .entry(format!(
+                    "{}\t{}\t{}",
+                    candidate.chrom, candidate.start, candidate.end
+                ))
+                .or_insert(0);
+            self.index1
+                .entry(candidate.chrom.clone())
+                .or_insert_with(Vec::new)
+                .push(CandidateBreakpoint {
+                    site: candidate.start,
+                    order: next_order,
+                    data: payload.clone(),
+                });
+            self.index2
+                .entry(candidate.chrom.clone())
+                .or_insert_with(Vec::new)
+                .push(CandidateBreakpoint {
+                    site: candidate.end,
+                    order: next_order,
+                    data: payload,
+                });
+            self.site_array1
+                .entry(candidate.chrom.clone())
+                .or_insert_with(HashSet::new)
+                .insert(candidate.start / bucket_size);
+            self.site_array2
+                .entry(candidate.chrom.clone())
+                .or_insert_with(HashSet::new)
+                .insert(candidate.end / bucket_size);
+            next_order += 1;
+            added += 1;
+        }
+
+        for list in self.index1.values_mut() {
+            list.sort_by_key(|x| (x.site, x.order));
+        }
+        for list in self.index2.values_mut() {
+            list.sort_by_key(|x| (x.site, x.order));
+        }
+        Ok(added)
     }
 
     /// Builds a mate-level display index from the post-Summary Scan1 display rows.

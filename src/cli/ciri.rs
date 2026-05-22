@@ -17,6 +17,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::annotation::Annotation;
+use crate::circ_catalog::read_circ_bed6;
 use crate::ciri_as::{
     rebuild_major_isoforms_from_segments, run_ciri_as, AsConfig, IsoformRunSummary,
 };
@@ -50,80 +51,77 @@ const IGV_OUTWARD_COLOR: &str = "245,124,0";
     long_about = None
 )]
 struct Args {
-    /// Path to the input SAM/BAM file.
+    /// Input SAM/BAM file.
     #[arg(short = 'i', long = "in")]
     in_sam: String,
 
-    /// Output prefix; final outputs include `.out`, `.bsj`, `.segments`,
-    /// `.isoforms.gtf`, `.isoforms.fa`, and IGV review sidecars.
+    /// Output prefix.
     #[arg(short = 'o', long = "out")]
     out_prefix: String,
 
-    /// Path to the reference genome FASTA file
+    /// Reference genome FASTA.
     #[arg(short = 'r', long = "ref")]
     ref_fasta: String,
 
-    /// (Optional) Path to the GTF annotation file
+    /// GTF annotation file.
     #[arg(short = 'a', long = "anno")]
     gtf: Option<String>,
 
-    /// Minimum Mapping Quality (MAPQ) for candidate BSJ reads
+    /// Minimum MAPQ for candidate BSJ reads.
     #[arg(short = 'm', long = "mapq", default_value_t = 10)]
     min_mapq: i32,
 
-    /// Stringency level (0, 1, 2). CIRI defaults to 0 to retain candidate
-    /// circRNAs for downstream segment/isoform filtering; Java CIRI3 defaults
-    /// to 2.
+    /// Stringency level [0/1/2].
     #[arg(short = 's', long = "stringency", default_value_t = 0)]
     stringency: i32,
 
-    /// Max spanning distance of circRNAs (Java -Max, default 200000)
+    /// Maximum circRNA span.
     #[arg(long = "max-span", default_value_t = 200000)]
     max_span: i32,
 
-    /// Min spanning distance of circRNAs. CIRI defaults to 50 to retain
-    /// short candidate circRNAs for downstream filtering; Java CIRI3 defaults
-    /// to 140.
+    /// Minimum circRNA span.
     #[arg(long = "min-span", default_value_t = 50)]
     min_span: i32,
 
-    /// Linear competition search range size (Java internal default 50000)
+    /// Linear competitor search range size.
     #[arg(long = "linear-range-size-min", default_value_t = 50000)]
     linear_range_size_min: i32,
 
-    /// Number of threads to use (default: auto)
+    /// Number of worker threads (0 = auto).
     #[arg(short = 't', long = "threads", default_value_t = 0)]
     threads: usize,
 
-    /// Maximum memory per thread (e.g., 512M, 2G)
+    /// Maximum memory per thread (e.g, 512M, 2G).
     #[arg(short = 'M', long = "mem-per-thread", default_value = "512M")]
     mem_per_thread: String,
 
-    /// Comma-separated read IDs to trace through Scan1/Scan2.
-    ///
-    /// When set, detailed trace lines are written to `<prefix>.trace.log`.
+    /// Comma-separated read IDs to trace in Scan1/Scan2.
     #[arg(long = "trace", value_name = "READS")]
     trace_reads: Option<String>,
 
-    /// Keep internal pipeline temporary files for debugging.
+    /// Keep internal pipeline temporary files.
     #[arg(long = "debug", default_value_t = false)]
     debug: bool,
 
-    /// Enable profiling and write the report to `<prefix>.perf.log`.
+    /// Write profiling report to `<prefix>.perf.log`.
     #[arg(long = "perf", default_value_t = false)]
     perf: bool,
 
-    /// Resume from the completed merged segments checkpoint.
-    ///
-    /// The resume logic intentionally ignores shard-local `.part_*.tmp` files.
-    /// If `<prefix>.segments` exists, only isoforms are rebuilt from
-    /// `<prefix>.out + <prefix>.segments`. Earlier merged outputs such as
-    /// `<prefix>.out + <prefix>.bsj` are intentionally not resumable because
-    /// rebuilding segments still requires a full BAM/SAM rescan. All normal
-    /// required inputs still must be provided so `--continue` stays an
-    /// execution-mode switch, not a separate CLI shape.
+    /// Rebuild isoforms only from existing `<prefix>.out` + `<prefix>.segments`
     #[arg(long = "continue", default_value_t = false)]
     continue_run: bool,
+
+    /// Only output `<prefix>.out` for 1st pass BSJ detection
+    #[arg(long = "1st-pass", default_value_t = false)]
+    first_pass: bool,
+
+    /// Only output `<prefix>.segments` for 2nd-pass segments detection.
+    #[arg(long = "2nd-pass", default_value_t = false)]
+    second_pass: bool,
+
+    /// User defined circRNAs in BED6 format.
+    #[arg(long = "circ", value_name = "BED6")]
+    circ: Option<String>,
 
     /// Print version.
     #[arg(short = 'v', long = "version", action = clap::ArgAction::SetTrue)]
@@ -1241,7 +1239,21 @@ pub fn main() -> Result<()> {
         return Ok(());
     }
     let args = Args::parse();
-    let _ = require_samtools()?;
+    if args.first_pass && args.second_pass {
+        bail!("--1st-pass and --2nd-pass are mutually exclusive");
+    }
+    if args.continue_run && (args.first_pass || args.second_pass || args.circ.is_some()) {
+        bail!("--continue cannot be combined with --1st-pass, --2nd-pass, or --circ");
+    }
+    if args.first_pass && args.circ.is_some() {
+        bail!("--circ is used after ciri-merge and cannot be combined with --1st-pass");
+    }
+    if args.second_pass && args.circ.is_none() {
+        bail!("--2nd-pass requires --circ <BED6>");
+    }
+    if !args.first_pass && !args.continue_run {
+        let _ = require_samtools()?;
+    }
     let mem_limit = parse_mem_str(&args.mem_per_thread);
     let result_output = result_path_for_output(&args.out_prefix);
     let log_output = log_path_for_output(&args.out_prefix);
@@ -1295,6 +1307,17 @@ pub fn main() -> Result<()> {
     if args.perf {
         log_info(&mut log_writer, "Perf report", &perf_output)?;
     }
+    let external_circ_catalog = if let Some(circ_path) = &args.circ {
+        let records = read_circ_bed6(circ_path)?;
+        log_info(
+            &mut log_writer,
+            "User-defined BSJ",
+            &format!("{} ({} circRNAs)", circ_path, records.len()),
+        )?;
+        Some(records)
+    } else {
+        None
+    };
 
     let input_path = args.in_sam.as_str();
     let format = detect_format(input_path)?;
@@ -1359,9 +1382,17 @@ pub fn main() -> Result<()> {
     // Stage boundaries are logged explicitly because most benchmarking and parity
     // work is reasoned about in terms of Scan1 / Scan2 / Summary timings.
     // 3. Scan 1
+    let total_stages = if args.first_pass {
+        1
+    } else if args.second_pass {
+        2
+    } else {
+        3
+    };
+    let stage1_label = format!("=== STAGE 1/{} ===", total_stages);
     log_info(
         &mut log_writer,
-        "=== STAGE 1/3 ===",
+        &stage1_label,
         "Back-splicing junction identification...",
     )?;
     log_info(
@@ -1376,13 +1407,17 @@ pub fn main() -> Result<()> {
         args.linear_range_size_min,
     );
     scan1.set_mem_limit(mem_limit);
-    scan1.run_with_priority_and_segments(
-        input_path,
-        &bsj1_output,
-        Some(&segments1_output),
-        &fasta.chr_tcga_map,
-        &annotation,
-    )?;
+    if args.first_pass {
+        scan1.run_with_priority(input_path, &bsj1_output, &fasta.chr_tcga_map, &annotation)?;
+    } else {
+        scan1.run_with_priority_and_segments(
+            input_path,
+            &bsj1_output,
+            Some(&segments1_output),
+            &fasta.chr_tcga_map,
+            &annotation,
+        )?;
+    }
     log_info(
         &mut log_writer,
         "Scan 1 summary",
@@ -1405,6 +1440,14 @@ pub fn main() -> Result<()> {
     let mut scan2 = Scan2::new(args.min_mapq, args.linear_range_size_min, scan2_seq_len);
     scan2.set_mem_limit(mem_limit);
     scan2.build_index(&bsj1_output)?;
+    if let Some(records) = external_circ_catalog.as_ref() {
+        let added = scan2.add_external_circ_candidates(records, &fasta.chr_tcga_map)?;
+        log_info(
+            &mut log_writer,
+            "External BSJ sites",
+            &format!("Added {} Scan2 candidate sites", added),
+        )?;
+    }
 
     // 5. Scan 2
     log_info(
@@ -1412,16 +1455,28 @@ pub fn main() -> Result<()> {
         "Running scan 2",
         "Curating splicing signals & counting FSJs...",
     )?;
-    let scan2_segment_artifacts = scan2.run_with_display_and_segments(
-        input_path,
-        &bsj2_output,
-        &fsj_output,
-        Some(&bsj1_output),
-        None,
-        Some(&segments2_output),
-        Some(&segments_non_bsj_output),
-        &fasta.chr_tcga_map,
-    )?;
+    let scan2_segment_artifacts = if args.first_pass {
+        scan2.run_with_display(
+            input_path,
+            &bsj2_output,
+            &fsj_output,
+            Some(&bsj1_output),
+            None,
+            &fasta.chr_tcga_map,
+        )?;
+        Default::default()
+    } else {
+        scan2.run_with_display_and_segments(
+            input_path,
+            &bsj2_output,
+            &fsj_output,
+            Some(&bsj1_output),
+            None,
+            Some(&segments2_output),
+            Some(&segments_non_bsj_output),
+            &fasta.chr_tcga_map,
+        )?
+    };
     log_info(
         &mut log_writer,
         "Scan 2 summary",
@@ -1444,7 +1499,6 @@ pub fn main() -> Result<()> {
         &annotation,
     )?;
     scan2.release_working_set();
-    write_display_bsj(&bsj_output, &bsj1_output, &bsj2_output)?;
 
     log_info(
         &mut log_writer,
@@ -1459,6 +1513,33 @@ pub fn main() -> Result<()> {
         ),
     )?;
     log_info(&mut log_writer, "Output BSJ file", &result_output)?;
+    if args.first_pass {
+        log_info(
+            &mut log_writer,
+            "First pass output",
+            "Stopping after 1st pass BSJ detection",
+        )?;
+        log_info(
+            &mut log_writer,
+            "Total runtime",
+            &format!("{:.2} seconds", run_started.elapsed().as_secs_f64()),
+        )?;
+        if !args.debug {
+            cleanup_pipeline_temp_files(
+                &[
+                    &bsj1_output,
+                    &bsj2_output,
+                    &segments1_output,
+                    &segments2_output,
+                    &segments_non_bsj_output,
+                    &fsj_output,
+                ],
+                &scan2_segment_artifacts.non_bsj_segment_evidence_paths,
+            );
+        }
+        return Ok(());
+    }
+    write_display_bsj(&bsj_output, &bsj1_output, &bsj2_output)?;
     let (bedpe_path, _bedpe_rows) = write_bsj_bedpe(&args.out_prefix, &result_output)?;
     log_info(
         &mut log_writer,
@@ -1466,9 +1547,10 @@ pub fn main() -> Result<()> {
         &format!("{}", bedpe_path),
     )?;
 
+    let stage2_label = format!("=== STAGE 2/{} ===", total_stages);
     log_info(
         &mut log_writer,
-        "=== STAGE 2/3 ===",
+        &stage2_label,
         "Internal splice junction identification...",
     )?;
     log_info(
@@ -1520,6 +1602,36 @@ pub fn main() -> Result<()> {
             segment_summary.outward_segments
         ),
     )?;
+    if args.second_pass {
+        log_info(
+            &mut log_writer,
+            "Second pass output",
+            "Stopping after 2nd pass segments detection",
+        )?;
+        log_info(
+            &mut log_writer,
+            "Total runtime",
+            &format!("{:.2} seconds", run_started.elapsed().as_secs_f64()),
+        )?;
+        if !args.debug {
+            let mut second_pass_extra_paths = scan2_segment_artifacts
+                .non_bsj_segment_evidence_paths
+                .clone();
+            second_pass_extra_paths.push(bsj_output.clone());
+            cleanup_pipeline_temp_files(
+                &[
+                    &bsj1_output,
+                    &bsj2_output,
+                    &segments1_output,
+                    &segments2_output,
+                    &segments_non_bsj_output,
+                    &fsj_output,
+                ],
+                &second_pass_extra_paths,
+            );
+        }
+        return Ok(());
+    }
 
     log_info(
         &mut log_writer,

@@ -13,6 +13,10 @@ path = "src/bin/ciri.rs"
 name = "ciri-simulator"
 path = "src/bin/ciri-simulator.rs"
 
+[[bin]]
+name = "ciri-merge"
+path = "src/bin/ciri-merge.rs"
+
 [dependencies]
 # Bioinformatic file parsing
 noodles = { version = "0.85", features = ["sam", "bam", "gtf", "fasta"] }
