@@ -6,6 +6,7 @@
 //! parity-oriented optimization against the Java reference implementation.
 
 pub mod annotation;
+pub mod circ_catalog;
 pub mod ciri_as;
 pub mod cli;
 pub mod fasta;

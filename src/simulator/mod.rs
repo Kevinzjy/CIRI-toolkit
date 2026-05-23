@@ -21,6 +21,12 @@ use std::process::{Command, Stdio};
 
 /// Probability used by the initial simulator model to add a second isoform.
 const SECOND_ISOFORM_PROBABILITY: f64 = 0.5;
+/// Major isoform usage assigned to the first sample in simulated switching events.
+const SWITCHING_HIGH_USAGE: f64 = 0.85;
+/// Minor isoform usage assigned to the first sample in simulated switching events.
+const SWITCHING_LOW_USAGE: f64 = 0.15;
+/// Stable major usage used for non-switching multi-sample circRNAs.
+const NON_SWITCHING_MAJOR_USAGE: f64 = 0.90;
 
 /// CircRNAs at or below this length use an insert distribution centered near
 /// the circle length so small circles can generate full-length-supporting read
@@ -61,9 +67,9 @@ pub struct SimulateArgs {
     #[arg(short = 'a', long = "anno")]
     pub gtf: String,
 
-    /// Output prefix; files are written as `<prefix>.*`.
-    #[arg(short = 'o', long = "out")]
-    pub out_prefix: String,
+    /// Output prefix; pass two prefixes to generate a matched switching pair.
+    #[arg(short = 'o', long = "out", num_args = 1..)]
+    pub out_prefixes: Vec<String>,
 
     /// Optional chromosome filter, for example `chr1`.
     #[arg(long = "chrom")]
@@ -72,6 +78,10 @@ pub struct SimulateArgs {
     /// Number of circular RNA loci to simulate.
     #[arg(long = "circ-count", default_value_t = 100)]
     pub circ_count: usize,
+
+    /// Number of two-isoform circRNAs whose major isoform switches between two samples.
+    #[arg(long = "switching-event", default_value_t = 0)]
+    pub switching_event: usize,
 
     /// Mean circRNA coverage; per-circ coverage is sampled with `--scale`.
     #[arg(long = "circ-coverage", default_value_t = 10.0)]
@@ -130,6 +140,8 @@ pub struct SimulateArgs {
 /// mates crossing the circular boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimulationSummary {
+    /// Number of output samples.
+    pub sample_count: usize,
     /// Number of simulated circRNA loci.
     pub circ_count: usize,
     /// Number of circular isoforms across all simulated circRNA loci.
@@ -148,17 +160,32 @@ pub struct SimulationSummary {
 
 impl std::fmt::Display for SimulationSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Simulated {} circRNAs, {} circular isoforms\nTotal {} read pairs, {} circRNA read pairs, {} linear read pairs\nBSJ feature: {} reads / {} read pairs",
-            self.circ_count,
-            self.isoform_count,
-            self.total_read_pairs,
-            self.circ_read_pairs,
-            self.linear_read_pairs,
-            self.bsj_reads,
-            self.bsj_read_pairs
-        )
+        if self.sample_count <= 1 {
+            write!(
+                f,
+                "Simulated {} circRNAs, {} circular isoforms\nTotal {} read pairs, {} circRNA read pairs, {} linear read pairs\nBSJ feature: {} reads / {} read pairs",
+                self.circ_count,
+                self.isoform_count,
+                self.total_read_pairs,
+                self.circ_read_pairs,
+                self.linear_read_pairs,
+                self.bsj_reads,
+                self.bsj_read_pairs
+            )
+        } else {
+            write!(
+                f,
+                "Simulated {} samples, {} circRNAs, {} circular isoforms\nTotal {} read pairs, {} circRNA read pairs, {} linear read pairs\nBSJ feature: {} reads / {} read pairs",
+                self.sample_count,
+                self.circ_count,
+                self.isoform_count,
+                self.total_read_pairs,
+                self.circ_read_pairs,
+                self.linear_read_pairs,
+                self.bsj_reads,
+                self.bsj_read_pairs
+            )
+        }
     }
 }
 
@@ -248,6 +275,23 @@ struct SimIsoform {
     seq: String,
     read_pair_count: usize,
     bsj_read_pair_count: usize,
+}
+
+/// Per-sample isoform usage for one circRNA.
+///
+/// Multi-sample fixtures keep circRNA structures fixed across samples and only
+/// vary these weights. This creates a clean truth source for downstream
+/// isoform-usage and major-switching validation.
+#[derive(Clone, Debug)]
+struct SampleCircUsage {
+    weights: Vec<f64>,
+}
+
+/// Isoform usage profile for one output sample.
+#[derive(Clone, Debug)]
+struct SampleUsageProfile {
+    prefix: String,
+    by_circ: Vec<SampleCircUsage>,
 }
 
 /// Per-base source coordinate in transcript-oriented sequence space.
@@ -1026,6 +1070,7 @@ fn build_circs(
     }
 
     let mut circs = Vec::new();
+    let mut switching_candidate_count = 0usize;
     for tx_idx in candidates {
         if circs.len() >= args.circ_count {
             break;
@@ -1058,9 +1103,11 @@ fn build_circs(
             bsj_read_pair_count: 0,
         }];
 
+        let force_switching_candidate =
+            args.out_prefixes.len() > 1 && switching_candidate_count < args.switching_event;
         if exon_window.len() >= 3
             && read_pair_count >= 2
-            && rng.gen_f64() < SECOND_ISOFORM_PROBABILITY
+            && (force_switching_candidate || rng.gen_f64() < SECOND_ISOFORM_PROBABILITY)
         {
             let skip_idx = 1 + rng.gen_range(exon_window.len() - 2);
             let skipped: Vec<Exon> = exon_window
@@ -1077,6 +1124,7 @@ fn build_circs(
                     read_pair_count: 0,
                     bsj_read_pair_count: 0,
                 });
+                switching_candidate_count += 1;
             }
         }
 
@@ -1098,18 +1146,55 @@ fn build_circs(
     Ok(circs)
 }
 
-/// Chooses an isoform while ensuring each output isoform receives at least one read.
-fn choose_isoform_for_pair(circ: &SimCirc, pair_idx: usize, rng: &mut Lcg64) -> usize {
-    if pair_idx < circ.isoforms.len() {
-        pair_idx
-    } else {
-        rng.gen_range(circ.isoforms.len())
+/// Chooses an isoform while keeping low-depth truth tables inspectable.
+///
+/// Single-sample simulation preserves the original uniform behavior. Multi-sample
+/// simulation passes explicit usage weights, and this helper first emits one
+/// read for every active isoform so the truth table exposes minor isoforms
+/// before switching to weighted random sampling.
+fn choose_isoform_for_pair(
+    circ: &SimCirc,
+    usage: Option<&SampleCircUsage>,
+    pair_idx: usize,
+    rng: &mut Lcg64,
+) -> usize {
+    let Some(usage) = usage else {
+        return if pair_idx < circ.isoforms.len() {
+            pair_idx
+        } else {
+            rng.gen_range(circ.isoforms.len())
+        };
+    };
+    let active: Vec<usize> = usage
+        .weights
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &weight)| (weight > 0.0).then_some(idx))
+        .collect();
+    if let Some(&idx) = active.get(pair_idx) {
+        return idx;
     }
+    let total: f64 = usage.weights.iter().sum();
+    if total <= 0.0 {
+        return 0;
+    }
+    let mut draw = rng.gen_f64() * total;
+    for (idx, &weight) in usage.weights.iter().enumerate() {
+        if weight <= 0.0 {
+            continue;
+        }
+        if draw < weight {
+            return idx;
+        }
+        draw -= weight;
+    }
+    usage.weights.len().saturating_sub(1)
 }
 
 /// Emits ordinary paired-end reads from circular isoforms and records read truth.
 fn write_circular_reads(
     circs: &mut [SimCirc],
+    usage_profile: Option<&SampleUsageProfile>,
     args: &SimulateArgs,
     rng: &mut Lcg64,
     r1_writer: &mut BufWriter<File>,
@@ -1118,9 +1203,10 @@ fn write_circular_reads(
     next_read_index: &mut usize,
 ) -> Result<()> {
     let qual = "I".repeat(args.read_len);
-    for circ in circs {
+    for (circ_idx, circ) in circs.iter_mut().enumerate() {
+        let circ_usage = usage_profile.and_then(|profile| profile.by_circ.get(circ_idx));
         for pair_idx in 0..circ.read_pair_count {
-            let iso_idx = choose_isoform_for_pair(circ, pair_idx, rng);
+            let iso_idx = choose_isoform_for_pair(circ, circ_usage, pair_idx, rng);
             let iso = &mut circ.isoforms[iso_idx];
             let seq_len = iso.seq.len();
             let source_map = source_map_for_exons(&iso.exon_chain, circ.strand);
@@ -1349,8 +1435,129 @@ fn write_isoform_truth(circs: &[SimCirc], prefix: &str) -> Result<()> {
     Ok(())
 }
 
+/// Builds sample-level isoform usage weights for matched multi-sample simulation.
+///
+/// Two-sample mode keeps all structures fixed and flips the major isoform for
+/// the first `switching_event` two-isoform circRNAs. The switching set is based
+/// on stable circRNA order so reruns with the same seed remain reproducible.
+fn build_sample_usage_profiles(
+    circs: &[SimCirc],
+    prefixes: &[String],
+    switching_event: usize,
+) -> Vec<SampleUsageProfile> {
+    let switching_ids: BTreeSet<String> = circs
+        .iter()
+        .filter(|circ| circ.isoforms.len() >= 2)
+        .take(switching_event)
+        .map(|circ| circ.circ_id.clone())
+        .collect();
+
+    prefixes
+        .iter()
+        .enumerate()
+        .map(|(sample_idx, prefix)| {
+            let by_circ = circs
+                .iter()
+                .map(|circ| SampleCircUsage {
+                    weights: sample_usage_weights(
+                        circ,
+                        switching_ids.contains(&circ.circ_id),
+                        sample_idx,
+                    ),
+                })
+                .collect();
+            SampleUsageProfile {
+                prefix: prefix.clone(),
+                by_circ,
+            }
+        })
+        .collect()
+}
+
+/// Returns per-isoform usage weights for one circRNA in one sample.
+fn sample_usage_weights(circ: &SimCirc, switching: bool, sample_idx: usize) -> Vec<f64> {
+    if circ.isoforms.len() <= 1 {
+        return vec![1.0];
+    }
+    let mut weights = vec![0.0; circ.isoforms.len()];
+    if switching {
+        let (first, second) = if sample_idx == 0 {
+            (SWITCHING_HIGH_USAGE, SWITCHING_LOW_USAGE)
+        } else {
+            (SWITCHING_LOW_USAGE, SWITCHING_HIGH_USAGE)
+        };
+        weights[0] = first;
+        weights[1] = second;
+        return weights;
+    }
+    weights[0] = NON_SWITCHING_MAJOR_USAGE;
+    let minor = (1.0 - NON_SWITCHING_MAJOR_USAGE) / (circ.isoforms.len() - 1) as f64;
+    for weight in weights.iter_mut().skip(1) {
+        *weight = minor;
+    }
+    weights
+}
+
+/// Writes one usage truth table per simulated sample.
+///
+/// Switching events are intentionally not materialized as a separate truth file.
+/// Downstream evaluation should compare these per-sample usage tables and infer
+/// major isoform switching from the observed usage values.
+fn write_sample_usage_truths(
+    sample_circs: &[Vec<SimCirc>],
+    profiles: &[SampleUsageProfile],
+) -> Result<()> {
+    for (sample, profile) in sample_circs.iter().zip(profiles) {
+        let mut writer =
+            BufWriter::new(File::create(prefixed_path(&profile.prefix, ".usage.tsv"))?);
+        writeln!(
+            writer,
+            "circ_id\tchrom\tstart\tend\tstrand\tisoform_id\tusage\tread_cnt\tbsj_read_cnt"
+        )?;
+        for circ in sample {
+            let total = circ.read_pair_count.max(1) as f64;
+            for iso in &circ.isoforms {
+                let usage = iso.read_pair_count as f64 / total;
+                writeln!(
+                    writer,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}\t{}",
+                    circ.circ_id,
+                    circ.chrom,
+                    circ.start,
+                    circ.end,
+                    circ.strand,
+                    iso.isoform_id,
+                    usage,
+                    iso.read_pair_count,
+                    iso.bsj_read_pair_count
+                )?;
+            }
+        }
+        writer.flush()?;
+    }
+    Ok(())
+}
+
 /// Ensures the user arguments describe a feasible simulation.
 fn validate_args(args: &SimulateArgs) -> Result<()> {
+    if args.out_prefixes.is_empty() {
+        bail!("at least one -o/--out prefix is required");
+    }
+    if args.out_prefixes.len() > 2 {
+        bail!("multi-sample simulator currently supports one or two -o/--out prefixes");
+    }
+    if args.switching_event > 0 && args.out_prefixes.len() < 2 {
+        bail!("--switching-event requires two -o/--out prefixes");
+    }
+    let mut seen_prefixes = HashSet::new();
+    for prefix in &args.out_prefixes {
+        if prefix.is_empty() {
+            bail!("output prefixes must not be empty");
+        }
+        if !seen_prefixes.insert(prefix) {
+            bail!("duplicate output prefix: {prefix}");
+        }
+    }
     if args.circ_count == 0 {
         bail!("--circ-count must be > 0");
     }
@@ -1392,9 +1599,11 @@ fn validate_args(args: &SimulateArgs) -> Result<()> {
 pub fn run(args: SimulateArgs) -> Result<SimulationSummary> {
     validate_args(&args)?;
     let fastq_compressor = select_fastq_compressor()?;
-    if let Some(parent) = Path::new(&args.out_prefix).parent() {
-        if !parent.as_os_str().is_empty() {
-            create_dir_all(parent)?;
+    for prefix in &args.out_prefixes {
+        if let Some(parent) = Path::new(prefix).parent() {
+            if !parent.as_os_str().is_empty() {
+                create_dir_all(parent)?;
+            }
         }
     }
 
@@ -1413,9 +1622,8 @@ pub fn run(args: SimulateArgs) -> Result<SimulationSummary> {
     if annotation.linear_transcripts.is_empty() {
         bail!("no usable linear transcripts remain after circRNA-exclusive exon filtering");
     }
-    write_linear_annotation(&annotation, &args.out_prefix)?;
 
-    let mut circs = build_circs(
+    let circs = build_circs(
         &annotation.transcripts,
         &fasta.chr_tcga_map,
         &args,
@@ -1424,60 +1632,93 @@ pub fn run(args: SimulateArgs) -> Result<SimulationSummary> {
     if circs.is_empty() {
         bail!("no circRNAs could be built; try lowering --read-len or --circ-count");
     }
+    let usage_profiles = if args.out_prefixes.len() > 1 {
+        build_sample_usage_profiles(&circs, &args.out_prefixes, args.switching_event)
+    } else {
+        Vec::new()
+    };
 
-    let r1_tmp_path = prefixed_path(&args.out_prefix, "_1.fq.tmp");
-    let r2_tmp_path = prefixed_path(&args.out_prefix, "_2.fq.tmp");
-    let r1_gz_path = prefixed_path(&args.out_prefix, "_1.fq.gz");
-    let r2_gz_path = prefixed_path(&args.out_prefix, "_2.fq.gz");
-    let mut r1_writer = BufWriter::new(File::create(&r1_tmp_path)?);
-    let mut r2_writer = BufWriter::new(File::create(&r2_tmp_path)?);
-    let mut read_truth =
-        BufWriter::new(File::create(prefixed_path(&args.out_prefix, ".reads.tsv"))?);
-    writeln!(
-        read_truth,
-        "read_id\tcirc_id\tchrom\tstart\tend\tstrand\tisoform_id\tis_circular\tis_bsj\tr1_segments\tr1_is_bsj\tr2_segments\tr2_is_bsj\ttype"
-    )?;
+    let mut sample_circs = Vec::with_capacity(args.out_prefixes.len());
+    let mut total_read_pairs = 0usize;
+    let mut circ_read_pairs = 0usize;
+    let mut linear_read_pairs = 0usize;
+    let mut bsj_read_pairs = 0usize;
+    let mut bsj_reads = 0usize;
+    for (sample_idx, prefix) in args.out_prefixes.iter().enumerate() {
+        write_linear_annotation(&annotation, prefix)?;
+        let mut circs_for_sample = circs.clone();
+        let profile = usage_profiles.get(sample_idx);
+        let r1_tmp_path = prefixed_path(prefix, "_1.fq.tmp");
+        let r2_tmp_path = prefixed_path(prefix, "_2.fq.tmp");
+        let r1_gz_path = prefixed_path(prefix, "_1.fq.gz");
+        let r2_gz_path = prefixed_path(prefix, "_2.fq.gz");
+        let mut r1_writer = BufWriter::new(File::create(&r1_tmp_path)?);
+        let mut r2_writer = BufWriter::new(File::create(&r2_tmp_path)?);
+        let mut read_truth = BufWriter::new(File::create(prefixed_path(prefix, ".reads.tsv"))?);
+        writeln!(
+            read_truth,
+            "read_id\tcirc_id\tchrom\tstart\tend\tstrand\tisoform_id\tis_circular\tis_bsj\tr1_segments\tr1_is_bsj\tr2_segments\tr2_is_bsj\ttype"
+        )?;
 
-    let mut next_read_index = 1usize;
-    write_circular_reads(
-        &mut circs,
-        &args,
-        &mut rng,
-        &mut r1_writer,
-        &mut r2_writer,
-        &mut read_truth,
-        &mut next_read_index,
-    )?;
-    let sampled_linear_coverage = sample_coverage(args.linear_coverage, args.scale, &mut rng);
-    write_linear_reads(
-        &annotation.linear_transcripts,
-        &fasta.chr_tcga_map,
-        &args,
-        sampled_linear_coverage,
-        &mut rng,
-        &mut r1_writer,
-        &mut r2_writer,
-        &mut read_truth,
-        &mut next_read_index,
-    )?;
-    r1_writer.flush()?;
-    r2_writer.flush()?;
-    read_truth.flush()?;
-    drop(r1_writer);
-    drop(r2_writer);
-    drop(read_truth);
-    compress_fastq_to_gz(&r1_tmp_path, &r1_gz_path, fastq_compressor)?;
-    compress_fastq_to_gz(&r2_tmp_path, &r2_gz_path, fastq_compressor)?;
-    write_isoform_truth(&circs, &args.out_prefix)?;
+        let mut next_read_index = 1usize;
+        write_circular_reads(
+            &mut circs_for_sample,
+            profile,
+            &args,
+            &mut rng,
+            &mut r1_writer,
+            &mut r2_writer,
+            &mut read_truth,
+            &mut next_read_index,
+        )?;
+        let sampled_linear_coverage = sample_coverage(args.linear_coverage, args.scale, &mut rng);
+        write_linear_reads(
+            &annotation.linear_transcripts,
+            &fasta.chr_tcga_map,
+            &args,
+            sampled_linear_coverage,
+            &mut rng,
+            &mut r1_writer,
+            &mut r2_writer,
+            &mut read_truth,
+            &mut next_read_index,
+        )?;
+        r1_writer.flush()?;
+        r2_writer.flush()?;
+        read_truth.flush()?;
+        drop(r1_writer);
+        drop(r2_writer);
+        drop(read_truth);
+        compress_fastq_to_gz(&r1_tmp_path, &r1_gz_path, fastq_compressor)?;
+        compress_fastq_to_gz(&r2_tmp_path, &r2_gz_path, fastq_compressor)?;
+        write_isoform_truth(&circs_for_sample, prefix)?;
+
+        let sample_total_read_pairs = next_read_index - 1;
+        let sample_circ_read_pairs: usize = circs_for_sample
+            .iter()
+            .map(|circ| circ.read_pair_count)
+            .sum();
+        total_read_pairs += sample_total_read_pairs;
+        circ_read_pairs += sample_circ_read_pairs;
+        linear_read_pairs += sample_total_read_pairs.saturating_sub(sample_circ_read_pairs);
+        bsj_read_pairs += circs_for_sample
+            .iter()
+            .map(|circ| circ.bsj_read_pair_count)
+            .sum::<usize>();
+        bsj_reads += circs_for_sample
+            .iter()
+            .map(|circ| circ.bsj_read_count)
+            .sum::<usize>();
+        sample_circs.push(circs_for_sample);
+    }
+    if args.out_prefixes.len() > 1 {
+        write_sample_usage_truths(&sample_circs, &usage_profiles)?;
+    }
 
     let isoform_count: usize = circs.iter().map(|circ| circ.isoforms.len()).sum();
-    let total_read_pairs = next_read_index - 1;
-    let circ_read_pairs: usize = circs.iter().map(|circ| circ.read_pair_count).sum();
-    let linear_read_pairs = total_read_pairs.saturating_sub(circ_read_pairs);
-    let bsj_read_pairs: usize = circs.iter().map(|circ| circ.bsj_read_pair_count).sum();
-    let bsj_reads: usize = circs.iter().map(|circ| circ.bsj_read_count).sum();
 
     Ok(SimulationSummary {
+        sample_count: args.out_prefixes.len(),
         circ_count: circs.len(),
         isoform_count,
         total_read_pairs,

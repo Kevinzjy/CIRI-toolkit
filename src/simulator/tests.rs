@@ -10,14 +10,17 @@ use super::{
 
 const ISOFORM_HEADER: &str = "circ_id\tchrom\tstart\tend\tstrand\tgene_id\ttranscript_id\tcoverage\tread_cnt\tbsj_read_cnt\tisoform_cnt\tisoform_exons\tisoform_len\tisoform_read_cnt\tisoform_bsj_read_cnt";
 const READS_HEADER: &str = "read_id\tcirc_id\tchrom\tstart\tend\tstrand\tisoform_id\tis_circular\tis_bsj\tr1_segments\tr1_is_bsj\tr2_segments\tr2_is_bsj\ttype";
+const USAGE_HEADER: &str =
+    "circ_id\tchrom\tstart\tend\tstrand\tisoform_id\tusage\tread_cnt\tbsj_read_cnt";
 
 fn base_args() -> SimulateArgs {
     SimulateArgs {
         ref_fasta: "unused.fa".to_string(),
         gtf: "unused.gtf".to_string(),
-        out_prefix: "unused".to_string(),
+        out_prefixes: vec!["unused".to_string()],
         chrom: None,
         circ_count: 1,
+        switching_event: 0,
         circ_coverage: 10.0,
         linear_coverage: 0.1,
         scale: 0.5,
@@ -159,9 +162,10 @@ fn simulator_output_contract_is_stable() {
     let summary = run(SimulateArgs {
         ref_fasta: ref_fasta.to_string_lossy().into_owned(),
         gtf: gtf.to_string_lossy().into_owned(),
-        out_prefix: prefix.to_string_lossy().into_owned(),
+        out_prefixes: vec![prefix.to_string_lossy().into_owned()],
         chrom: Some("chrTest".to_string()),
         circ_count: 10,
+        switching_event: 0,
         circ_coverage: 8.0,
         linear_coverage: 0.01,
         scale: 0.5,
@@ -274,6 +278,128 @@ fn simulator_output_contract_is_stable() {
         reads.len(),
     );
     assert_eq!(summary.to_string(), expected_summary);
+}
+
+#[test]
+fn multi_sample_simulator_emits_isoform_switching_truth() {
+    let temp_dir = tempfile::tempdir().expect("create temporary simulator output directory");
+    let output_dir = temp_dir.path().join("out");
+    let sample_a = output_dir.join("sampleA");
+    let sample_b = output_dir.join("sampleB");
+    let (ref_fasta, gtf) = write_simulator_contract_fixture(temp_dir.path());
+
+    let summary = run(SimulateArgs {
+        ref_fasta: ref_fasta.to_string_lossy().into_owned(),
+        gtf: gtf.to_string_lossy().into_owned(),
+        out_prefixes: vec![
+            sample_a.to_string_lossy().into_owned(),
+            sample_b.to_string_lossy().into_owned(),
+        ],
+        chrom: Some("chrTest".to_string()),
+        circ_count: 8,
+        switching_event: 3,
+        circ_coverage: 80.0,
+        linear_coverage: 0.0,
+        scale: 0.0,
+        read_len: 80,
+        insert_len: 320,
+        insert_sd: 60.0,
+        insert_len_minor: 550,
+        insert_sd_minor: 80.0,
+        minor_insert_fraction: 0.10,
+        error_rate: 0.002,
+        exon_exclusive_rate: 0.25,
+        seed: 7,
+    })
+    .expect("run multi-sample simulator");
+
+    assert_eq!(summary.sample_count, 2);
+    assert_eq!(summary.circ_count, 8);
+    assert_eq!(
+        read_tsv(&sample_a.with_extension("isoforms.tsv"), ISOFORM_HEADER).len(),
+        read_tsv(&sample_b.with_extension("isoforms.tsv"), ISOFORM_HEADER).len()
+    );
+    assert!(sample_a.with_extension("usage.tsv").exists());
+    assert!(sample_b.with_extension("usage.tsv").exists());
+
+    let usage_a = read_tsv(&sample_a.with_extension("usage.tsv"), USAGE_HEADER);
+    let usage_b = read_tsv(&sample_b.with_extension("usage.tsv"), USAGE_HEADER);
+    assert_eq!(usage_a.len(), usage_b.len());
+    let switching = inferred_switching_circs(&usage_a, &usage_b);
+    assert_eq!(switching.len(), 3);
+}
+
+#[test]
+fn multi_sample_switching_event_clamps_to_available_two_isoform_circs() {
+    let temp_dir = tempfile::tempdir().expect("create temporary simulator output directory");
+    let output_dir = temp_dir.path().join("out");
+    let sample_a = output_dir.join("sampleA");
+    let sample_b = output_dir.join("sampleB");
+    let (ref_fasta, gtf) = write_simulator_contract_fixture(temp_dir.path());
+
+    run(SimulateArgs {
+        ref_fasta: ref_fasta.to_string_lossy().into_owned(),
+        gtf: gtf.to_string_lossy().into_owned(),
+        out_prefixes: vec![
+            sample_a.to_string_lossy().into_owned(),
+            sample_b.to_string_lossy().into_owned(),
+        ],
+        chrom: Some("chrTest".to_string()),
+        circ_count: 3,
+        switching_event: 100,
+        circ_coverage: 40.0,
+        linear_coverage: 0.0,
+        scale: 0.0,
+        read_len: 80,
+        insert_len: 320,
+        insert_sd: 60.0,
+        insert_len_minor: 550,
+        insert_sd_minor: 80.0,
+        minor_insert_fraction: 0.10,
+        error_rate: 0.002,
+        exon_exclusive_rate: 0.25,
+        seed: 17,
+    })
+    .expect("run multi-sample simulator with oversized switching target");
+
+    let usage_a = read_tsv(&sample_a.with_extension("usage.tsv"), USAGE_HEADER);
+    let usage_b = read_tsv(&sample_b.with_extension("usage.tsv"), USAGE_HEADER);
+    let isoforms = read_tsv(&sample_a.with_extension("isoforms.tsv"), ISOFORM_HEADER);
+    let available_two_isoform = isoforms
+        .iter()
+        .filter(|row| parse_usize(row, 10) >= 2)
+        .count();
+    let switching = inferred_switching_circs(&usage_a, &usage_b);
+    assert_eq!(switching.len(), available_two_isoform);
+    assert!(switching.len() <= 3);
+}
+
+fn inferred_switching_circs(sample_a: &[Vec<String>], sample_b: &[Vec<String>]) -> Vec<String> {
+    use std::collections::BTreeMap;
+
+    let mut by_sample: [BTreeMap<String, BTreeMap<String, f64>>; 2] =
+        [BTreeMap::new(), BTreeMap::new()];
+    for (target, rows) in by_sample.iter_mut().zip([sample_a, sample_b]) {
+        for row in rows {
+            target
+                .entry(row[0].clone())
+                .or_default()
+                .insert(row[5].clone(), row[6].parse::<f64>().unwrap());
+        }
+    }
+    by_sample[0]
+        .iter()
+        .filter_map(|(circ_id, usage_a)| {
+            let usage_b = by_sample[1].get(circ_id)?;
+            let major_a = usage_a
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())?;
+            let major_b = usage_b
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())?;
+            (major_a.0 != major_b.0).then(|| circ_id.clone())
+        })
+        .collect()
 }
 
 fn write_simulator_contract_fixture(dir: &Path) -> (PathBuf, PathBuf) {
