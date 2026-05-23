@@ -1,4 +1,4 @@
-//! Thin binary wrapper for the multi-sample `ciri-merge` command.
+//! Thin binary wrapper for the multi-sample `ciri-assemble` command.
 
 use mimalloc::MiMalloc;
 
@@ -6,5 +6,5 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() -> anyhow::Result<()> {
-    ciri_toolkit::cli::merge::main()
+    ciri_toolkit::cli::assemble::main()
 }

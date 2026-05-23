@@ -20,6 +20,7 @@ tmp/
 # Ignore intermediate back-spliced junction (BSJ) files
 tests/chr1*
 tests/hg38*
+tests/multi*
 
 # --- Backup and Temporary Files ---
 *.rs.bk

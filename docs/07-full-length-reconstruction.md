@@ -788,134 +788,139 @@ FASTA 输出 `type` 和 `evidence` 方便用户直接过滤 sequence candidate�
 
 如果 `gene_id=NA` 或 GTF 中没有可用 exon overlap，长 unspliced block 仍只能按 graph block 原样保留；这类 isoform 应视为低可信 / unresolved full-length case，而不是成熟 RNA 长度已经被可靠确定。后续 standalone isoform/multi-sample 阶段应把这类记录显式标记出来，或在 FASTA 输出中降级处理。
 
-## 12. 下一阶段：two-pass multi-sample integration 与 cohort assembly
+## 12. 已落地：two-pass multi-sample integration 与 shared assembly
 
-rank 1 major isoform 已经是当前默认输出。下一阶段不再回到 CIRI-AS / CIRI-full 路线，而是把单样本默认流程保留为 full run，同时新增面向 cohort 的 two-pass 入口：第一遍只做单样本 BSJ discovery，合并多个样本的 `.out` 得到 cohort-level circRNA catalog；第二遍每个样本用同一个 catalog 重新扫描 BAM/SAM 并生成 cohort-aware `.segments`；最后由独立 assembly 阶段整合多个样本的 second-pass segments，建立 cohort isoform search space、per-sample usage 和 major isoform switching 审计。
+rank 1 major isoform 已经是当前默认输出。当前不再回到 CIRI-AS / CIRI-full 路线，而是把单样本默认流程保留为 full run，同时提供面向多样本的 two-pass 入口：第一遍只做单样本 BSJ discovery，合并多个样本的 `.out` 得到 shared circRNA catalog；第二遍每个样本用同一个 catalog 重新扫描 BAM/SAM 并生成 shared-catalog `.segments`；最后由独立 `ciri-assemble` 整合多个样本的 second-pass segments，建立 integrated isoform search space、per-sample usage 和 major isoform switching 审计。
 
-这样设计的原因是：直接从 pass1 的 `.segments` 做整合只能利用每个样本已经识别到的 circRNA context。低表达样本中真实 BSJ 可能没有独立进入 `.out`，对应 reads 在 `.segments` 中也可能没有被正确投影。cohort BSJ catalog 先合并多个样本的 BSJ 证据，再反过来指导每个样本重新生成 segments，能让 weak-but-reproducible BSJ 参与 sample-specific segments 判定。
+这样设计的原因是：直接从 pass1 的 `.segments` 做整合只能利用每个样本已经识别到的 circRNA context。低表达样本中真实 BSJ 可能没有独立进入 `.out`，对应 reads 在 `.segments` 中也可能没有被正确投影。shared BSJ catalog 先合并多个样本的 BSJ 证据，再反过来指导每个样本重新生成 segments，能让 weak-but-reproducible BSJ 参与 sample-specific segments 判定。
 
 ### 12.1 总体边界
 
 - 仍然以 Summary confirmed BSJ 为硬锚点
 - 单样本默认模式仍然全流程输出 `.out + .segments + .isoforms.* + review sidecar`
-- two-pass mode 不修改默认模式语义；它是 cohort-aware 运行策略
+- two-pass mode 不修改默认模式语义；它是 shared-catalog 运行策略
 - `--1st-pass` 只生成 pass1 `.out`，用于 `ciri-merge`；该入口已实现
-- `--2nd-pass` 必须和 `--circ` 同时使用，只生成当前样本在 cohort catalog 下的 `.out + .bedpe + .segments + .segments.bam/.bai`，不运行 isoform reconstruction
-- 指定 `--circ` 但不指定 `--2nd-pass` 时，按 cohort catalog 执行完整单样本流程，继续输出 `.isoforms.gtf/.fa`
+- `--2nd-pass` 必须和 `--circ` 同时使用，只生成当前样本在 shared catalog 下的 `.out + .bedpe + .segments + .segments.bam/.bai`，不运行 isoform reconstruction
+- 指定 `--circ` 但不指定 `--2nd-pass` 时，按 shared catalog 执行完整单样本流程，继续输出 `.isoforms.gtf/.fa`
 - 仍然不修改 `priority=1` 主流程证据的定义；`--circ` 只扩展候选 BSJ catalog 和 segments 校正 context
 - 仍然不把 remap 作为第一依赖
 - isoform usage / multi-sample assembly 仍然应作为 `Summary` 和 segments 之后的独立后处理阶段
 - 单样本 `<prefix>.isoforms.gtf` 保留 rank 1 major 审计信息，`<prefix>.isoforms.fa` 保持高可信 sequence candidate 定位
 
-### 12.2 CLI 入口规划
+### 12.2 CLI 入口
 
-新增入口建议拆成三个明确阶段：
+当前入口拆成三个明确阶段：
 
 ```bash
 # pass 1: sample-local BSJ discovery only
-ciri -i S1.bam -o S1.ciri -r ref.fa -a annotation.gtf --1st-pass
-ciri -i S2.bam -o S2.ciri -r ref.fa -a annotation.gtf --1st-pass
+ciri -i S1.bam -o S1_1st_pass -r ref.fa -a annotation.gtf -s 0 --1st-pass
+ciri -i S2.bam -o S2_1st_pass -r ref.fa -a annotation.gtf -s 0 --1st-pass
 
-# merge pass1 BSJ/circRNA outputs into a cohort catalog
-ciri-merge -i S1.ciri.out S2.ciri.out -o 1st_pass.out
+# merge pass1 BSJ/circRNA outputs into a shared catalog
+ciri-merge -i S1_1st_pass.out S2_1st_pass.out -o 1st_pass.bed
 
-# pass 2: sample-specific segments under the cohort circRNA catalog
-ciri -i S1.bam -o S1.cohort.ciri -r ref.fa -a annotation.gtf \
-  --2nd-pass --circ 1st_pass.out
-ciri -i S2.bam -o S2.cohort.ciri -r ref.fa -a annotation.gtf \
-  --2nd-pass --circ 1st_pass.out
+# pass 2: sample-specific segments under the shared circRNA catalog
+ciri -i S1.bam -o S1_2nd_pass -r ref.fa -a annotation.gtf \
+  -s 0 --2nd-pass --circ 1st_pass.bed
+ciri -i S2.bam -o S2_2nd_pass -r ref.fa -a annotation.gtf \
+  -s 0 --2nd-pass --circ 1st_pass.bed
 
-# cohort isoform search space and per-sample usage
-ciri-assemble --manifest pass2.tsv --circ 1st_pass.out \
-  -o cohort.ciri -r ref.fa -a annotation.gtf
+# headerless sample manifest: sample_id<TAB>prefix
+printf "S1\tS1_2nd_pass\n" > sample_list.tsv
+printf "S2\tS2_2nd_pass\n" >> sample_list.tsv
+
+# integrated isoform search space and per-sample usage
+ciri-assemble -i sample_list.tsv -o merged -r ref.fa -a annotation.gtf
 ```
 
 约束：
 
 - `--1st-pass` 和 `--2nd-pass` 互斥；
 - `--2nd-pass` 必须指定 `--circ`；
-- `--circ` 文件来自 `ciri-merge -o` 写出的 cohort catalog，字段和排序应稳定，便于断点重跑；
+- `--circ` 文件来自 `ciri-merge -o` 写出的 BED6 shared catalog，字段和排序应稳定，便于断点重跑；
 - 当前实现中 `--circ` 会在 Scan1-derived candidate 之后追加外部 BSJ candidate，并从参考序列重建 Scan2 需要的 left/right splice signal；它不会把 BED 中的 catalog-only 位点直接写入样本 `.out`；
-- `ciri-merge` / `ciri-assemble` 是独立 binary，类似 `ciri-simulator`，不把 cohort manifest 语义塞进默认 `ciri` 单样本参数组；当前已实现 `ciri-merge`，`ciri-assemble` 仍是下一阶段。
+- `ciri-merge` / `ciri-assemble` 是独立 binary，类似 `ciri-simulator`，不把 multi-sample manifest 语义塞进默认 `ciri` 单样本参数组；
+- `ciri-assemble` 的 `-i` 输入为无 header 的两列 TSV：`sample_id<TAB>prefix`。第二列是 second-pass 输出 prefix，程序自动读取 `<prefix>.out` 和 `<prefix>.segments`。
 
 ### 12.3 `ciri-merge`：合并 pass1 `.out`
 
-`ciri-merge` 只合并多个样本的 `.out`，生成 BED6 cohort-level circRNA / BSJ catalog。它不读取 `.segments`，也不尝试做内部 isoform reconstruction。
+`ciri-merge` 只合并多个样本的 `.out`，生成 BED6 shared circRNA / BSJ catalog。它不读取 `.segments`，也不尝试做内部 isoform reconstruction。
 
 输入直接使用多个 first-pass `.out`：
 
 ```bash
-ciri-merge -i S1.ciri.out S2.ciri.out -o 1st_pass.out
+ciri-merge -i S1_1st_pass.out S2_1st_pass.out -o 1st_pass.bed
 ```
 
 输出：
 
 ```text
-1st_pass.out
+1st_pass.bed
 ```
 
-`1st_pass.out` 是 `--circ` 的标准输入，采用无 header 的 BED6：
+`1st_pass.bed` 是 `--circ` 的标准输入，采用无 header 的 BED6：
 
 ```text
 chrom	chromStart	chromEnd	name	score	strand
 ```
 
-其中 `chromStart = circ_start - 1`，`chromEnd = circ_end`，`name` 使用 cohort circRNA ID，例如 `chr1:461154|461954:+`，`score` 使用 capped total BSJ reads。`ciri-merge` 的合并 key 应为 `chrom,start,end,strand`。
+其中 `chromStart = circ_start - 1`，`chromEnd = circ_end`，`name` 使用 shared circRNA ID，例如 `chr1:461154|461954:+`，`score` 使用 capped total BSJ reads。`ciri-merge` 的合并 key 应为 `chrom,start,end,strand`。
 
 ### 12.4 `--circ` second-pass semantics
 
 `--circ` 不表示直接接受外部 circRNA 为当前样本阳性，也不跳过 read-level evidence。它表示：
 
-> 使用外部 cohort circRNA catalog 作为候选 BSJ 集合，对当前样本重新计数、重新 rescue、重新生成 segments。
+> 使用外部 shared circRNA catalog 作为候选 BSJ 集合，对当前样本重新计数、重新 rescue、重新生成 segments。
 
-第二遍应输出当前样本在 cohort catalog 下的 sample-specific 结果：
+第二遍应输出当前样本在 shared catalog 下的 sample-specific 结果：
 
-- `<prefix>.out`：当前样本中被 read evidence 支持的 cohort circRNA / BSJ count；
+- `<prefix>.out`：当前样本中被 read evidence 支持的 shared-catalog circRNA / BSJ count；
 - `<prefix>.bedpe`：当前样本 Summary-confirmed BSJ anchor pair 的 IGV review track；
-- `<prefix>.segments`：在 cohort catalog context 下重新解释的 BSJ/backward/outward read chains；
+- `<prefix>.segments`：在 shared catalog context 下重新解释的 BSJ/backward/outward read chains；
 - `<prefix>.segments.bam/.bai`：对应 `.segments` 的 IGV review 投影。
 
-`--2nd-pass --circ` 默认到 `.segments` 结束，不跑 `.isoforms.gtf/.fa`。如果用户只指定 `--circ` 而不指定 `--2nd-pass`，则执行 cohort-aware full single-sample run，并继续输出 isoform GTF/FASTA。
+`--2nd-pass --circ` 默认到 `.segments` 结束，不跑 `.isoforms.gtf/.fa`。如果用户只指定 `--circ` 而不指定 `--2nd-pass`，则执行 shared-catalog full single-sample run，并继续输出 isoform GTF/FASTA。
 
 输出中需要区分：
 
 - sample-detected BSJ：当前样本自身 read evidence 足以支持；
-- cohort-rescued BSJ：当前样本 read evidence 在 cohort catalog context 下被 rescue；
+- shared-catalog-rescued BSJ：当前样本 read evidence 在 shared catalog context 下被 rescue；
 - catalog-only no-support：catalog 中存在但当前样本无 read support；这类记录不应进入当前样本 `.out` 主计数，只能保留在后续审计 sidecar。
 
-### 12.5 `ciri-assemble`：cohort segments 共组装
+### 12.5 `ciri-assemble`：multi-sample segments 共组装
 
-`ciri-assemble` 消费多个样本 second-pass 输出，建立 cohort-level isoform candidate graph，并保留 sample_id 维度计算 per-sample support / usage。它不能简单把所有 `.segments` 拼成一个“大样本”后重建 isoform，因为那会丢掉 sample-specific usage，并可能用 cohort major 掩盖某个样本的 major isoform switching。
+`ciri-assemble` 消费多个样本 second-pass 输出，建立 integrated isoform candidate graph，并保留 sample_id 维度计算 per-sample support / usage。它不能简单把所有 `.segments` 拼成一个“大样本”后重建 isoform，因为那会丢掉 sample-specific usage，并可能用 integrated major 掩盖某个样本的 major isoform switching。
 
-输入 manifest：
+输入 sample manifest：
 
 ```text
-sample_id	out	segments
-S1	S1.cohort.ciri.out	S1.cohort.ciri.segments
-S2	S2.cohort.ciri.out	S2.cohort.ciri.segments
+S1	S1_2nd_pass
+S2	S2_2nd_pass
 ```
 
 最小 structure co-assembly 需要：
 
-- `--circ 1st_pass.out`
 - 每个样本的 second-pass `<prefix>.segments`
+- 每个样本的 second-pass `<prefix>.out`
 
 正式 usage co-assembly 还应读取：
 
-- 每个样本的 second-pass `<prefix>.out`，用于 sample-level BSJ support、presence/absence 和 catalog-only 区分；
 - annotation GTF，用于 unresolved block 的 annotation-guided repair；
-- reference FASTA，仅当需要输出 cohort FASTA 时必需。
+- reference FASTA，仅当需要输出 integrated FASTA 时必需。
 
-输出建议：
+当前输出：
 
 ```text
-cohort.ciri.isoforms.gtf
-cohort.ciri.isoforms.fa
-cohort.ciri.isoform_usage.tsv
-cohort.ciri.switching.tsv
+merged.isoforms.gtf
+merged.isoforms.fa
+merged.bsj.tsv
+merged.ratio.tsv
+merged.usage.tsv
 ```
 
-FASTA 仍保持高可信 sequence candidate 定位；低可信或 ambiguous candidate 只进入 GTF / usage 审计表，不默认输出序列。
+`merged.bsj.tsv` 和 `merged.ratio.tsv` 是 circRNA-by-sample matrix。
+`merged.usage.tsv` 只输出检测到 major isoform switching 的 circRNA / isoform usage matrix。
+FASTA 仍保持高可信 sequence candidate 定位；低可信或 ambiguous candidate 只进入 GTF 审计表，不默认输出序列。
 
 ### 12.6 usage 计算所需输入
 
@@ -925,6 +930,8 @@ FASTA 仍保持高可信 sequence candidate 定位；低可信或 ambiguous cand
 - `<prefix>.isoforms.gtf` 中的 exon chain、`type`、`evidence`、`weakness`、`score` 和 `weight`；
 - `.out` 中的 circRNA boundary、BSJ reads 和 annotation 字段；
 - simulator `.isoforms.tsv/.reads.tsv` 用于验证 major isoform switching 与后续可能的 minor usage，而不是只验证 top-1 structure。
+
+当前 `ciri-assemble` 的 usage 定量只使用 BSJ read-level assignment。backward / outward rows 仍可参与候选结构的 co-assembly discovery，但由于它们对具体 BSJ molecule 和 circRNA identity 存在不确定性，不作为 isoform usage 的可靠计数证据。
 
 ### 12.7 候选 isoform search space
 
@@ -939,8 +946,9 @@ FASTA 仍保持高可信 sequence candidate 定位；低可信或 ambiguous cand
 
 后续输出建议保持两个层次：
 
-- 单样本 usage：每个 circRNA 输出候选 isoform、support reads、加权 usage、是否为 major 和 confidence tier；结构哈希可以从 exon chain 重新计算，不需要依赖当前 GTF 字段；
+- 单样本 usage：当前仍不作为默认输出；每个 circRNA 默认只输出 rank 1 major isoform。
 - 多样本整合：按 circ boundary、strand 和 exon chain 合并结构，输出 per-sample support/usage、major isoform switching、样本缺失/新增结构和跨样本一致性。
+- switching 判定先要求 candidate isoform 结构达到 switching-grade evidence；该门槛允许 `mature`、annotation-guided / unphased-junction estimate，以及带 `ambiguous_exon` 但有足够 BSJ assignment support 的 estimate 参与，仍排除 `low_coverage_exon` 和 `unconfident_long_exon`。随后在每个样本中用 BSJ reads 对固定候选 isoform 做 read-level assignment，并要求 major isoform 发生变化且 usage shift 足够大。
 
 ### 12.9 scalability 边界
 
@@ -952,6 +960,8 @@ FASTA 仍保持高可信 sequence candidate 定位；低可信或 ambiguous cand
 - merge 阶段只合并 circ-level edge/link/span support summary；
 - 输出排序键固定为 `chrom,start,end,strand,structure_key,sample_id`；
 - 所有长阶段必须输出进度和阶段性 INFO，避免隐藏 finalize/merge 时间。
+
+当前 isoform reconstruction / `ciri-assemble` 尚未实现并行化。现阶段在 chr1 fixture 和当前真实样本上运行速度足够快，因此先保持串行实现，降低并行状态合并和输出顺序回归风险。后续等多样本数量增加并拿到更大的 multi-sample benchmark 后，再根据 profiling 决定是否对 circRNA bucket 或 sample-level parsing 做并行加速。
 
 ### 12.10 仍然暂不做的内容
 
@@ -1051,17 +1061,19 @@ BSJ 关系的推荐表达方式是“线性 exon / segment track + BSJ arc track
 11. 用 retained shard streaming 进行 junction support collection 与 ambiguous row correction，避免全量 read-level rows 常驻内存
 12. 基于 `<prefix>.segments` 构建 circ-local graph，输出每个 circRNA 的 rank 1 major isoform GTF/FASTA
 13. 增加默认 IGV review sidecar：`<prefix>.bedpe` 和 `<prefix>.segments.bam/.bai`
+14. 实现 `--1st-pass`，只运行单样本 BSJ discovery 并输出 pass1 `.out`
+15. 实现独立 `ciri-merge`，读取多个 pass1 `.out`，生成 shared BED6 `1st_pass.bed`
+16. 实现 `--circ` 与 `--2nd-pass`：`--circ` 将 shared BED6 作为外部 Scan2 BSJ candidate catalog；`--2nd-pass --circ` 重新扫描当前样本并只输出 `.out + .bedpe + .segments + .segments.bam/.bai`；仅指定 `--circ` 时继续执行完整 shared-catalog single-sample run
+17. 实现独立 `ciri-assemble`，读取多个 second-pass `.segments/.out`，建立 integrated isoform candidate graph，输出 per-sample usage 与 major isoform switching
+18. 实现 BSJ-only read-level assignment 作为 multi-sample usage 定量依据，避免 backward/outward reads 在多个 circRNA 或多个 isoform 间重复计数
+19. 扩展 `ciri-simulator -o sample1 sample2 --switching-event N`，生成共享 catalog 的两样本 switching truth fixture
 
 下一阶段：
 
-1. 已实现 `--1st-pass`，只运行单样本 BSJ discovery 并输出 pass1 `.out`
-2. 已实现独立 `ciri-merge`，读取多个 pass1 `.out`，生成 cohort-level BED6 `1st_pass.out`
-3. 已实现 `--circ` 与 `--2nd-pass`：`--circ` 将 cohort BED6 作为外部 Scan2 BSJ candidate catalog；`--2nd-pass --circ` 重新扫描当前样本并只输出 `.out + .bedpe + .segments + .segments.bam/.bai`；仅指定 `--circ` 时继续执行完整 cohort-aware single-sample run
-4. 实现独立 `ciri-assemble`，读取多个 second-pass `.segments/.out`，建立 cohort isoform candidate graph，输出 per-sample usage 与 major isoform switching
-5. 若 switching 或多样本复现支持明确，再从当前 major path builder 中扩展 candidate isoform search space，保留 phase-supported、seed-extended、annotation-guided 和 audit-only tier
-6. 设计 per-circ read-to-isoform assignment / fractional usage 规则，避免 backward/outward reads 在多个 circRNA 或多个 isoform 间重复计数
-7. 用 chr1 simulator truth 同时评估 major accuracy、minor recovery、usage rank correlation 和 false sequence candidate rate
-8. 继续补充 IGV review track，用于人工检查高支持但未进 FASTA 或 usage 分歧明显的 circRNA
+1. 用多样本 simulator truth 继续评估 major switching precision/recall、usage rank correlation 和 false sequence candidate rate
+2. 若 switching 或多样本复现支持明确，再从当前 major path builder 中扩展 candidate isoform search space，保留 phase-supported、seed-extended、annotation-guided 和 audit-only tier
+3. 等样本数增加并拿到大 multi-sample benchmark 后，评估 isoform reconstruction / `ciri-assemble` 是否需要并行加速
+4. 继续补充 IGV review track，用于人工检查高支持但未进 FASTA 或 usage 分歧明显的 circRNA
 
 ---
 最后更新：2026-05-22

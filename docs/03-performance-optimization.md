@@ -97,6 +97,7 @@ python scripts/ciri_result_diff.py tests/chr1/CIRI3_result.txt tests/chr1/CIRI.r
 
 - 当前 major isoform 阶段必须从已写出的 `<prefix>.segments` 重新解析，不能依赖前一阶段内存对象；这是 `--continue`、debug 和未来 multi-sample integration 的稳定输入边界。
 - 后续 multi-isoform usage 和 multi-sample integration 必须继续保持可流式/分片处理，不允许把全量 read-level rows 或所有样本的 segments 常驻内存。
+- 当前 isoform reconstruction / `ciri-assemble` 尚未做并行化。现阶段该阶段速度足够快，先保持串行实现；后续等样本数增加并完成大 multi-sample profiling 后，再决定是否对 circRNA bucket、sample parser 或 read-assignment 阶段做并行加速。
 - 若新增 usage profiling，应单独标记 parser、circ-local graph、read assignment、sample merge 和 writer 阶段，避免把最后一步性能问题误归因到 Scan1/Scan2。
 
 ## Scan2 专项记录（2026-05）

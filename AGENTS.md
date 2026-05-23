@@ -21,7 +21,8 @@
 ## 扩展模块策略（segments / isoforms / multi-sample）
 - **CIRI3 parity 与扩展功能分层**：`vendor/CIRI3` 仍是核心 BSJ 检测行为标准；`vendor/CIRI-AS` 与 `vendor/CIRI-full` 只作为历史算法参考和风险清单，不再作为当前开发路线或完整 parity 目标。
 - **当前已落地能力**：默认后处理已实现 `<prefix>.segments`、`<prefix>.isoforms.gtf`、高可信 `<prefix>.isoforms.fa`、`<prefix>.bedpe` 和 `<prefix>.segments.bam/.bai`；`<prefix>.segments` 包含 chain-level CIGAR 与 short-form `cs`，`.segments.bam` 从这些字段重建 synthetic sequence / `cs:Z` 用于 IGV review；isoform 阶段必须从已写出的 `<prefix>.segments` 重新解析，保证断点调试和后续多样本整合共用同一输入边界。
-- **下一阶段目标**：围绕同一 circRNA 的多个候选 isoform 建立 usage 计算、置信度分层和 multi-sample integration；重点是比较 major isoform switching、结构稳定性和样本间 usage 变化，而不是沿 CIRI-AS / CIRI-full / RO remap 路线继续复刻历史输出。
+- **当前 multi-sample 状态**：two-pass shared-catalog workflow 已有首版闭环，包括 `--1st-pass`、`ciri-merge`、`--2nd-pass --circ` 和 `ciri-assemble`。`ciri-assemble` 当前使用串行 isoform reconstruction / usage assignment；由于现阶段速度足够快，暂不实现并行化，后续等样本数增加并拿到大 multi-sample benchmark 后再基于 profiling 决定是否并行加速。
+- **下一阶段目标**：继续围绕同一 circRNA 的多个候选 isoform 完善 usage 计算、置信度分层和 multi-sample integration；重点是比较 major isoform switching、结构稳定性和样本间 usage 变化，而不是沿 CIRI-AS / CIRI-full / RO remap 路线继续复刻历史输出。
 - **证据边界**：BSJ/backward/outward segments 是当前 isoform 图的主要证据层。后续新增 evidence 必须先进入审计字段或 sidecar，不能反向改变 `.out/.bsj/.segments` 的既有判定。
 - **文档优先**：isoform usage、多样本整合、输出协议或证据分层发生变化时，必须同步更新 `docs/07-full-length-reconstruction.md`、`docs/01-development-status.md` 和必要的用户文档。
 - **用户定稿文案优先**：用户已经调整过的 clap help 文案和 README 用法说明视为用户界面契约；除非用户明确要求，不要为了同步实现细节而主动改写。输出协议需要记录时优先更新内部设计文档，确实需要改 README 或 clap 文案时先单独确认。

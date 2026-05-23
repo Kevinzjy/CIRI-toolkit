@@ -100,7 +100,7 @@ The main output files are:
 - `<prefix>.segments.bam` and `<prefix>.segments.bam.bai`: IGV-compatible segment alignments
 - `<prefix>.log`: run log
 
-## `.out` Format
+### `.out` Format
 
 `<prefix>.out` uses the CIRI3-compatible 13-column format:
 
@@ -118,24 +118,6 @@ The main output files are:
 11. strand
 12. junction_reads_ID
 13. Score
-```
-
-## Multi-sample intergration
-
-For multi-sample integrative analysis, `ciri` provides a two pass
-workflow:
-
-```bash
-# Run 1st pass: BSJ detection
-ciri -i sample1.bam -o sample1_1st_pass -r ref.fa -a annotation.gtf -s 0  --1st-pass
-ciri -i sample2.bam -o sample2_1st_pass -r ref.fa -a annotation.gtf -s 0 --1st-pass
-
-# Merge detection BSJ sites
-ciri-merge -i sample1_1st_pass.out sample2_1st_pass.out -o 1st_pass.bed
-
-# Run 2nd pass: segments detection
-ciri -i sample1.bam -o sample1_2nd_pass -r ref.fa -a annotation.gtf --circ 1st_pass.bed -s 0 --2nd-pass
-ciri -i sample2.bam -o sample2_2nd_pass -r ref.fa -a annotation.gtf --circ 1st_pass.bed -s 0 --2nd-pass
 ```
 
 ### Full-length isoform sequence assembly
@@ -156,6 +138,36 @@ Recommended filtering criteria:
 - Records containing `ambiguous_exon`, `low_coverage_exon`, or
   `unconfident_long_exon` are retained to preserve recall, but should be treated
   as lower-confidence candidates in sequence-sensitive downstream analyses.
+
+## Multi-sample integration
+
+For multi-sample integrative analysis, `ciri` provides a two pass
+workflow:
+
+```bash
+# Run 1st pass: BSJ detection
+ciri -i sample1.bam -o sample1_1st_pass -r ref.fa -a annotation.gtf -s 0  --1st-pass
+ciri -i sample2.bam -o sample2_1st_pass -r ref.fa -a annotation.gtf -s 0 --1st-pass
+
+# Merge detection BSJ sites
+ciri-merge -i sample1_1st_pass.out sample2_1st_pass.out -o 1st_pass.bed
+
+# Run 2nd pass: segments detection
+ciri -i sample1.bam -o sample1_2nd_pass -r ref.fa -a annotation.gtf --circ 1st_pass.bed -s 0 --2nd-pass
+ciri -i sample2.bam -o sample2_2nd_pass -r ref.fa -a annotation.gtf --circ 1st_pass.bed -s 0 --2nd-pass
+
+# Prepare sample list
+printf "sample1\tsample1_2nd_pass\n" > sample_list.tsv
+printf "sample2\tsample2_2nd_pass\n" >> sample_list.tsv
+
+# Integrative assembly of circRNA isoforms
+ciri-assemble -i sample_list.tsv -o merged -r ref.fa -a annotation.gtf
+```
+
+The final `merged.isoforms.fa` and `merged.isoforms.gtf` contain co-assembled isoform
+structures and sequences. Isoform reconstruction and multi-sample assembly currently
+run serially; this stage is fast on current validation datasets, and parallel
+execution will be revisited when larger multi-sample datasets require it.
 
 ## Generate a simulation dataset with `ciri-simulator`
 
@@ -179,3 +191,25 @@ Simulator outputs:
 - `<prefix>.annotation.gtf`: masked linear annotation for de novo evaluation
 - `<prefix>.isoforms.tsv`: isoform-level truth table
 - `<prefix>.reads.tsv`: read-pair-level truth table
+
+To generate a matched two-sample fixture with shared circRNA/isoform structures
+and controlled major isoform switching, pass two output prefixes and set
+`--switching-event`:
+
+```bash
+ciri-simulator \
+  -r <reference_fasta> \
+  -a <source_gtf> \
+  -o sample1 sample2 \
+  --circ-count 1000 \
+  --circ-coverage 100 \
+  --linear-coverage 10 \
+  --switching-event 200
+```
+
+The simulator writes the normal per-sample FASTQ/truth files for each prefix.
+It also writes `<sample1>.usage.tsv` and `<sample2>.usage.tsv` with per-sample
+isoform usage truth. Major isoform switching events can be derived later by
+comparing usage across samples. If fewer two-isoform circRNAs are available than
+the requested `--switching-event`, the simulator uses all available two-isoform
+circRNAs instead of failing.

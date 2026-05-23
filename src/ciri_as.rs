@@ -135,6 +135,16 @@ const MAJOR_MIN_TRUSTED_ESTIMATE_SEGMENT_COVERAGE_PCT: f64 = 50.0;
 /// incomplete, but a broadly segment-covered chain is still useful enough to
 /// include in the sequence FASTA with its estimate reason preserved.
 const MAJOR_MIN_CANDIDATE_SEGMENT_COVERAGE_PCT: f64 = 90.0;
+/// Minimum sample-level BSJ support required before a different major isoform
+/// can trigger a cohort switching call.
+const COHORT_SWITCHING_MIN_BSJ_READS: f64 = 5.0;
+/// Minimum usage shift required before high-confidence sample-major structures
+/// are reported as a cohort switching event.
+const COHORT_SWITCHING_MIN_USAGE_DELTA: f64 = 0.50;
+/// Minimum aggregate structural support required to seed a cohort alternative.
+const COHORT_MIN_ALT_EDGE_SUPPORT: f64 = 5.0;
+/// Hard cap for per-circRNA alternative-edge probes during cohort co-assembly.
+const COHORT_MAX_ALT_EDGE_PROBES: usize = 64;
 /// Half-window around local anchors searched for non-BSJ clip placement.
 const NON_BSJ_LOCAL_CLIP_ANCHOR_FLANK_MULTIPLIER: i32 = 2;
 /// Maximum local clip pseudo-alignments retained per read group.
@@ -252,6 +262,47 @@ pub struct IsoformRunSummary {
     pub fasta_isoforms: usize,
     /// Distinct circRNAs represented by FASTA sequence records.
     pub fasta_circ_rnas: usize,
+}
+
+/// One sample entry consumed by `ciri-assemble`.
+///
+/// The prefix points to completed second-pass outputs. Assembly derives
+/// `<prefix>.out` and `<prefix>.segments` so the manifest stays stable even if
+/// additional review sidecars are present in the same directory.
+#[derive(Debug, Clone)]
+pub struct CohortSampleInput {
+    /// User-facing sample identifier used as a matrix column.
+    pub sample_id: String,
+    /// Output prefix of one completed second-pass CIRI run.
+    pub prefix: String,
+}
+
+/// Configuration for cohort-level isoform assembly from second-pass outputs.
+pub struct CohortAssembleConfig<'a> {
+    /// Headerless manifest entries supplied by `ciri-assemble`.
+    pub samples: Vec<CohortSampleInput>,
+    /// Output prefix for `.isoforms.*` and matrix files.
+    pub out_prefix: &'a str,
+    /// Reference sequences used to materialize FASTA records.
+    pub reference: &'a HashMap<String, String>,
+    /// Optional annotation used by the same major-isoform projection logic as
+    /// single-sample reconstruction.
+    pub annotation: Option<&'a Annotation>,
+}
+
+/// User-facing summary returned by cohort assembly.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CohortAssembleSummary {
+    /// Number of samples read from the manifest.
+    pub samples: usize,
+    /// Distinct circRNAs represented by the cohort matrix.
+    pub circ_rnas: usize,
+    /// Isoform records written to `<prefix>.isoforms.gtf`.
+    pub isoforms: usize,
+    /// CircRNAs whose supported sample-major structures switched across samples.
+    pub switching_circ_rnas: usize,
+    /// FASTA records emitted after applying the normal sequence-confidence gate.
+    pub fasta_isoforms: usize,
 }
 
 /// Compact alignment representation for CIRI-AS read-group matching.
@@ -501,6 +552,19 @@ struct MajorLinkSupport {
     outward: f64,
 }
 
+/// BSJ-only read observation retained for cohort isoform quantification.
+///
+/// Backward and outward rows are useful for discovering possible structures, but
+/// they do not resolve the BSJ molecule precisely enough for usage estimates.
+/// Cohort usage therefore keeps a separate BSJ read-level view and assigns each
+/// read probabilistically across the already co-assembled candidate isoforms.
+#[derive(Debug, Clone)]
+struct MajorBsjReadObservation {
+    read_id: String,
+    edges: HashSet<MajorEdge>,
+    spans: Vec<(i32, i32)>,
+}
+
 /// Continuous aligned segment used as junction-exclusive evidence.
 ///
 /// If a read has one uninterrupted alignment block spanning a candidate intron,
@@ -566,6 +630,48 @@ struct MajorIsoformRecord {
     isoform_class: String,
     isoform_origin: String,
     estimate_reason: String,
+}
+
+/// Per-sample support maps used by major-isoform reconstruction.
+#[derive(Default)]
+struct MajorIsoformSupportBundle {
+    edge_support_by_circ: HashMap<usize, HashMap<MajorEdge, MajorEdgeSupport>>,
+    link_support_by_circ: HashMap<usize, HashMap<MajorJunctionLink, MajorLinkSupport>>,
+    link_exclusion_by_circ: HashMap<usize, HashMap<MajorJunctionLink, MajorLinkSupport>>,
+    span_support_by_circ: HashMap<usize, Vec<MajorAlignedSpan>>,
+    bsj_reads_by_circ: HashMap<usize, Vec<MajorBsjReadObservation>>,
+}
+
+/// Matrix-ready circRNA values parsed from one sample `.out`.
+#[derive(Debug, Clone)]
+struct MajorCircSampleValue {
+    circ: CircRecord,
+    bsj_reads: f64,
+    junction_ratio: f64,
+}
+
+/// Per-sample assembly state retained for cohort-level switching and usage.
+struct MajorSampleAssembly {
+    sample_id: String,
+    circ_index_by_id: HashMap<String, usize>,
+    circ_values: HashMap<String, MajorCircSampleValue>,
+    support: MajorIsoformSupportBundle,
+}
+
+/// Structure key used to merge identical isoforms across samples.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
+struct MajorIsoformStructureKey {
+    chr: String,
+    start: i32,
+    end: i32,
+    strand: char,
+    exons: Vec<(i32, i32)>,
+}
+
+/// Stable circRNA row metadata used by cohort matrices.
+#[derive(Debug, Clone)]
+struct CohortCircInfo {
+    id: String,
 }
 
 /// Result of converting graph blocks into mature exon intervals.
@@ -635,6 +741,7 @@ struct MajorBlockBuildStatus {
 /// interface needed for later standalone and multi-sample processing.
 #[derive(Debug, Clone, Copy)]
 struct MajorSegmentsColumns {
+    read_id: usize,
     type_name: usize,
     circ_id: usize,
     chrom: usize,
@@ -883,6 +990,144 @@ pub fn rebuild_major_isoforms_from_segments(
         reference,
         annotation,
     )
+}
+
+/// Runs cohort isoform assembly from completed second-pass sample prefixes.
+///
+/// Each sample contributes its own `.out` BSJ counts and `.segments` structure
+/// evidence. Unlike single-sample output, cohort assembly first merges all
+/// structural reads into one co-assembly graph, then estimates per-sample usage
+/// for the resulting high-confidence candidate structures. This keeps sample
+/// labels out of structure discovery so sample-local annotation projection or
+/// boundary drift cannot by itself create an isoform-switching event.
+pub fn run_ciri_assemble(config: CohortAssembleConfig<'_>) -> Result<CohortAssembleSummary> {
+    if config.samples.is_empty() {
+        bail!("ciri-assemble requires at least one sample");
+    }
+    let mut sample_assemblies = Vec::with_capacity(config.samples.len());
+    for sample in &config.samples {
+        let out_path = format!("{}.out", sample.prefix);
+        let segments_path = format!("{}.segments", sample.prefix);
+        let (circ_records, circ_values) = load_major_circ_sample_values(&out_path)?;
+        let circ_index_by_id: HashMap<String, usize> = circ_records
+            .iter()
+            .enumerate()
+            .map(|(idx, circ)| (circ.id.clone(), idx))
+            .collect();
+        let support = collect_major_isoform_support(&circ_records, &segments_path)?;
+        sample_assemblies.push(MajorSampleAssembly {
+            sample_id: sample.sample_id.clone(),
+            circ_index_by_id,
+            circ_values,
+            support,
+        });
+    }
+
+    let sample_ids: Vec<String> = sample_assemblies
+        .iter()
+        .map(|sample| sample.sample_id.clone())
+        .collect();
+    let cohort_circ_records = cohort_circ_records(&sample_assemblies);
+    let cohort_support = cohort_support_bundle(&cohort_circ_records, &sample_assemblies);
+    let circ_infos = cohort_circ_infos_from_records(&cohort_circ_records);
+    write_cohort_bsj_matrix(
+        &format!("{}.bsj.tsv", config.out_prefix),
+        &sample_ids,
+        &circ_infos,
+        &sample_assemblies,
+    )?;
+    write_cohort_ratio_matrix(
+        &format!("{}.ratio.tsv", config.out_prefix),
+        &sample_ids,
+        &circ_infos,
+        &sample_assemblies,
+    )?;
+
+    let cohort_sample_id = major_sample_id(config.out_prefix);
+    let mut cohort_isoforms = Vec::new();
+    let mut switching_rows: Vec<(String, Vec<MajorIsoformRecord>)> = Vec::new();
+    for (circ_index, circ) in cohort_circ_records.iter().enumerate() {
+        let mut candidates = select_cohort_isoform_candidates(
+            circ_index,
+            circ,
+            &cohort_support,
+            &cohort_sample_id,
+            config.annotation,
+        );
+        if candidates.is_empty() {
+            continue;
+        }
+        let candidate_support_by_key =
+            cohort_candidate_assignment_support_by_key(&candidates, &sample_assemblies, &circ.id);
+        candidates.sort_by(|a, b| {
+            let support_b = candidate_support_by_key
+                .get(&major_isoform_structure_key(b))
+                .copied()
+                .unwrap_or(0.0);
+            let support_a = candidate_support_by_key
+                .get(&major_isoform_structure_key(a))
+                .copied()
+                .unwrap_or(0.0);
+            support_b
+                .partial_cmp(&support_a)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| major_isoform_structure_key(a).cmp(&major_isoform_structure_key(b)))
+        });
+        let switching = candidates.len() > 1
+            && cohort_usage_shift_passes(&candidates, &sample_assemblies, &circ.id);
+        let mut selected_records = if switching {
+            candidates
+        } else {
+            candidates.into_iter().take(1).collect()
+        };
+        for (rank, record) in selected_records.iter_mut().enumerate() {
+            major_set_isoform_identity(record, rank + 1);
+            record.sample_id = cohort_sample_id.clone();
+            let total_support = candidate_support_by_key
+                .get(&major_isoform_structure_key(record))
+                .copied()
+                .unwrap_or(0.0);
+            record.path_score = total_support;
+            record.cov = total_support;
+            record.bsj_reads = total_support.round().max(0.0) as usize;
+        }
+        if switching {
+            switching_rows.push((circ.id.clone(), selected_records.clone()));
+        }
+        cohort_isoforms.extend(selected_records);
+    }
+
+    cohort_isoforms.sort_by(|a, b| {
+        a.chr
+            .cmp(&b.chr)
+            .then_with(|| a.start.cmp(&b.start))
+            .then_with(|| a.end.cmp(&b.end))
+            .then_with(|| a.circ_id.cmp(&b.circ_id))
+            .then_with(|| a.isoform_rank.cmp(&b.isoform_rank))
+    });
+    write_major_isoform_gtf(
+        &format!("{}.isoforms.gtf", config.out_prefix),
+        &cohort_isoforms,
+    )?;
+    let fasta_summary = write_major_isoform_fasta(
+        &format!("{}.isoforms.fa", config.out_prefix),
+        &cohort_isoforms,
+        config.reference,
+    )?;
+    write_cohort_usage_matrix(
+        &format!("{}.usage.tsv", config.out_prefix),
+        &sample_ids,
+        &switching_rows,
+        &sample_assemblies,
+    )?;
+
+    Ok(CohortAssembleSummary {
+        samples: sample_ids.len(),
+        circ_rnas: circ_infos.len(),
+        isoforms: cohort_isoforms.len(),
+        switching_circ_rnas: switching_rows.len(),
+        fasta_isoforms: fasta_summary.isoforms,
+    })
 }
 
 /// Summarizes final segment row counts by evidence type.
@@ -9633,8 +9878,219 @@ fn build_major_isoforms_from_segments_file(
     })
 }
 
+/// Loads the matrix fields and circRNA records needed by cohort assembly.
+fn load_major_circ_sample_values(
+    path: &str,
+) -> Result<(Vec<CircRecord>, HashMap<String, MajorCircSampleValue>)> {
+    let file = File::open(path).with_context(|| format!("open circ table {}", path))?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .transpose()?
+        .ok_or_else(|| anyhow!("empty circ table: {}", path))?;
+    let headers: Vec<&str> = header.split('\t').collect();
+    let idx = |name: &str| -> Result<usize> {
+        headers
+            .iter()
+            .position(|h| *h == name)
+            .ok_or_else(|| anyhow!("missing `{}` column in {}", name, path))
+    };
+    let id_idx = idx("circRNA_ID")?;
+    let chr_idx = idx("chr")?;
+    let start_idx = idx("circRNA_start")?;
+    let end_idx = idx("circRNA_end")?;
+    let junc_count_idx = idx("#junction_reads")?;
+    let ratio_idx = idx("junction_reads_ratio")?;
+    let gene_idx = idx("gene_id")?;
+    let strand_idx = idx("strand")?;
+
+    let mut records = Vec::new();
+    let mut values = HashMap::new();
+    for line in lines {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        let get = |i: usize| -> Result<&str> {
+            cols.get(i)
+                .copied()
+                .ok_or_else(|| anyhow!("malformed circ row in {}: {}", path, line))
+        };
+        let circ = CircRecord {
+            id: get(id_idx)?.to_string(),
+            chr: get(chr_idx)?.to_string(),
+            start: get(start_idx)?.parse::<i32>()?,
+            end: get(end_idx)?.parse::<i32>()?,
+            junction_read_count: get(junc_count_idx)?.to_string(),
+            gene_id: get(gene_idx)?.to_string(),
+            strand: get(strand_idx)?.to_string(),
+        };
+        let bsj_reads = get(junc_count_idx)?.parse::<f64>().unwrap_or(0.0);
+        let junction_ratio = get(ratio_idx)?.parse::<f64>().unwrap_or(0.0);
+        values.insert(
+            circ.id.clone(),
+            MajorCircSampleValue {
+                circ: circ.clone(),
+                bsj_reads,
+                junction_ratio,
+            },
+        );
+        records.push(circ);
+    }
+    Ok((records, values))
+}
+
+/// Collects the support maps used by the major-isoform graph builder.
+fn collect_major_isoform_support(
+    circ_records: &[CircRecord],
+    segments_path: &str,
+) -> Result<MajorIsoformSupportBundle> {
+    let circ_by_id: HashMap<&str, usize> = circ_records
+        .iter()
+        .enumerate()
+        .map(|(idx, circ)| (circ.id.as_str(), idx))
+        .collect();
+    let circ_index_by_chr = build_major_circ_index(circ_records);
+    let mut support_bundle = MajorIsoformSupportBundle::default();
+
+    let file =
+        File::open(segments_path).with_context(|| format!("open segments {}", segments_path))?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .transpose()?
+        .ok_or_else(|| anyhow!("empty segments file: {}", segments_path))?;
+    let columns = major_segments_columns(&header, segments_path)?;
+    for line_result in lines {
+        let line = line_result?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').collect();
+        let Some(row) = major_segment_row(&cols, columns) else {
+            continue;
+        };
+        let assignments = assign_major_circs_from_segments(
+            row.type_name,
+            row.circ_id,
+            row.chrom,
+            row.start,
+            row.end,
+            row.r1_segments,
+            row.r2_segments,
+            &circ_by_id,
+            &circ_index_by_chr,
+            circ_records,
+        );
+        for assignment in assignments {
+            let circ_index = assignment.circ_index;
+            let circ = &circ_records[circ_index];
+            let r1_is_chimeric = major_segment_has_reused_overlap(row.r1_segments, circ);
+            let r2_is_chimeric = major_segment_has_reused_overlap(row.r2_segments, circ);
+            let r1_junctions = if r1_is_chimeric {
+                Vec::new()
+            } else {
+                major_segment_junction_chain(row.r1_segments, circ)
+            };
+            let r2_junctions = if r2_is_chimeric {
+                Vec::new()
+            } else {
+                major_segment_junction_chain(row.r2_segments, circ)
+            };
+            let record_spans: HashSet<(i32, i32)> = (!r1_is_chimeric)
+                .then(|| major_contiguous_segment_spans(row.r1_segments, circ))
+                .into_iter()
+                .flatten()
+                .chain(
+                    (!r2_is_chimeric)
+                        .then(|| major_contiguous_segment_spans(row.r2_segments, circ))
+                        .into_iter()
+                        .flatten(),
+                )
+                .collect();
+            let mut record_span_vec: Vec<(i32, i32)> = record_spans.iter().copied().collect();
+            record_span_vec.sort_unstable();
+            for (start, end) in record_span_vec.iter().copied() {
+                let mut span = MajorAlignedSpan {
+                    start,
+                    end,
+                    bsj: 0.0,
+                    backward: 0.0,
+                    outward: 0.0,
+                };
+                match row.type_name {
+                    "bsj" => span.bsj = assignment.weight,
+                    "backward" => span.backward = assignment.weight,
+                    "outward" => span.outward = assignment.weight,
+                    _ => {}
+                }
+                support_bundle
+                    .span_support_by_circ
+                    .entry(circ_index)
+                    .or_default()
+                    .push(span);
+            }
+            let record_edges: HashSet<MajorEdge> = r1_junctions
+                .iter()
+                .chain(r2_junctions.iter())
+                .filter_map(|junction| match junction {
+                    MajorJunction::Edge(edge) => Some(*edge),
+                    MajorJunction::Bsj => None,
+                })
+                .collect();
+            if row.type_name == "bsj" && assignment.weight > 0.0 {
+                support_bundle
+                    .bsj_reads_by_circ
+                    .entry(circ_index)
+                    .or_default()
+                    .push(MajorBsjReadObservation {
+                        read_id: row.read_id.to_string(),
+                        edges: record_edges.clone(),
+                        spans: record_span_vec.clone(),
+                    });
+            }
+            for edge in record_edges {
+                let support = support_bundle
+                    .edge_support_by_circ
+                    .entry(circ_index)
+                    .or_default()
+                    .entry(edge)
+                    .or_default();
+                match row.type_name {
+                    "bsj" => support.bsj += assignment.weight,
+                    "backward" => support.backward += assignment.weight,
+                    "outward" => support.outward += assignment.weight,
+                    _ => {}
+                }
+            }
+            let record_links: HashSet<MajorJunctionLink> =
+                major_adjacent_junction_links(&r1_junctions)
+                    .into_iter()
+                    .chain(major_adjacent_junction_links(&r2_junctions))
+                    .collect();
+            for link in record_links {
+                let support = support_bundle
+                    .link_support_by_circ
+                    .entry(circ_index)
+                    .or_default()
+                    .entry(link)
+                    .or_default();
+                match row.type_name {
+                    "bsj" => support.bsj += assignment.weight,
+                    "backward" => support.backward += assignment.weight,
+                    "outward" => support.outward += assignment.weight,
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(support_bundle)
+}
+
 /// Borrowed view of one `<prefix>.segments` row used by the isoform stage.
 struct MajorSegmentRow<'a> {
+    read_id: &'a str,
     type_name: &'a str,
     circ_id: &'a str,
     chrom: &'a str,
@@ -9654,6 +10110,7 @@ fn major_segments_columns(header: &str, path: &str) -> Result<MajorSegmentsColum
             .ok_or_else(|| anyhow!("missing `{}` column in {}", name, path))
     };
     Ok(MajorSegmentsColumns {
+        read_id: idx("read_id")?,
         type_name: idx("type")?,
         circ_id: idx("circ_id")?,
         chrom: idx("chrom")?,
@@ -9670,6 +10127,7 @@ fn major_segment_row<'a>(
     indexes: MajorSegmentsColumns,
 ) -> Option<MajorSegmentRow<'a>> {
     Some(MajorSegmentRow {
+        read_id: *cols.get(indexes.read_id)?,
         type_name: *cols.get(indexes.type_name)?,
         circ_id: *cols.get(indexes.circ_id)?,
         chrom: *cols.get(indexes.chrom)?,
@@ -11153,7 +11611,603 @@ fn major_sample_id(out_prefix: &str) -> String {
     sample.strip_suffix(".ciri").unwrap_or(sample).to_string()
 }
 
-/// Computes a deterministic FNV-1a hash for multi-sample structure matching.
+/// Returns a structure key for merging sample-major isoforms across a cohort.
+fn major_isoform_structure_key(record: &MajorIsoformRecord) -> MajorIsoformStructureKey {
+    MajorIsoformStructureKey {
+        chr: record.chr.clone(),
+        start: record.start,
+        end: record.end,
+        strand: record.strand,
+        exons: record.exons.clone(),
+    }
+}
+
+/// Returns internal splice edges implied by an exon chain.
+fn major_edges_from_isoform(record: &MajorIsoformRecord) -> Vec<MajorEdge> {
+    record
+        .exons
+        .windows(2)
+        .filter_map(|pair| {
+            let donor_end = pair[0].1;
+            let acceptor_start = pair[1].0;
+            (donor_end < acceptor_start).then_some(MajorEdge {
+                donor_end,
+                acceptor_start,
+                strand: record.strand,
+            })
+        })
+        .collect()
+}
+
+/// Tests whether one read-local contiguous span excludes a candidate splice edge.
+///
+/// The same anchor rule is used by mature classification: a span must cover at
+/// least `MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH` bases on both sides of a
+/// candidate intron before it can be treated as evidence that the intron was not
+/// spliced in this molecule.
+fn major_read_span_excludes_edge(span: (i32, i32), edge: MajorEdge) -> bool {
+    let left_anchor_start = edge.donor_end - MAJOR_EXCLUSIVE_JUNCTION_MIN_ANCHOR + 1;
+    let right_anchor_end = edge.acceptor_start + MAJOR_EXCLUSIVE_JUNCTION_MIN_ANCHOR - 1;
+    span.0 <= left_anchor_start && span.1 >= right_anchor_end
+}
+
+/// Scores compatibility between one BSJ read and one cohort candidate isoform.
+///
+/// A read can only support a candidate when all splice edges it directly
+/// observes are present in the candidate and none of its continuous blocks
+/// confidently spans over a candidate edge. Compatible candidates receive equal
+/// probability for that read; this avoids over-interpreting short BSJ reads that
+/// cannot phase the whole isoform.
+fn major_bsj_read_candidate_score(
+    observation: &MajorBsjReadObservation,
+    candidate_edges: &HashSet<MajorEdge>,
+) -> f64 {
+    if !observation
+        .edges
+        .iter()
+        .all(|edge| candidate_edges.contains(edge))
+    {
+        return 0.0;
+    }
+    if candidate_edges.iter().any(|edge| {
+        observation
+            .spans
+            .iter()
+            .any(|&span| major_read_span_excludes_edge(span, *edge))
+    }) {
+        return 0.0;
+    }
+    1.0
+}
+
+/// Assigns one sample's BSJ reads probabilistically to fixed cohort candidates.
+///
+/// This is deliberately separate from the graph-building support maps. Backward
+/// and outward reads can help discover candidate structures during co-assembly,
+/// but usage and switching estimates only use exact BSJ molecules because those
+/// rows have a trustworthy circRNA identity.
+fn cohort_bsj_assignment_supports(
+    records: &[MajorIsoformRecord],
+    sample: &MajorSampleAssembly,
+    circ_id: &str,
+) -> Vec<f64> {
+    let Some(circ_index) = sample.circ_index_by_id.get(circ_id).copied() else {
+        return vec![0.0; records.len()];
+    };
+    let observations = sample
+        .support
+        .bsj_reads_by_circ
+        .get(&circ_index)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let candidate_edges: Vec<HashSet<MajorEdge>> = records
+        .iter()
+        .map(|record| major_edges_from_isoform(record).into_iter().collect())
+        .collect();
+    let mut supports = vec![0.0; records.len()];
+    for observation in observations {
+        if observation.read_id.is_empty() {
+            continue;
+        }
+        let scores: Vec<f64> = candidate_edges
+            .iter()
+            .map(|edges| major_bsj_read_candidate_score(observation, edges))
+            .collect();
+        let denominator: f64 = scores.iter().sum();
+        if denominator <= 0.0 {
+            continue;
+        }
+        for (support, score) in supports.iter_mut().zip(scores) {
+            *support += score / denominator;
+        }
+    }
+    supports
+}
+
+/// Sums BSJ read-assignment support across samples for cohort candidate ranking.
+fn cohort_candidate_assignment_support_by_key(
+    records: &[MajorIsoformRecord],
+    samples: &[MajorSampleAssembly],
+    circ_id: &str,
+) -> HashMap<MajorIsoformStructureKey, f64> {
+    let mut totals = vec![0.0; records.len()];
+    for sample in samples {
+        for (total, value) in totals
+            .iter_mut()
+            .zip(cohort_bsj_assignment_supports(records, sample, circ_id))
+        {
+            *total += value;
+        }
+    }
+    records
+        .iter()
+        .zip(totals)
+        .map(|(record, total)| (major_isoform_structure_key(record), total))
+        .collect()
+}
+
+/// Returns whether selected high-confidence candidates have a real usage shift.
+///
+/// Cohort switching should not be triggered by small sample-to-sample changes
+/// around a 50/50 split. The candidate set is already restricted to
+/// sample-major structures with enough BSJ support and switching-grade structure;
+/// this final gate requires at least one candidate usage to change by 50
+/// percentage points across eligible samples.
+fn cohort_usage_shift_passes(
+    records: &[MajorIsoformRecord],
+    samples: &[MajorSampleAssembly],
+    circ_id: &str,
+) -> bool {
+    let mut sample_major_keys = HashSet::new();
+    let mut sample_supports = Vec::new();
+    for sample in samples {
+        let bsj_reads = sample
+            .circ_values
+            .get(circ_id)
+            .map(|value| value.bsj_reads)
+            .unwrap_or(0.0);
+        if bsj_reads < COHORT_SWITCHING_MIN_BSJ_READS {
+            continue;
+        }
+        let supports = cohort_bsj_assignment_supports(records, sample, circ_id);
+        let denominator: f64 = supports.iter().sum();
+        if denominator > 0.0 {
+            sample_supports.push(supports);
+        }
+    }
+    records.iter().any(|record| {
+        let Some(record_index) = records.iter().position(|candidate| {
+            major_isoform_structure_key(candidate) == major_isoform_structure_key(record)
+        }) else {
+            return false;
+        };
+        let mut min_usage = f64::INFINITY;
+        let mut max_usage = f64::NEG_INFINITY;
+        for supports in &sample_supports {
+            let denominator: f64 = supports.iter().sum();
+            let usage = supports[record_index] / denominator;
+            min_usage = min_usage.min(usage);
+            max_usage = max_usage.max(usage);
+        }
+        sample_supports.len() >= 2 && max_usage - min_usage >= COHORT_SWITCHING_MIN_USAGE_DELTA
+    }) && samples
+        .iter()
+        .filter_map(|sample| cohort_sample_major_usage_key(records, sample, circ_id))
+        .any(|key| {
+            sample_major_keys.insert(key);
+            sample_major_keys.len() > 1
+        })
+}
+
+/// Returns the unique highest-usage cohort candidate for one eligible sample.
+fn cohort_sample_major_usage_key(
+    records: &[MajorIsoformRecord],
+    sample: &MajorSampleAssembly,
+    circ_id: &str,
+) -> Option<MajorIsoformStructureKey> {
+    let bsj_reads = sample
+        .circ_values
+        .get(circ_id)
+        .map(|value| value.bsj_reads)
+        .unwrap_or(0.0);
+    if bsj_reads < COHORT_SWITCHING_MIN_BSJ_READS {
+        return None;
+    }
+    let supports = cohort_bsj_assignment_supports(records, sample, circ_id);
+    let denominator: f64 = supports.iter().sum();
+    if denominator <= 0.0 {
+        return None;
+    }
+    let mut ranked: Vec<(f64, MajorIsoformStructureKey)> = records
+        .iter()
+        .zip(supports)
+        .map(|(record, support)| (support / denominator, major_isoform_structure_key(record)))
+        .collect();
+    ranked.sort_by(|(usage_a, key_a), (usage_b, key_b)| {
+        usage_b
+            .partial_cmp(usage_a)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| key_a.cmp(key_b))
+    });
+    let (top_usage, top_key) = ranked.first()?.clone();
+    if ranked
+        .get(1)
+        .is_some_and(|(next_usage, _)| (top_usage - *next_usage).abs() < 1e-9)
+    {
+        return None;
+    }
+    Some(top_key)
+}
+
+/// Returns whether a cohort candidate is reliable enough to call switching.
+///
+/// FASTA output only means a sequence is useful to inspect. Switching requires a
+/// stricter structure interpretation: mature phased chains are accepted, and
+/// estimates are accepted only when their uncertainty is limited to
+/// annotation-guided projection, unphased junction chaining, or an ambiguous
+/// long block with enough assignment support. Low-coverage single-exon calls
+/// and unconfident long exons remain audit-only because they do not provide a
+/// stable enough structure for sample-to-sample major isoform switching.
+fn major_isoform_is_switching_eligible(record: &MajorIsoformRecord) -> bool {
+    if record.isoform_origin == "mature" {
+        return true;
+    }
+    if record.isoform_origin != "estimate" {
+        return false;
+    }
+    let reasons: HashSet<&str> = record.estimate_reason.split(',').collect();
+    if reasons.contains("unphased_single_exon_block")
+        || reasons.contains("low_segment_coverage_unannotated_long_exon")
+    {
+        return false;
+    }
+    reasons.contains("gtf_long_block_projection")
+        || reasons.contains("inferred_internal_block")
+        || reasons.contains("unphased_junction_chain")
+}
+
+/// Builds a coordinate-sorted union of circRNAs represented in any sample.
+fn cohort_circ_records(samples: &[MajorSampleAssembly]) -> Vec<CircRecord> {
+    let mut by_id: HashMap<String, CircRecord> = HashMap::new();
+    let mut read_counts: HashMap<String, f64> = HashMap::new();
+    for sample in samples {
+        for value in sample.circ_values.values() {
+            *read_counts.entry(value.circ.id.clone()).or_default() += value.bsj_reads;
+            by_id
+                .entry(value.circ.id.clone())
+                .or_insert_with(|| value.circ.clone());
+        }
+    }
+    let mut rows: Vec<_> = by_id.into_values().collect();
+    for row in &mut rows {
+        if let Some(reads) = read_counts.get(&row.id) {
+            row.junction_read_count = format!("{:.0}", reads);
+        }
+    }
+    rows.sort_by(|a, b| {
+        cohort_chrom_sort_key(&a.chr)
+            .cmp(&cohort_chrom_sort_key(&b.chr))
+            .then_with(|| a.start.cmp(&b.start))
+            .then_with(|| a.end.cmp(&b.end))
+            .then_with(|| a.strand.cmp(&b.strand))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    rows
+}
+
+/// Converts co-assembled circRNA records into matrix row metadata.
+fn cohort_circ_infos_from_records(records: &[CircRecord]) -> Vec<CohortCircInfo> {
+    records
+        .iter()
+        .map(|record| CohortCircInfo {
+            id: record.id.clone(),
+        })
+        .collect()
+}
+
+/// Merges all per-sample structural support into one cohort co-assembly bundle.
+fn cohort_support_bundle(
+    circ_records: &[CircRecord],
+    samples: &[MajorSampleAssembly],
+) -> MajorIsoformSupportBundle {
+    let cohort_index_by_id: HashMap<&str, usize> = circ_records
+        .iter()
+        .enumerate()
+        .map(|(idx, circ)| (circ.id.as_str(), idx))
+        .collect();
+    let mut merged = MajorIsoformSupportBundle::default();
+    for sample in samples {
+        for (circ_id, &sample_idx) in &sample.circ_index_by_id {
+            let Some(cohort_idx) = cohort_index_by_id.get(circ_id.as_str()).copied() else {
+                continue;
+            };
+            merge_major_support_for_circ(&mut merged, cohort_idx, &sample.support, sample_idx);
+        }
+    }
+    merged
+}
+
+/// Adds one sample-local circRNA support map into the cohort support map.
+fn merge_major_support_for_circ(
+    out: &mut MajorIsoformSupportBundle,
+    out_idx: usize,
+    input: &MajorIsoformSupportBundle,
+    input_idx: usize,
+) {
+    if let Some(edges) = input.edge_support_by_circ.get(&input_idx) {
+        let out_edges = out.edge_support_by_circ.entry(out_idx).or_default();
+        for (&edge, support) in edges {
+            let target = out_edges.entry(edge).or_default();
+            target.bsj += support.bsj;
+            target.backward += support.backward;
+            target.outward += support.outward;
+        }
+    }
+    if let Some(links) = input.link_support_by_circ.get(&input_idx) {
+        let out_links = out.link_support_by_circ.entry(out_idx).or_default();
+        for (&link, support) in links {
+            let target = out_links.entry(link).or_default();
+            target.bsj += support.bsj;
+            target.backward += support.backward;
+            target.outward += support.outward;
+        }
+    }
+    if let Some(links) = input.link_exclusion_by_circ.get(&input_idx) {
+        let out_links = out.link_exclusion_by_circ.entry(out_idx).or_default();
+        for (&link, support) in links {
+            let target = out_links.entry(link).or_default();
+            target.bsj += support.bsj;
+            target.backward += support.backward;
+            target.outward += support.outward;
+        }
+    }
+    if let Some(spans) = input.span_support_by_circ.get(&input_idx) {
+        out.span_support_by_circ
+            .entry(out_idx)
+            .or_default()
+            .extend(spans.iter().copied());
+    }
+}
+
+/// Builds high-confidence candidate isoforms from the cohort co-assembly graph.
+fn select_cohort_isoform_candidates(
+    circ_index: usize,
+    circ: &CircRecord,
+    support_bundle: &MajorIsoformSupportBundle,
+    sample_id: &str,
+    annotation: Option<&Annotation>,
+) -> Vec<MajorIsoformRecord> {
+    let empty = HashMap::new();
+    let empty_links = HashMap::new();
+    let empty_exclusions = HashMap::new();
+    let empty_spans = Vec::new();
+    let support = support_bundle
+        .edge_support_by_circ
+        .get(&circ_index)
+        .unwrap_or(&empty);
+    let link_support = support_bundle
+        .link_support_by_circ
+        .get(&circ_index)
+        .unwrap_or(&empty_links);
+    let link_exclusion = support_bundle
+        .link_exclusion_by_circ
+        .get(&circ_index)
+        .unwrap_or(&empty_exclusions);
+    let span_support = support_bundle
+        .span_support_by_circ
+        .get(&circ_index)
+        .unwrap_or(&empty_spans);
+    let mut by_key: HashMap<MajorIsoformStructureKey, MajorIsoformRecord> = HashMap::new();
+    for chain in cohort_candidate_edge_chains(circ, support) {
+        let mut record = major_isoform_from_edges(
+            circ,
+            &chain,
+            support,
+            link_support,
+            link_exclusion,
+            span_support,
+            sample_id,
+            annotation,
+        );
+        major_set_isoform_identity(&mut record, 1);
+        if major_isoform_is_switching_eligible(&record) {
+            by_key
+                .entry(major_isoform_structure_key(&record))
+                .or_insert(record);
+        }
+    }
+    if by_key.is_empty() {
+        let mut fallback = select_major_isoform(
+            circ,
+            support,
+            link_support,
+            link_exclusion,
+            span_support,
+            sample_id,
+            annotation,
+        );
+        major_set_isoform_identity(&mut fallback, 1);
+        by_key.insert(major_isoform_structure_key(&fallback), fallback);
+    }
+    by_key.into_values().collect()
+}
+
+/// Enumerates bounded candidate edge chains from the merged cohort graph.
+fn cohort_candidate_edge_chains(
+    circ: &CircRecord,
+    support: &HashMap<MajorEdge, MajorEdgeSupport>,
+) -> Vec<Vec<MajorEdge>> {
+    let primary = major_union_chain(major_seed_chain(support), major_phase_chain(circ, support));
+    let mut chains = vec![primary];
+    let mut weighted: Vec<(MajorEdge, f64)> = support
+        .iter()
+        .filter_map(|(&edge, counts)| {
+            let weight = major_edge_weight(counts);
+            (weight >= COHORT_MIN_ALT_EDGE_SUPPORT).then_some((edge, weight))
+        })
+        .collect();
+    weighted.sort_by(|(edge_a, score_a), (edge_b, score_b)| {
+        score_b
+            .partial_cmp(score_a)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| edge_a.cmp(edge_b))
+    });
+    for (edge, _score) in weighted.into_iter().take(COHORT_MAX_ALT_EDGE_PROBES) {
+        chains.push(cohort_chain_forced_edge(edge, support));
+    }
+    let mut seen = HashSet::new();
+    chains
+        .into_iter()
+        .map(major_sorted_unique_chain)
+        .filter(|chain| seen.insert(chain.clone()))
+        .collect()
+}
+
+/// Builds a compatible high-support chain around one required alternative edge.
+fn cohort_chain_forced_edge(
+    focal: MajorEdge,
+    support: &HashMap<MajorEdge, MajorEdgeSupport>,
+) -> Vec<MajorEdge> {
+    let mut chain = vec![focal];
+    let mut weighted: Vec<(MajorEdge, f64)> = support
+        .iter()
+        .filter_map(|(&edge, counts)| {
+            let weight = major_edge_weight(counts);
+            (edge != focal && weight > 0.0).then_some((edge, weight))
+        })
+        .collect();
+    weighted.sort_by(|(edge_a, score_a), (edge_b, score_b)| {
+        score_b
+            .partial_cmp(score_a)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| edge_a.cmp(edge_b))
+    });
+    for (edge, _score) in weighted {
+        if chain
+            .iter()
+            .all(|selected| major_edges_compatible(*selected, edge))
+        {
+            chain.push(edge);
+        }
+    }
+    major_sorted_unique_chain(chain)
+}
+
+/// Human-friendly chromosome sort key used by cohort matrix rows.
+fn cohort_chrom_sort_key(chrom: &str) -> (u8, u32, String) {
+    let core = chrom.strip_prefix("chr").unwrap_or(chrom);
+    if let Ok(rank) = core.parse::<u32>() {
+        return (0, rank, String::new());
+    }
+    match core {
+        "X" => (0, 23, String::new()),
+        "Y" => (0, 24, String::new()),
+        "M" | "MT" => (0, 25, String::new()),
+        _ => (1, 0, chrom.to_string()),
+    }
+}
+
+/// Writes a circRNA-by-sample BSJ read-count matrix.
+fn write_cohort_bsj_matrix(
+    path: &str,
+    sample_ids: &[String],
+    circ_infos: &[CohortCircInfo],
+    samples: &[MajorSampleAssembly],
+) -> Result<()> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    write!(writer, "circRNA_id")?;
+    for sample_id in sample_ids {
+        write!(writer, "\t{}", sample_id)?;
+    }
+    writeln!(writer)?;
+    for circ in circ_infos {
+        write!(writer, "{}", circ.id)?;
+        for sample in samples {
+            let value = sample
+                .circ_values
+                .get(&circ.id)
+                .map(|value| value.bsj_reads)
+                .unwrap_or(0.0);
+            write!(writer, "\t{:.0}", value)?;
+        }
+        writeln!(writer)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Writes a circRNA-by-sample junction-read-ratio matrix.
+fn write_cohort_ratio_matrix(
+    path: &str,
+    sample_ids: &[String],
+    circ_infos: &[CohortCircInfo],
+    samples: &[MajorSampleAssembly],
+) -> Result<()> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    write!(writer, "circRNA_id")?;
+    for sample_id in sample_ids {
+        write!(writer, "\t{}", sample_id)?;
+    }
+    writeln!(writer)?;
+    for circ in circ_infos {
+        write!(writer, "{}", circ.id)?;
+        for sample in samples {
+            let value = sample
+                .circ_values
+                .get(&circ.id)
+                .map(|value| value.junction_ratio)
+                .unwrap_or(0.0);
+            write!(writer, "\t{:.6}", value)?;
+        }
+        writeln!(writer)?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Writes isoform usage only for circRNAs with major isoform switching.
+fn write_cohort_usage_matrix(
+    path: &str,
+    sample_ids: &[String],
+    switching_rows: &[(String, Vec<MajorIsoformRecord>)],
+    samples: &[MajorSampleAssembly],
+) -> Result<()> {
+    let mut writer = BufWriter::new(File::create(path)?);
+    write!(writer, "isoform_id")?;
+    for sample_id in sample_ids {
+        write!(writer, "\t{}", sample_id)?;
+    }
+    writeln!(writer)?;
+    for (circ_id, records) in switching_rows {
+        let sample_supports: Vec<Vec<f64>> = samples
+            .iter()
+            .map(|sample| cohort_bsj_assignment_supports(records, sample, circ_id))
+            .collect();
+        for record in records {
+            write!(writer, "{}", record.isoform_id)?;
+            let record_index = records
+                .iter()
+                .position(|candidate| {
+                    major_isoform_structure_key(candidate) == major_isoform_structure_key(record)
+                })
+                .unwrap_or(0);
+            for supports in &sample_supports {
+                let numerator = supports.get(record_index).copied().unwrap_or(0.0);
+                let denominator: f64 = supports.iter().sum();
+                let usage = if denominator > 0.0 {
+                    numerator / denominator
+                } else {
+                    0.0
+                };
+                write!(writer, "\t{:.6}", usage)?;
+            }
+            writeln!(writer)?;
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 /// Writes major isoforms as a GTF sidecar with structure audit metadata.
 ///
 /// The numeric support values live in ordered attributes rather than the GTF
@@ -12242,6 +13296,261 @@ mod tests {
         let _ = std::fs::remove_file(&segments_path);
         let _ = std::fs::remove_file(format!("{}.isoforms.gtf", out_prefix));
         let _ = std::fs::remove_file(format!("{}.isoforms.fa", out_prefix));
+    }
+
+    #[test]
+    fn cohort_assembly_reports_switching_major_isoforms() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ciri_cohort_assemble_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let s1_prefix = tmp_dir.join("sample1").to_string_lossy().to_string();
+        let s2_prefix = tmp_dir.join("sample2").to_string_lossy().to_string();
+        let out_prefix = tmp_dir.join("merged").to_string_lossy().to_string();
+        let out_header = "circRNA_ID\tchr\tcircRNA_start\tcircRNA_end\t#junction_reads\tSM_MS_SMS\t#non_junction_reads\tjunction_reads_ratio\tcircRNA_type\tgene_id\tstrand\tjunction_reads_ID\tScore\n";
+        std::fs::write(
+            format!("{}.out", s1_prefix),
+            format!(
+                "{}chrT:100|300\tchrT\t100\t300\t5\t5_0_0\t0\t0.80\texon\tgeneT\t+\ts1r1,s1r2,s1r3,s1r4,s1r5\t5\n",
+                out_header
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            format!("{}.out", s2_prefix),
+            format!(
+                "{}chrT:100|300\tchrT\t100\t300\t5\t5_0_0\t0\t0.70\texon\tgeneT\t+\ts2r1,s2r2,s2r3,s2r4,s2r5\t5\n",
+                out_header
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            format!("{}.segments", s1_prefix),
+            concat!(
+                "read_id\ttype\tcirc_id\tchrom\tstart\tend\tstrand\tis_circular\tis_r1_bsj\tis_r2_bsj\tr1_align_strand\tr2_align_strand\tr1_cigar\tr1_segments\tr2_cigar\tr2_segments\n",
+                "s1r1\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M49N21M\t280-300:+|<bsj>|100-150:+|200-220:+\tNA\tNA\n",
+                "s1r2\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t31M49N101M\t120-150:+|200-300:+|<bsj>|100-110:+\tNA\tNA\n",
+                "s1r3\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M49N21M\t280-300:+|<bsj>|100-150:+|200-220:+\tNA\tNA\n",
+                "s1r4\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t31M49N101M\t120-150:+|200-300:+|<bsj>|100-110:+\tNA\tNA\n",
+                "s1r5\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t31M49N101M\t120-150:+|200-300:+|<bsj>|100-110:+\tNA\tNA\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            format!("{}.segments", s2_prefix),
+            concat!(
+                "read_id\ttype\tcirc_id\tchrom\tstart\tend\tstrand\tis_circular\tis_r1_bsj\tis_r2_bsj\tr1_align_strand\tr2_align_strand\tr1_cigar\tr1_segments\tr2_cigar\tr2_segments\n",
+                "s2r1\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M69N21M\t280-300:+|<bsj>|100-170:+|240-260:+\tNA\tNA\n",
+                "s2r2\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t51M69N101M\t120-170:+|240-300:+|<bsj>|100-110:+\tNA\tNA\n",
+                "s2r3\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M69N21M\t280-300:+|<bsj>|100-170:+|240-260:+\tNA\tNA\n",
+                "s2r4\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t51M69N101M\t120-170:+|240-300:+|<bsj>|100-110:+\tNA\tNA\n",
+                "s2r5\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t51M69N101M\t120-170:+|240-300:+|<bsj>|100-110:+\tNA\tNA\n",
+            ),
+        )
+        .unwrap();
+        let mut reference = HashMap::new();
+        reference.insert("chrT".to_string(), "ACGT".repeat(100));
+
+        let summary = run_ciri_assemble(CohortAssembleConfig {
+            samples: vec![
+                CohortSampleInput {
+                    sample_id: "sample1".to_string(),
+                    prefix: s1_prefix.clone(),
+                },
+                CohortSampleInput {
+                    sample_id: "sample2".to_string(),
+                    prefix: s2_prefix.clone(),
+                },
+            ],
+            out_prefix: &out_prefix,
+            reference: &reference,
+            annotation: None,
+        })
+        .unwrap();
+
+        assert_eq!(summary.samples, 2);
+        assert_eq!(summary.circ_rnas, 1);
+        assert_eq!(summary.switching_circ_rnas, 1);
+        assert_eq!(summary.isoforms, 2);
+        let bsj_matrix = std::fs::read_to_string(format!("{}.bsj.tsv", out_prefix)).unwrap();
+        assert!(bsj_matrix.contains("circRNA_id\tsample1\tsample2\n"));
+        assert!(bsj_matrix.contains("chrT:100|300\t5\t5\n"));
+        let ratio_matrix = std::fs::read_to_string(format!("{}.ratio.tsv", out_prefix)).unwrap();
+        assert!(ratio_matrix.contains("chrT:100|300\t0.800000\t0.700000\n"));
+        let usage_matrix = std::fs::read_to_string(format!("{}.usage.tsv", out_prefix)).unwrap();
+        assert!(usage_matrix.contains("isoform_id\tsample1\tsample2\n"));
+        assert!(usage_matrix.contains("chrT:100|300.iso1"));
+        assert!(usage_matrix.contains("chrT:100|300.iso2"));
+        let gtf = std::fs::read_to_string(format!("{}.isoforms.gtf", out_prefix)).unwrap();
+        assert!(gtf.contains("transcript_id \"chrT:100|300.iso1\";"));
+        assert!(gtf.contains("transcript_id \"chrT:100|300.iso2\";"));
+
+        let _ = std::fs::remove_file(format!("{}.out", s1_prefix));
+        let _ = std::fs::remove_file(format!("{}.segments", s1_prefix));
+        let _ = std::fs::remove_file(format!("{}.out", s2_prefix));
+        let _ = std::fs::remove_file(format!("{}.segments", s2_prefix));
+        let _ = std::fs::remove_file(format!("{}.bsj.tsv", out_prefix));
+        let _ = std::fs::remove_file(format!("{}.ratio.tsv", out_prefix));
+        let _ = std::fs::remove_file(format!("{}.usage.tsv", out_prefix));
+        let _ = std::fs::remove_file(format!("{}.isoforms.gtf", out_prefix));
+        let _ = std::fs::remove_file(format!("{}.isoforms.fa", out_prefix));
+        let _ = std::fs::remove_dir(&tmp_dir);
+    }
+
+    #[test]
+    fn cohort_switching_requires_large_usage_shift() {
+        let circ = CircRecord {
+            id: "chrT:100|300".to_string(),
+            chr: "chrT".to_string(),
+            start: 100,
+            end: 300,
+            junction_read_count: "11".to_string(),
+            gene_id: "geneT".to_string(),
+            strand: "+".to_string(),
+        };
+        let iso_a = test_major_isoform("chrT:100|300", &[(100, 150), (200, 300)]);
+        let iso_b = test_major_isoform("chrT:100|300", &[(100, 170), (240, 300)]);
+        let weak_shift_samples = vec![
+            test_major_sample("sample1", &circ, iso_a.clone(), 6.0, 5.0),
+            test_major_sample("sample2", &circ, iso_b.clone(), 5.0, 6.0),
+        ];
+        let records = vec![iso_a.clone(), iso_b.clone()];
+        assert!(!cohort_usage_shift_passes(
+            &records,
+            &weak_shift_samples,
+            "chrT:100|300"
+        ));
+
+        let strong_shift_samples = vec![
+            test_major_sample("sample1", &circ, iso_a.clone(), 9.0, 3.0),
+            test_major_sample("sample2", &circ, iso_b.clone(), 3.0, 9.0),
+        ];
+        assert!(cohort_usage_shift_passes(
+            &records,
+            &strong_shift_samples,
+            "chrT:100|300"
+        ));
+
+        let tied_major_samples = vec![
+            test_major_sample("sample1", &circ, iso_a.clone(), 10.0, 0.0),
+            test_major_sample("sample2", &circ, iso_b.clone(), 5.0, 5.0),
+        ];
+        assert!(!cohort_usage_shift_passes(
+            &records,
+            &tied_major_samples,
+            "chrT:100|300"
+        ));
+
+        assert!(major_isoform_is_switching_eligible(&iso_a));
+        let mut annotation_guided = iso_a.clone();
+        annotation_guided.isoform_origin = "estimate".to_string();
+        annotation_guided.estimate_reason =
+            "gtf_long_block_projection,unphased_junction_chain".to_string();
+        assert!(major_isoform_is_switching_eligible(&annotation_guided));
+
+        let mut ambiguous = annotation_guided.clone();
+        ambiguous.estimate_reason =
+            "gtf_long_block_projection,unphased_junction_chain,unresolved_long_block".to_string();
+        assert!(major_isoform_is_switching_eligible(&ambiguous));
+
+        let mut low_coverage_exon = annotation_guided.clone();
+        low_coverage_exon.estimate_reason = "unphased_single_exon_block".to_string();
+        assert!(!major_isoform_is_switching_eligible(&low_coverage_exon));
+
+        let mut unconfident_long = annotation_guided.clone();
+        unconfident_long.estimate_reason =
+            "unphased_junction_chain,low_segment_coverage_unannotated_long_exon".to_string();
+        assert!(!major_isoform_is_switching_eligible(&unconfident_long));
+    }
+
+    fn test_major_isoform(circ_id: &str, exons: &[(i32, i32)]) -> MajorIsoformRecord {
+        MajorIsoformRecord {
+            circ_id: circ_id.to_string(),
+            isoform_id: format!("{}.iso1", circ_id),
+            sample_id: "sample".to_string(),
+            chr: "chrT".to_string(),
+            start: 100,
+            end: 300,
+            strand: '+',
+            source_gene_id: "geneT".to_string(),
+            exons: exons.to_vec(),
+            cov: 10.0,
+            segment_coverage_pct: 100.0,
+            path_score: 10.0,
+            bsj_reads: 10,
+            isoform_len: exons.iter().map(|(start, end)| end - start + 1).sum(),
+            isoform_rank: 1,
+            isoform_class: "major".to_string(),
+            isoform_origin: "mature".to_string(),
+            estimate_reason: "none".to_string(),
+        }
+    }
+
+    fn test_major_sample(
+        sample_id: &str,
+        circ: &CircRecord,
+        _major: MajorIsoformRecord,
+        support_a: f64,
+        support_b: f64,
+    ) -> MajorSampleAssembly {
+        let edge_a = MajorEdge {
+            donor_end: 150,
+            acceptor_start: 200,
+            strand: '+',
+        };
+        let edge_b = MajorEdge {
+            donor_end: 170,
+            acceptor_start: 240,
+            strand: '+',
+        };
+        let mut edge_support = HashMap::new();
+        edge_support.insert(
+            edge_a,
+            MajorEdgeSupport {
+                bsj: support_a,
+                backward: 0.0,
+                outward: 0.0,
+            },
+        );
+        edge_support.insert(
+            edge_b,
+            MajorEdgeSupport {
+                bsj: support_b,
+                backward: 0.0,
+                outward: 0.0,
+            },
+        );
+        let mut bsj_observations = Vec::new();
+        for idx in 0..support_a.round().max(0.0) as usize {
+            bsj_observations.push(MajorBsjReadObservation {
+                read_id: format!("{}_a_{}", sample_id, idx),
+                edges: HashSet::from([edge_a]),
+                spans: Vec::new(),
+            });
+        }
+        for idx in 0..support_b.round().max(0.0) as usize {
+            bsj_observations.push(MajorBsjReadObservation {
+                read_id: format!("{}_b_{}", sample_id, idx),
+                edges: HashSet::from([edge_b]),
+                spans: Vec::new(),
+            });
+        }
+        MajorSampleAssembly {
+            sample_id: sample_id.to_string(),
+            circ_index_by_id: HashMap::from([(circ.id.clone(), 0)]),
+            circ_values: HashMap::from([(
+                circ.id.clone(),
+                MajorCircSampleValue {
+                    circ: circ.clone(),
+                    bsj_reads: support_a + support_b,
+                    junction_ratio: 1.0,
+                },
+            )]),
+            support: MajorIsoformSupportBundle {
+                edge_support_by_circ: HashMap::from([(0, edge_support)]),
+                bsj_reads_by_circ: HashMap::from([(0, bsj_observations)]),
+                ..Default::default()
+            },
+        }
     }
 
     #[test]

@@ -40,6 +40,7 @@ cargo run --bin ciri-simulator -- \
 ```text
 --chrom                   可选染色体过滤；默认不限制
 --circ-count              模拟 circRNA 数量，默认 100
+--switching-event         两样本模式下 major isoform switching event 目标数量，默认 0
 --circ-coverage           circRNA coverage 均值，默认 10
 --linear-coverage         线性 transcript 背景 coverage 均值，默认 0.1
 --scale                   coverage Gaussian 相对标准差，默认 0.5；设为 0 时固定使用均值
@@ -143,6 +144,57 @@ BSJ feature: <junction_spanning_mate_count> reads / <bsj_read_pair_count> read p
 ```
 
 这里 `Total/circRNA/linear` 的计数口径是 paired-end read pair；`BSJ feature` 的第一个数字是 individual mate 级别，只统计真正跨过 circular boundary 的 R1/R2，第二个数字是至少一个 mate 跨过 BSJ 的 read pair 数。来自 circRNA 的普通 read pair 不会自动计为 BSJ feature。
+
+### 3.1 两样本 isoform switching fixture
+
+`-o` 支持一个或两个输出 prefix。一个 prefix 时保持单样本行为不变；两个 prefix
+时进入 matched two-sample 模式：
+
+```bash
+ciri-simulator \
+  -r ref.fa \
+  -a annotation.gtf \
+  -o sample1 sample2 \
+  --circ-count 1000 \
+  --circ-coverage 100 \
+  --linear-coverage 10 \
+  --switching-event 200
+```
+
+两样本模式只构建一次共享 circRNA / isoform catalog，然后分别为每个样本抽取
+reads。这样 `sample1` 和 `sample2` 的 circRNA 边界与 isoform 结构完全一致，
+差异只来自每个样本的 read sampling 和 isoform usage profile。前
+`--switching-event` 个 two-isoform circRNA 会被设置为 truth major switching：
+
+- sample1: `isoform1` 为 major，`isoform2` 为 minor；
+- sample2: `isoform2` 为 major，`isoform1` 为 minor；
+- 非 switching circRNA 在所有样本中保持同一个 major isoform。
+
+`--switching-event` 是目标数量，不是硬错误条件。如果实际可用的 two-isoform
+circRNA 少于目标值，模拟器使用所有可用 two-isoform circRNA 作为 switching
+truth，不报错。
+
+每个样本仍输出单样本正式文件：
+
+```text
+<sample_prefix>_1.fq.gz
+<sample_prefix>_2.fq.gz
+<sample_prefix>.annotation.gtf
+<sample_prefix>.isoforms.tsv
+<sample_prefix>.reads.tsv
+<sample_prefix>.usage.tsv
+```
+
+其中 `.usage.tsv` 是该样本的 isoform usage truth：
+
+```text
+circ_id	chrom	start	end	strand	isoform_id	usage	read_cnt	bsj_read_cnt
+```
+
+`usage` 使用该样本中对应 circRNA 的 circular read pairs 作为分母，`read_cnt`
+和 `bsj_read_cnt` 保留实际抽样后的 isoform read count。模拟器不单独输出
+switching event table；后续评估应读取多个样本的 `.usage.tsv`，根据同一 circRNA
+下 major isoform 是否变化以及 usage shift 是否足够大来计算 switching events。
 
 ## 4. `<prefix>.isoforms.tsv`
 

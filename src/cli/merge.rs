@@ -1,8 +1,8 @@
-//! CLI implementation for `ciri-merge` cohort BSJ catalog construction.
+//! CLI implementation for `ciri-merge` shared BSJ catalog construction.
 //!
 //! The command is intentionally narrower than the main `ciri` pipeline: it
 //! consumes only completed first-pass `.out` files and writes a deterministic
-//! BED6 cohort circRNA catalog. It does not read `.segments` or original
+//! BED6 shared circRNA catalog. It does not read `.segments` or original
 //! BAM/SAM files, so the output can be used as the external `--circ` catalog
 //! for a later sample-specific second pass.
 
@@ -39,7 +39,7 @@ struct MergeSample {
     out_path: String,
 }
 
-/// Cohort-level grouping key for one circRNA/BSJ boundary.
+/// Multi-sample grouping key for one circRNA/BSJ boundary.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 struct CircKey {
     chrom: String,
@@ -71,14 +71,14 @@ impl PartialOrd for ChromSortKey {
     }
 }
 
-/// Per-sample evidence contributing to one cohort circRNA boundary.
+/// Per-sample evidence contributing to one shared circRNA boundary.
 #[derive(Debug, Clone)]
 struct SampleCircSupport {
     source_circ_id: String,
     junction_reads: i64,
 }
 
-/// Aggregated cohort support for one [`CircKey`].
+/// Aggregated multi-sample support for one [`CircKey`].
 #[derive(Debug, Default)]
 struct CohortCircSupport {
     by_sample: BTreeMap<String, SampleCircSupport>,
@@ -104,7 +104,7 @@ pub fn main() -> Result<()> {
     Ok(())
 }
 
-/// Runs cohort circRNA catalog construction from first-pass `.out` files.
+/// Runs shared circRNA catalog construction from first-pass `.out` files.
 ///
 /// This function keeps only one compact support record per `(sample, circRNA
 /// boundary)` in memory. It is therefore bounded by the number of detected
@@ -182,7 +182,7 @@ struct OutReadSummary {
     total_bsj_reads: i64,
 }
 
-/// Streams one CIRI `.out` file into the cohort support map.
+/// Streams one CIRI `.out` file into the shared support map.
 fn read_out_file(
     sample: &MergeSample,
     cohort: &mut HashMap<CircKey, CohortCircSupport>,
@@ -256,7 +256,7 @@ fn read_out_file(
     Ok(summary)
 }
 
-/// Normalizes missing or unknown CIRI strand labels for stable cohort keys.
+/// Normalizes missing or unknown CIRI strand labels for stable shared keys.
 fn normalize_strand(strand: &str) -> String {
     match strand {
         "+" | "-" => strand.to_string(),
@@ -264,7 +264,7 @@ fn normalize_strand(strand: &str) -> String {
     }
 }
 
-/// Writes the BED6 cohort circRNA catalog used by the future `--circ` second pass.
+/// Writes the BED6 shared circRNA catalog used by the future `--circ` second pass.
 ///
 /// The first six columns follow BED6 conventions with 0-based half-open
 /// coordinates. The score uses capped total BSJ support so the file remains
@@ -293,12 +293,12 @@ fn bed_score(total_bsj_reads: i64) -> i64 {
     total_bsj_reads.clamp(0, 1000)
 }
 
-/// Returns the stable cohort circRNA identifier for one merged BSJ boundary.
+/// Returns the stable shared circRNA identifier for one merged BSJ boundary.
 fn cohort_circ_id(key: &CircKey) -> String {
     format!("{}:{}|{}:{}", key.chrom, key.start, key.end, key.strand)
 }
 
-/// Sums BSJ read support across samples for one cohort circRNA.
+/// Sums BSJ read support across samples for one shared circRNA.
 fn total_bsj_reads(support: &CohortCircSupport) -> i64 {
     support
         .by_sample
@@ -307,7 +307,7 @@ fn total_bsj_reads(support: &CohortCircSupport) -> i64 {
         .sum()
 }
 
-/// Compares cohort circRNA keys in coordinate order.
+/// Compares shared circRNA keys in coordinate order.
 fn compare_circ_keys(left: &CircKey, right: &CircKey) -> Ordering {
     chrom_sort_key(&left.chrom)
         .cmp(&chrom_sort_key(&right.chrom))

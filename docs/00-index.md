@@ -21,9 +21,9 @@
 6. `05-ro-feature-plan.md`
    - RO feature 和后续 side evidence 方向的历史设计；当前不作为活跃开发路线。
 7. `06-simulation-truth-design.md`
-   - 独立 Rust 模拟器、结构化 truth 表、circ/isoform fixture 生成和后续结构验证口径。
+   - 独立 Rust 模拟器、结构化 truth 表、circ/isoform fixture 生成、两样本 `--switching-event` truth fixture 和后续结构验证口径。
 8. `07-full-length-reconstruction.md`
-   - 默认 `<prefix>.segments` 后处理设计，包含 BSJ/backward/outward read-level chain、内部 junction 校正、major isoform GTF/FASTA sidecar、chr1 FASTA 准确率口径、IGV visualization sidecar 规划，以及后续 `--1st-pass` / `ciri-merge` / `--2nd-pass --circ` / `ciri-assemble` 的 two-pass multi-sample integration 入口。
+   - 默认 `<prefix>.segments` 后处理设计，包含 BSJ/backward/outward read-level chain、内部 junction 校正、major isoform GTF/FASTA sidecar、chr1 FASTA 准确率口径、IGV visualization sidecar 规划，以及已落地的 `--1st-pass` / `ciri-merge` / `--2nd-pass --circ` / `ciri-assemble` two-pass multi-sample integration 入口。
 9. `CIRI-AS.md`
    - CIRI-AS 上游脚本功能拆解；当前作为历史参考和 segments 边界解释背景，不作为完整 parity 目标，并记录 annotation-aware motif/offset 等有意偏离 Perl 的规则。
 10. `CIRI-full.md`
