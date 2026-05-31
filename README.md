@@ -9,12 +9,11 @@ Benchmark dataset: ~80 GB BAM file (~300 GB SAM).
 | Tool / workflow | Output scope | Runtime |
 |---|---|---:|
 | CIRI3 | BSJ detection | ~80 min |
-| CIRI-toolkit | BSJ detection | ~6 min |
-| CIRI-toolkit | BSJ detection + isoform reconstruction | <20 min |
+| CIRI-toolkit | BSJ detection + isoform reconstruction | ~11.5 min |
 
 ## Prerequisites
 
-- Rust >= 1.85.0, if building from source
+- Rust >= 1.85.0 if building from source
 - GCC >= 5
 - `pigz` or `gzip`
 - `samtools` in `PATH`, or set `SAMTOOLS=/path/to/samtools`
@@ -36,7 +35,7 @@ cargo build --release
 
 ```bash
 # Step 1. Align reads with BWA-MEM and write a BAM file.
-# BAM must not be coordinate sorted
+# NOTE: BAM must **NOT** be coordinate-sorted.
 bwa mem -t <threads> -T 19 <bwa_index> <R1.fastq.gz> <R2.fastq.gz> \
   | samtools view -bS -@ <threads> -o <bam_file> -
 
@@ -73,8 +72,8 @@ Optional arguments:
 
 Advanced arguments:
   --circ <BED6>                   External BED6 circRNA catalog from `ciri-merge`
-  --1st-pass                      Only output `<prefix>.out` for 1st pass BSJ detection
-  --2nd-pass                      Only output `<prefix>.segments` for 2nd-pass segments detection
+  --1st-pass                      Output only `<prefix>.out` for first-pass BSJ detection
+  --2nd-pass                      Output only `<prefix>.segments` for second-pass segment detection
 
 Debugging arguments:
   --trace <READS>                 Comma-separated read IDs to trace in Scan1/Scan2
@@ -141,26 +140,26 @@ Recommended filtering criteria:
 
 ## Multi-sample integration
 
-For multi-sample integrative analysis, `ciri` provides a two pass
+For multi-sample integrated analysis, `ciri` provides a two-pass
 workflow:
 
 ```bash
-# Run 1st pass: BSJ detection
-ciri -i sample1.bam -o sample1_1st_pass -r ref.fa -a annotation.gtf -s 0  --1st-pass
+# Run the first pass: BSJ detection
+ciri -i sample1.bam -o sample1_1st_pass -r ref.fa -a annotation.gtf -s 0 --1st-pass
 ciri -i sample2.bam -o sample2_1st_pass -r ref.fa -a annotation.gtf -s 0 --1st-pass
 
-# Merge detection BSJ sites
+# Merge detected BSJ sites
 ciri-merge -i sample1_1st_pass.out sample2_1st_pass.out -o 1st_pass.bed
 
-# Run 2nd pass: segments detection
+# Run the second pass: segment detection
 ciri -i sample1.bam -o sample1_2nd_pass -r ref.fa -a annotation.gtf --circ 1st_pass.bed -s 0 --2nd-pass
 ciri -i sample2.bam -o sample2_2nd_pass -r ref.fa -a annotation.gtf --circ 1st_pass.bed -s 0 --2nd-pass
 
-# Prepare sample list
+# Prepare the sample list
 printf "sample1\tsample1_2nd_pass\n" > sample_list.tsv
 printf "sample2\tsample2_2nd_pass\n" >> sample_list.tsv
 
-# Integrative assembly of circRNA isoforms
+# Integrated assembly of circRNA isoforms
 ciri-assemble -i sample_list.tsv -o merged -r ref.fa -a annotation.gtf
 ```
 
@@ -169,7 +168,7 @@ structures and sequences. Isoform reconstruction and multi-sample assembly curre
 run serially; this stage is fast on current validation datasets, and parallel
 execution will be revisited when larger multi-sample datasets require it.
 
-## Generate a simulation dataset with `ciri-simulator`
+## Generate simulation datasets with `ciri-simulator`
 
 CIRI-toolkit also includes `ciri-simulator`, which generates paired-end circRNA reads and structured truth tables from a reference genome and annotation.
 
@@ -209,7 +208,4 @@ ciri-simulator \
 
 The simulator writes the normal per-sample FASTQ/truth files for each prefix.
 It also writes `<sample1>.usage.tsv` and `<sample2>.usage.tsv` with per-sample
-isoform usage truth. Major isoform switching events can be derived later by
-comparing usage across samples. If fewer two-isoform circRNAs are available than
-the requested `--switching-event`, the simulator uses all available two-isoform
-circRNAs instead of failing.
+isoform usage truth.

@@ -2,6 +2,20 @@
 name = "ciri-toolkit"
 version = "0.2.1"
 edition = "2021"
+rust-version = "1.85"
+description = "High-performance circRNA detection and isoform reconstruction toolkit"
+license = "GPL-2.0-or-later"
+repository = "https://bioinfo.ioz.ac.cn/git/zhangjy/CIRI-toolkit"
+homepage = "https://bioinfo.ioz.ac.cn/git/zhangjy/CIRI-toolkit"
+readme = "README.md"
+keywords = ["circrna", "rna-seq", "bioinformatics", "ciri"]
+categories = ["command-line-utilities", "science"]
+include = [
+    "/Cargo.lock",
+    "/Cargo.toml",
+    "/README.md",
+    "/src/**",
+]
 autobins = false
 default-run = "ciri"
 
