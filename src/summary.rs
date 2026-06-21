@@ -29,10 +29,13 @@ pub struct Summary {
 
 /// One sortable final-result row for a chromosome.
 ///
-/// Results are grouped by chromosome and then sorted by start coordinate to
-/// preserve the stable output order expected by existing comparisons.
+/// Results are grouped by chromosome and then sorted by full circRNA identity.
+/// The extra tie-breakers keep byte-level output reproducible when multiple
+/// retained circRNAs share a start coordinate.
 struct CircSortItem {
     start_site: i32,
+    end_site: i32,
+    circ_id: String,
     line: String,
 }
 
@@ -666,13 +669,14 @@ impl Summary {
                 0.0
             };
             let start = p_key[1].parse::<i32>().unwrap_or(0);
-            let (circ_type, gene_id) =
-                Self::annotate_circ(annotation, p_key[0], start, p_key[2].parse().unwrap_or(0));
+            let end = p_key[2].parse::<i32>().unwrap_or(0);
+            let (circ_type, gene_id) = Self::annotate_circ(annotation, p_key[0], start, end);
             let mut ids: Vec<String> = circ_id_set3.into_iter().collect();
             ids.sort();
             for id in &ids {
                 final_read_ids.insert(id.clone());
             }
+            let circ_id = format!("{}:{}|{}", p_key[0], p_key[1], p_key[2]);
             let line = format!(
                 "{}:{}|{}\t{}\t{}\t{}\t{}\t{}_{}_{}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}",
                 p_key[0],
@@ -698,6 +702,8 @@ impl Summary {
                 .or_default()
                 .push(CircSortItem {
                     start_site: start,
+                    end_site: end,
+                    circ_id,
                     line,
                 });
         }
@@ -709,7 +715,12 @@ impl Summary {
         chrs.sort_by(|a, b| Self::compare_chr_names(a, b));
         for chr in chrs {
             let items = final_results.get_mut(&chr).expect("chromosome key exists");
-            items.sort_by_key(|x| x.start_site);
+            items.sort_by(|a, b| {
+                a.start_site
+                    .cmp(&b.start_site)
+                    .then_with(|| a.end_site.cmp(&b.end_site))
+                    .then_with(|| a.circ_id.cmp(&b.circ_id))
+            });
             for item in items {
                 writeln!(writer, "{}", item.line)?;
                 self.circ_count += 1;

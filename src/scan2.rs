@@ -12,8 +12,8 @@ use crate::runtime::{
 };
 use crate::utils::{
     alignment_short_cs, bam_shard_count, bsj_is_summary_priority, bsj_payload_start,
-    clip_sequence_payload, local_clip_evidence_lines, part_path, reverse_complement,
-    AlignmentRecord,
+    cigar_is_full_match, clip_sequence_payload, local_clip_evidence_lines, parse_cigar_ops_basic,
+    part_path, reverse_complement, AlignmentRecord,
 };
 use anyhow::{bail, Result};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -31,17 +31,41 @@ use noodles::sam::{
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
 const NON_BSJ_SEGMENT_MAPQ_THRES: i32 = 5;
 const NON_BSJ_SEGMENT_MAX_SPAN: i32 = 200000;
+const NON_BSJ_OUTWARD_MIN_TERMINAL_CLIP: i32 = 19;
+const NON_BSJ_OUTWARD_MIN_PAIR_OFFSET: i32 = 19;
+const NON_BSJ_OUTWARD_RETENTION_ENV: &str = "CIRI_SCAN2_NON_BSJ_OUTWARD_RETENTION";
+const STRONG_FSJ_ENV: &str = "CIRI_SCAN2_STRONG_FSJ";
+const STRONG_FSJ_MIN_ANCHOR: i32 = 19;
+const DIRECT_SIDE_FSJ_ANCHOR_ENV: &str = "CIRI_SCAN2_DIRECT_SIDE_FSJ_ANCHOR";
+const DIRECT_SIDE_FSJ_RESCUE_ANCHOR_ENV: &str = "CIRI_SCAN2_DIRECT_SIDE_FSJ_RESCUE_ANCHOR";
+const DIRECT_SIDE_FSJ_SPLICE_TOLERANCE: i32 = 6;
+const FSJ_PAIR_DUMP_ENV: &str = "CIRI_SCAN2_FSJ_PAIR_DUMP";
+
+/// Outward-retention modes for the non-BSJ sidecar prefilter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NonBsjOutwardRetention {
+    /// Keep the legacy primary-pair-only spill policy.
+    PrimaryOnly,
+    /// Also allow high-MAPQ supplementary pairs to trigger sidecar retention.
+    Supplementary,
+    /// Also allow one low-MAPQ mate when the opposite mate has usable MAPQ.
+    Relaxed,
+    /// Allow high-MAPQ primary/supplementary pairs for stricter precision testing.
+    Filtered,
+}
 
 /// Core logic for the second scan pass.
 pub struct Scan2 {
@@ -97,6 +121,355 @@ fn xa_payload(raw: &str) -> &str {
         "*"
     } else {
         raw
+    }
+}
+
+/// Returns the 1-based mate bucket encoded by a SAM flag.
+fn mate_bucket_from_flag(flag: i32) -> i32 {
+    if flag & 0x40 != 0 {
+        1
+    } else if flag & 0x80 != 0 {
+        2
+    } else {
+        0
+    }
+}
+
+/// Returns whether Scan2 should require strong side anchors for FSJ counting.
+///
+/// The switch is cached because the check sits on the Scan2 hot path. Leaving
+/// it unset preserves Java-compatible span-based FSJ counts.
+fn strong_fsj_filter_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        env::var(STRONG_FSJ_ENV)
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+            .unwrap_or(false)
+    })
+}
+
+/// Returns the optional direct side-spanning FSJ anchor threshold.
+///
+/// This is an experimental minibwa evaluation mode. When set, Scan2 replaces
+/// Java's broad span-based FSJ counting with direct side support from CIGAR
+/// `M` blocks and splice-like `N` gaps. Leaving the variable unset keeps the
+/// Java-compatible path byte-for-byte reachable for parity checks.
+fn direct_side_fsj_anchor() -> Option<i32> {
+    static ANCHOR: OnceLock<Option<i32>> = OnceLock::new();
+    *ANCHOR.get_or_init(|| {
+        env::var(DIRECT_SIDE_FSJ_ANCHOR_ENV)
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|value| *value > 0)
+    })
+}
+
+/// Returns the optional direct side-spanning FSJ rescue anchor threshold.
+///
+/// Unlike `CIRI_SCAN2_DIRECT_SIDE_FSJ_ANCHOR`, this mode keeps the
+/// Java-compatible CIRI3 FSJ set and only adds extra side-spanning linear
+/// evidence. It is the preferred experiment for minibwa because it improves
+/// recall without discarding CIRI3's already high-precision default FSJs.
+fn direct_side_fsj_rescue_anchor() -> Option<i32> {
+    static ANCHOR: OnceLock<Option<i32>> = OnceLock::new();
+    *ANCHOR.get_or_init(|| {
+        env::var(DIRECT_SIDE_FSJ_RESCUE_ANCHOR_ENV)
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|value| *value > 0)
+    })
+}
+
+/// Returns the optional read-level FSJ audit path.
+///
+/// The main `.out` format only contains circ-level FSJ counts. This debug-only
+/// sink records the exact read groups that incremented those counts, allowing
+/// simulator precision/recall audits without changing the public output
+/// contract.
+fn fsj_pair_dump_path() -> Option<String> {
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        env::var(FSJ_PAIR_DUMP_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+    .clone()
+}
+
+/// Returns side-specific FSJ keys with strong linear support.
+///
+/// The CIRI3-compatible FSJ counter treats a broad alignment span as enough
+/// evidence. This enhanced predicate is stricter: each candidate side is counted
+/// separately only when it is in the middle of a read chain with enough aligned
+/// sequence on both sides. Continuous match blocks and CIGAR `N` splice gaps can
+/// provide that evidence; large `D` artifacts cannot.
+fn strong_fsj_side_keys(key: &str, aln_pos: i32, cigar: &str) -> Vec<String> {
+    let mut fields = key.split('\t');
+    let Some(chr) = fields.next() else {
+        return Vec::new();
+    };
+    let Some(site1) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
+        return Vec::new();
+    };
+    let Some(site2) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(2);
+    if cigar_has_strong_side_spanning(cigar, aln_pos, site1) {
+        out.push(format!("{chr}\t{site1}\t{site2}\tS"));
+    }
+    if cigar_has_strong_side_spanning(cigar, aln_pos, site2) {
+        out.push(format!("{chr}\t{site1}\t{site2}\tE"));
+    }
+    out
+}
+
+/// Tests one candidate side against the read-chain encoded by one CIGAR string.
+///
+/// A side can be supported either inside one match block or across an `N` splice
+/// gap whose flanking match blocks both provide enough query sequence. Deletions
+/// do not count as splice support because minibwa can use large `D` operations
+/// to absorb junction gaps that BWA would represent with split alignments.
+fn cigar_has_strong_side_spanning(cigar: &str, aln_pos: i32, side: i32) -> bool {
+    if cigar == "*" || aln_pos <= 0 {
+        return false;
+    }
+    let mut ref_pos = aln_pos;
+    let mut prev_match: Option<(i32, i32)> = None;
+    let mut pending_skip_after: Option<(i32, i32)> = None;
+    let mut count = 0_i32;
+    let mut has_count = false;
+    for op in cigar.chars() {
+        if op.is_ascii_digit() {
+            count = match count
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(op.to_digit(10).unwrap_or(0) as i32))
+            {
+                Some(value) => value,
+                None => return false,
+            };
+            has_count = true;
+            continue;
+        }
+        if !has_count {
+            return false;
+        }
+        match op {
+            'M' | '=' | 'X' => {
+                let block_start = ref_pos;
+                let block_end = ref_pos + count - 1;
+                if side >= block_start
+                    && side <= block_end
+                    && side - block_start + 1 >= STRONG_FSJ_MIN_ANCHOR
+                    && block_end - side + 1 >= STRONG_FSJ_MIN_ANCHOR
+                {
+                    return true;
+                }
+                if let Some((skip_start, skip_end)) = pending_skip_after.take() {
+                    if let Some((prev_start, prev_end)) = prev_match {
+                        let left_anchor = prev_end - prev_start + 1;
+                        let right_anchor = block_end - block_start + 1;
+                        if side >= skip_start - 6
+                            && side <= skip_end + 6
+                            && (side - prev_end).abs().min((block_start - side).abs()) <= 6
+                            && left_anchor >= STRONG_FSJ_MIN_ANCHOR
+                            && right_anchor >= STRONG_FSJ_MIN_ANCHOR
+                        {
+                            return true;
+                        }
+                    }
+                }
+                prev_match = Some((block_start, block_end));
+                ref_pos += count;
+            }
+            'N' => {
+                pending_skip_after = prev_match.map(|(_start, end)| (end + 1, ref_pos + count - 1));
+                ref_pos += count;
+            }
+            'D' => {
+                pending_skip_after = None;
+                ref_pos += count;
+            }
+            'I' | 'S' | 'H' | 'P' => {
+                pending_skip_after = None;
+            }
+            _ => return false,
+        }
+        count = 0;
+        has_count = false;
+    }
+    false
+}
+
+/// Collapses optional side-specific strong-FSJ keys back to circ-level keys.
+fn fsj_count_key(key: &str) -> String {
+    let mut fields = key.split('\t');
+    match (fields.next(), fields.next(), fields.next(), fields.next()) {
+        (Some(chr), Some(start), Some(end), Some(_side)) => format!("{chr}\t{start}\t{end}"),
+        _ => key.to_string(),
+    }
+}
+
+/// Collapses side-specific FSJ audit keys to one read-pair-level count key.
+///
+/// Strong-FSJ mode can record separate start- and end-side evidence for one
+/// read. Summary FSJ counts are still read-pair-level, so side keys must be
+/// deduplicated after collapsing back to the circRNA key.
+fn collapsed_fsj_count_keys(keys: HashSet<String>) -> HashSet<String> {
+    keys.into_iter().map(|key| fsj_count_key(&key)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn aln(flag: i32, pos: i32, mapq: i32, cigar: &'static str) -> AlignmentRecord<'static> {
+        AlignmentRecord {
+            flag,
+            chrom: Cow::Borrowed("chr1"),
+            pos,
+            mapq,
+            cigar: Cow::Borrowed(cigar),
+            seq: Cow::Borrowed("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+            xa: Cow::Borrowed(""),
+        }
+    }
+
+    #[test]
+    fn non_bsj_outward_retention_defaults_to_recognition_first_relaxed() {
+        assert_eq!(
+            Scan2::parse_non_bsj_outward_retention_mode(None),
+            NonBsjOutwardRetention::Relaxed
+        );
+        assert_eq!(
+            Scan2::parse_non_bsj_outward_retention_mode(Some("primary")),
+            NonBsjOutwardRetention::PrimaryOnly
+        );
+        assert_eq!(
+            Scan2::parse_non_bsj_outward_retention_mode(Some(" primary-only ")),
+            NonBsjOutwardRetention::PrimaryOnly
+        );
+        assert_eq!(
+            Scan2::parse_non_bsj_outward_retention_mode(Some("bogus")),
+            NonBsjOutwardRetention::PrimaryOnly
+        );
+        assert_eq!(
+            Scan2::parse_non_bsj_outward_retention_mode(Some("filtered")),
+            NonBsjOutwardRetention::Filtered
+        );
+    }
+
+    #[test]
+    fn non_bsj_outward_prefilter_accepts_gap_facing_primary_pair() {
+        let records = vec![
+            aln(97, 94_955_296, 60, "80M70S"),
+            aln(145, 94_953_252, 60, "97M53S"),
+        ];
+
+        assert!(Scan2::may_support_outward_segments(&records));
+    }
+
+    #[test]
+    fn non_bsj_outward_prefilter_rejects_linear_fr_pair() {
+        let records = vec![aln(65, 100, 60, "150M"), aln(145, 300, 60, "150M")];
+
+        assert!(!Scan2::may_support_outward_segments(&records));
+    }
+
+    #[test]
+    fn non_bsj_outward_prefilter_keeps_mapq_gate() {
+        let records = vec![aln(97, 1_000, 60, "100M50S"), aln(145, 500, 4, "100M50S")];
+
+        assert!(!Scan2::may_support_outward_segments(&records));
+    }
+
+    #[test]
+    fn non_bsj_outward_prefilter_accepts_same_span_terminal_clips() {
+        let records = vec![aln(65, 100, 60, "131M19S"), aln(145, 100, 60, "131M19S")];
+
+        assert!(Scan2::may_support_outward_segments(&records));
+    }
+
+    #[test]
+    fn strong_fsj_side_anchor_accepts_match_block_with_two_anchors() {
+        assert_eq!(
+            strong_fsj_side_keys("chr1\t150\t300", 100, "101M"),
+            vec!["chr1\t150\t300\tS".to_string()]
+        );
+    }
+
+    #[test]
+    fn strong_fsj_side_anchor_accepts_spliced_read_chain() {
+        assert_eq!(
+            strong_fsj_side_keys("chr1\t141\t300", 100, "40M100N40M"),
+            vec!["chr1\t141\t300\tS".to_string()]
+        );
+    }
+
+    #[test]
+    fn strong_fsj_side_anchor_rejects_large_deletion_span() {
+        assert!(strong_fsj_side_keys("chr1\t141\t200", 100, "40M117D80M").is_empty());
+    }
+
+    #[test]
+    fn strong_fsj_side_anchor_rejects_short_flanking_anchor() {
+        assert!(strong_fsj_side_keys("chr1\t150\t300", 140, "60M").is_empty());
+    }
+
+    #[test]
+    fn strong_fsj_side_anchor_counts_start_and_end_separately() {
+        assert_eq!(
+            strong_fsj_side_keys("chr1\t150\t180", 100, "101M"),
+            vec![
+                "chr1\t150\t180\tS".to_string(),
+                "chr1\t150\t180\tE".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn collapsed_fsj_count_keys_deduplicates_side_specific_keys() {
+        let mut keys = HashSet::new();
+        keys.insert("chr1\t150\t180\tS".to_string());
+        keys.insert("chr1\t150\t180\tE".to_string());
+
+        let collapsed = collapsed_fsj_count_keys(keys);
+
+        assert_eq!(collapsed.len(), 1);
+        assert!(collapsed.contains("chr1\t150\t180"));
+    }
+
+    #[test]
+    fn non_bsj_outward_supplementary_retention_keeps_high_mapq_split_pair() {
+        let records = vec![
+            aln(97, 32_740_922, 1, "31S99M149D20M"),
+            aln(2145, 32_740_654, 34, "32M118S"),
+            aln(145, 32_716_883, 60, "91M59S"),
+        ];
+
+        assert!(!Scan2::may_support_outward_segments(&records));
+        assert!(Scan2::may_support_outward_segments_with_retention(
+            &records,
+            NonBsjOutwardRetention::Supplementary
+        ));
+    }
+
+    #[test]
+    fn non_bsj_outward_relaxed_retention_keeps_one_low_mapq_mate() {
+        let records = vec![
+            aln(97, 29_650_146, 60, "150M"),
+            aln(145, 29_649_893, 1, "10S115M134D25M"),
+        ];
+
+        assert!(!Scan2::may_support_outward_segments(&records));
+        assert!(!Scan2::may_support_outward_segments_with_retention(
+            &records,
+            NonBsjOutwardRetention::Supplementary
+        ));
+        assert!(Scan2::may_support_outward_segments_with_retention(
+            &records,
+            NonBsjOutwardRetention::Relaxed
+        ));
     }
 }
 
@@ -214,6 +587,8 @@ fn advise_dontneed(mmap: &Mmap, offset: usize, len: usize) {
     let aligned_offset = (offset / page_size) * page_size;
     let aligned_len = ((offset + len + page_size - 1) / page_size) * page_size - aligned_offset;
     unsafe {
+        // SAFETY: `aligned_offset` and `aligned_len` are page-aligned within the
+        // live mmap, and `madvise` only receives a non-mutating cache hint.
         let ptr = mmap.as_ptr().add(aligned_offset);
         libc::madvise(ptr as *mut libc::c_void, aligned_len, libc::MADV_DONTNEED);
     }
@@ -294,6 +669,39 @@ impl Scan2DisplayClaims {
         self.by_read
             .get(read_id)
             .is_some_and(|mask| mask & 0b11 == 0b11)
+    }
+}
+
+/// Borrowed identity for a main Scan2 hit that display rescue would rediscover.
+///
+/// The display path emits rows without the priority column, but the candidate
+/// identity before validation is the same `(mate, cigar, chr, sites, signals)`
+/// payload. Keeping this as borrowed fields lets Scan2 suppress exact display
+/// duplicates before the expensive HG2 validator call without allocating a
+/// formatted key for every display candidate.
+#[derive(Clone, Copy)]
+struct Scan2DisplaySkipKey<'a> {
+    mate: &'a str,
+    cigar: &'a str,
+    chrom: &'a str,
+    site1: &'a str,
+    site2: &'a str,
+    signal1: &'a str,
+    signal2: &'a str,
+    sum_q: &'a str,
+}
+
+impl<'a> Scan2DisplaySkipKey<'a> {
+    /// Tests whether a display candidate would duplicate this main Scan2 hit.
+    fn matches(&self, mate: &str, cigar: &str, chrom: &str, cand: &CandidateBreakpoint) -> bool {
+        self.mate == mate
+            && self.cigar == cigar
+            && self.chrom == chrom
+            && self.site1 == cand.data[0]
+            && self.site2 == cand.data[1]
+            && self.signal1 == cand.data[2]
+            && self.signal2 == cand.data[3]
+            && self.sum_q == cand.data[4]
     }
 }
 
@@ -479,6 +887,11 @@ impl Scan2 {
     #[inline]
     fn shard_fsj_path(output_fsj: &str, shard_idx: usize) -> String {
         part_path(output_fsj, shard_idx)
+    }
+
+    /// Returns the shard-local read-level FSJ audit path.
+    fn shard_fsj_pair_dump_path(output_fsj: &str, shard_idx: usize) -> String {
+        format!("{}.pairs", Self::shard_fsj_path(output_fsj, shard_idx))
     }
 
     /// Writes one shard-local FSJ map to disk so the main thread can merge it
@@ -877,6 +1290,165 @@ impl Scan2 {
         }
     }
 
+    /// Collects FSJ keys directly from side-spanning linear alignment evidence.
+    ///
+    /// This minibwa-oriented experimental mode is intentionally separate from
+    /// Java-compatible bucket spans: `M` blocks contribute only the interval
+    /// where both flanks have at least `anchor` aligned bases, and `N` gaps
+    /// contribute only small windows around splice boundaries with adequate
+    /// flanking match blocks. `D` gaps are ignored because large deletion spans
+    /// were a recurrent false-FSJ source in minibwa.
+    fn collect_direct_side_fsj_keys(
+        &self,
+        chr: &str,
+        aln_pos: i32,
+        cigar: &str,
+        anchor: i32,
+        out: &mut HashSet<String>,
+    ) {
+        if cigar == "*" || aln_pos <= 0 {
+            return;
+        }
+        let mut ref_pos = aln_pos;
+        let mut prev_match: Option<(i32, i32)> = None;
+        let mut pending_skip_after: Option<(i32, i32, i32, i32)> = None;
+        let mut count = 0_i32;
+        let mut has_count = false;
+        for op in cigar.chars() {
+            if op.is_ascii_digit() {
+                count = match count
+                    .checked_mul(10)
+                    .and_then(|value| value.checked_add(op.to_digit(10).unwrap_or(0) as i32))
+                {
+                    Some(value) => value,
+                    None => return,
+                };
+                has_count = true;
+                continue;
+            }
+            if !has_count {
+                return;
+            }
+            match op {
+                'M' | '=' | 'X' => {
+                    let block_start = ref_pos;
+                    let block_end = ref_pos + count - 1;
+                    let direct_start = block_start + anchor - 1;
+                    let direct_end = block_end - anchor + 1;
+                    if direct_start <= direct_end {
+                        self.collect_fsj_keys_in_range(chr, direct_start, direct_end, 0, out);
+                    }
+                    if let Some((_skip_start, _skip_end, left_start, left_end)) =
+                        pending_skip_after.take()
+                    {
+                        if left_end - left_start + 1 >= anchor
+                            && block_end - block_start + 1 >= anchor
+                        {
+                            self.collect_fsj_keys_in_range(
+                                chr,
+                                left_end - DIRECT_SIDE_FSJ_SPLICE_TOLERANCE,
+                                left_end + DIRECT_SIDE_FSJ_SPLICE_TOLERANCE,
+                                0,
+                                out,
+                            );
+                            self.collect_fsj_keys_in_range(
+                                chr,
+                                block_start - DIRECT_SIDE_FSJ_SPLICE_TOLERANCE,
+                                block_start + DIRECT_SIDE_FSJ_SPLICE_TOLERANCE,
+                                0,
+                                out,
+                            );
+                        }
+                    }
+                    prev_match = Some((block_start, block_end));
+                    ref_pos += count;
+                }
+                'N' => {
+                    pending_skip_after =
+                        prev_match.map(|(start, end)| (end + 1, ref_pos + count - 1, start, end));
+                    ref_pos += count;
+                }
+                'D' => {
+                    pending_skip_after = None;
+                    ref_pos += count;
+                }
+                'I' | 'S' | 'H' | 'P' => {
+                    pending_skip_after = None;
+                }
+                _ => return,
+            }
+            count = 0;
+            has_count = false;
+        }
+    }
+
+    /// Collects FSJ keys with optional strong side-anchor filtering.
+    ///
+    /// The default CIRI3-compatible path keeps Java's span-based FSJ counting.
+    /// `CIRI_SCAN2_STRONG_FSJ=1` is an evaluation mode for minibwa: a candidate
+    /// circRNA is counted only when the current linear alignment has one BSJ side
+    /// inside a match block with enough matched bases on both sides. Large `D`
+    /// spans therefore no longer masquerade as strong forward evidence.
+    fn collect_fsj_keys_for_alignment(
+        &self,
+        chr: &str,
+        start_tem: i32,
+        end_tem: i32,
+        style: i32,
+        aln_pos: i32,
+        cigar: &str,
+        out: &mut HashSet<String>,
+    ) {
+        if let Some(anchor) = direct_side_fsj_anchor() {
+            self.collect_direct_side_fsj_keys(chr, aln_pos, cigar, anchor, out);
+            return;
+        }
+        if !strong_fsj_filter_enabled() {
+            self.collect_fsj_keys_in_range(chr, start_tem, end_tem, style, out);
+            if let Some(anchor) = direct_side_fsj_rescue_anchor() {
+                self.collect_direct_side_fsj_keys(chr, aln_pos, cigar, anchor, out);
+            }
+            return;
+        }
+        let mut candidates = HashSet::new();
+        self.collect_fsj_keys_in_range(chr, start_tem, end_tem, style, &mut candidates);
+        for key in candidates {
+            for side_key in strong_fsj_side_keys(&key, aln_pos, cigar) {
+                out.insert(side_key);
+            }
+        }
+        if let Some(anchor) = direct_side_fsj_rescue_anchor() {
+            self.collect_direct_side_fsj_keys(chr, aln_pos, cigar, anchor, out);
+        }
+    }
+
+    /// Inserts one validator-derived FSJ competitor under the strong-FSJ policy.
+    ///
+    /// Scan2 adds `tag==0` candidates as linear competitors. In enhanced
+    /// strong-FSJ mode, those candidates must pass the same side-anchor test as
+    /// span-derived FSJ keys; otherwise BSJ-like split reads can inflate the
+    /// forward denominator without a strong linear explanation.
+    fn insert_fsj_key_for_alignment(
+        chr: &str,
+        site1: &str,
+        site2: &str,
+        aln_pos: i32,
+        cigar: &str,
+        out: &mut HashSet<String>,
+    ) {
+        if direct_side_fsj_anchor().is_some() {
+            return;
+        }
+        let key = format!("{chr}\t{site1}\t{site2}");
+        if !strong_fsj_filter_enabled() {
+            out.insert(key);
+        } else {
+            for side_key in strong_fsj_side_keys(&key, aln_pos, cigar) {
+                out.insert(side_key);
+            }
+        }
+    }
+
     /// Dispatches to the SAM or BAM Scan2 implementation.
     pub fn run(
         &mut self,
@@ -1071,6 +1643,11 @@ impl Scan2 {
         num_threads: usize,
     ) -> Result<()> {
         let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(output_bsj2)?);
+        let mut pair_dump_writer = if let Some(path) = fsj_pair_dump_path() {
+            Some(BufWriter::with_capacity(1024 * 1024, File::create(path)?))
+        } else {
+            None
+        };
         let mut rescued_ids = HashSet::new();
         for i in 0..num_threads {
             let shard_path = part_path(output_bsj2, i);
@@ -1112,8 +1689,24 @@ impl Scan2 {
                 }
             }
             let _ = std::fs::remove_file(fsj_path);
+
+            let pair_path = Self::shard_fsj_pair_dump_path(output_fsj, i);
+            if let Some(pair_dump_writer) = pair_dump_writer.as_mut() {
+                if let Ok(pair_file) = File::open(&pair_path) {
+                    let mut pair_reader = BufReader::new(pair_file);
+                    let mut line = String::new();
+                    while pair_reader.read_line(&mut line)? != 0 {
+                        pair_dump_writer.write_all(line.as_bytes())?;
+                        line.clear();
+                    }
+                }
+            }
+            let _ = std::fs::remove_file(pair_path);
         }
         writer.flush()?;
+        if let Some(mut pair_dump_writer) = pair_dump_writer {
+            pair_dump_writer.flush()?;
+        }
         self.rescued_reads = rescued_ids.len();
         self.final_bsj_reads = self.scan1_ids.len() + self.rescued_reads;
         Ok(())
@@ -1161,6 +1754,8 @@ impl Scan2 {
         let profile_ref = profile.as_ref();
         let file = File::open(bam_file)?;
         let file_size = std::fs::metadata(bam_file)?.len();
+        // SAFETY: the file descriptor remains open while the mapping is created;
+        // the returned `Mmap` owns the mapping for the rest of this scope.
         let mmap = unsafe { Mmap::map(&file)? };
         let num_threads = bam_shard_count(mmap.len(), rayon::current_num_threads());
         let shard_size = mmap.len() / num_threads;
@@ -1177,6 +1772,8 @@ impl Scan2 {
         pb.enable_steady_tick(Duration::from_millis(120));
 
         unsafe {
+            // SAFETY: the pointer and length come from the live mapping, and
+            // `madvise` only changes the kernel's read-ahead/cache policy.
             libc::madvise(
                 mmap.as_ptr() as *mut libc::c_void,
                 mmap.len(),
@@ -1388,10 +1985,61 @@ impl Scan2 {
     /// Cheap read-level filter for supplemental backward/outward candidates.
     fn may_support_non_bsj_segments<'a>(alignments: &[AlignmentRecord<'a>]) -> bool {
         Self::may_support_outward_segments(alignments)
+            || Self::may_support_outward_segments_with_retention(
+                alignments,
+                Self::non_bsj_outward_retention_mode(),
+            )
             || Self::may_support_backward_segments(alignments)
     }
 
-    /// Tests the 5' overlap plus 3' outward pair geometry without circ gating.
+    /// Reads the non-BSJ outward retention mode from the environment.
+    ///
+    /// The default is the recognition-first relaxed mode because simulator
+    /// evaluation showed that it restores minibwa outward recall to the BWA
+    /// control range while preserving BSJ and isoform accuracy. `primary` and
+    /// `filtered` remain explicit overrides for speed- or precision-first
+    /// audits.
+    fn non_bsj_outward_retention_mode() -> NonBsjOutwardRetention {
+        let value = env::var(NON_BSJ_OUTWARD_RETENTION_ENV).ok();
+        Self::parse_non_bsj_outward_retention_mode(value.as_deref())
+    }
+
+    /// Parses a configured non-BSJ outward retention mode.
+    ///
+    /// Keeping parsing separate from the environment read makes the
+    /// recognition-first default testable despite the process-wide environment.
+    /// Only an unset environment variable opts into that default; unknown
+    /// explicit values fall back to the legacy primary-only policy so typoed
+    /// speed or precision overrides do not silently enable extra retention.
+    fn parse_non_bsj_outward_retention_mode(value: Option<&str>) -> NonBsjOutwardRetention {
+        let Some(value) = value else {
+            return NonBsjOutwardRetention::Relaxed;
+        };
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("supplementary") {
+            NonBsjOutwardRetention::Supplementary
+        } else if value.eq_ignore_ascii_case("relaxed") {
+            NonBsjOutwardRetention::Relaxed
+        } else if value.eq_ignore_ascii_case("filtered") {
+            NonBsjOutwardRetention::Filtered
+        } else if value.eq_ignore_ascii_case("primary")
+            || value.eq_ignore_ascii_case("primary_only")
+            || value.eq_ignore_ascii_case("primary-only")
+        {
+            NonBsjOutwardRetention::PrimaryOnly
+        } else {
+            NonBsjOutwardRetention::PrimaryOnly
+        }
+    }
+
+    /// Tests 3' outward pair geometry before writing non-BSJ segment evidence.
+    ///
+    /// This must stay aligned with the stricter post-Summary outward detector in
+    /// `ciri_as`: Scan2 only decides whether the full read group is worth
+    /// spilling to the sidecar, while the later segment stage still applies the
+    /// linear-mate negative filter and builds only `type=outward` rows. Keeping
+    /// the same coordinate rule here prevents gap-facing outward pairs from
+    /// being dropped before that safer final check can run.
     fn may_support_outward_segments<'a>(alignments: &[AlignmentRecord<'a>]) -> bool {
         let mut r1: Option<&AlignmentRecord<'_>> = None;
         let mut r2: Option<&AlignmentRecord<'_>> = None;
@@ -1422,6 +2070,102 @@ impl Scan2 {
         let Some(r2_span) = Self::alignment_ref_span(r2) else {
             return false;
         };
+        if !Self::has_3p_outward_pair_geometry(r1, r1_span, r2, r2_span) {
+            return false;
+        }
+        let span_start = r1_span.0.min(r2_span.0);
+        let span_end = r1_span.1.max(r2_span.1);
+        span_end - span_start + 1 <= NON_BSJ_SEGMENT_MAX_SPAN
+    }
+
+    /// Tests supplementary-aware outward geometry for opt-in sidecar retention.
+    ///
+    /// This function never runs in the default path. It is intentionally more
+    /// permissive about supplementary records because Scan2 only decides whether
+    /// to spill the read group; the later segments stage still applies full
+    /// linear negative filters, circ containment and chain ranking before
+    /// emitting `type=outward`.
+    fn may_support_outward_segments_with_retention<'a>(
+        alignments: &[AlignmentRecord<'a>],
+        mode: NonBsjOutwardRetention,
+    ) -> bool {
+        if mode == NonBsjOutwardRetention::PrimaryOnly {
+            return false;
+        }
+        for (left_idx, left) in alignments.iter().enumerate() {
+            if !Self::is_non_bsj_outward_retention_record(left) {
+                continue;
+            }
+            let Some(left_span) = Self::alignment_ref_span(left) else {
+                continue;
+            };
+            for right in alignments.iter().skip(left_idx + 1) {
+                if !Self::is_non_bsj_outward_retention_record(right)
+                    || left.chrom != right.chrom
+                    || mate_bucket_from_flag(left.flag) == mate_bucket_from_flag(right.flag)
+                {
+                    continue;
+                }
+                if !Self::outward_retention_mapq_pass(left, right, mode) {
+                    continue;
+                }
+                let Some(right_span) = Self::alignment_ref_span(right) else {
+                    continue;
+                };
+                if !Self::has_3p_outward_pair_geometry(left, left_span, right, right_span) {
+                    continue;
+                }
+                let span_start = left_span.0.min(right_span.0);
+                let span_end = left_span.1.max(right_span.1);
+                if span_end - span_start + 1 <= NON_BSJ_SEGMENT_MAX_SPAN {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Returns whether one alignment can participate in opt-in outward retention.
+    fn is_non_bsj_outward_retention_record<'a>(aln: &AlignmentRecord<'a>) -> bool {
+        aln.flag & 0x4 == 0
+            && aln.flag & 0x100 == 0
+            && aln.chrom.as_ref() != "*"
+            && aln.cigar.as_ref() != "*"
+            && mate_bucket_from_flag(aln.flag) != 0
+    }
+
+    /// Applies MAPQ thresholds for supplementary-aware outward retention modes.
+    fn outward_retention_mapq_pass<'a>(
+        left: &AlignmentRecord<'a>,
+        right: &AlignmentRecord<'a>,
+        mode: NonBsjOutwardRetention,
+    ) -> bool {
+        match mode {
+            NonBsjOutwardRetention::PrimaryOnly => false,
+            NonBsjOutwardRetention::Supplementary => {
+                left.mapq >= NON_BSJ_SEGMENT_MAPQ_THRES && right.mapq >= NON_BSJ_SEGMENT_MAPQ_THRES
+            }
+            NonBsjOutwardRetention::Filtered => {
+                left.mapq >= NON_BSJ_SEGMENT_MAPQ_THRES && right.mapq >= NON_BSJ_SEGMENT_MAPQ_THRES
+            }
+            NonBsjOutwardRetention::Relaxed => {
+                left.mapq.max(right.mapq) >= NON_BSJ_SEGMENT_MAPQ_THRES
+            }
+        }
+    }
+
+    /// Mirrors the post-Summary outward geometry used by CIRI-AS segments.
+    ///
+    /// A non-identical pair is accepted when the reverse-strand mate lies left
+    /// of the forward-strand mate by both start and end coordinates. Exact
+    /// same-span pairs need paired 3' terminal clips so fully overlapping
+    /// artifacts are not spilled into the non-BSJ sidecar.
+    fn has_3p_outward_pair_geometry<'a>(
+        r1: &AlignmentRecord<'a>,
+        r1_span: (i32, i32),
+        r2: &AlignmentRecord<'a>,
+        r2_span: (i32, i32),
+    ) -> bool {
         let r1_reverse = r1.flag & 0x10 != 0;
         let r2_reverse = r2.flag & 0x10 != 0;
         if r1_reverse == r2_reverse {
@@ -1432,10 +2176,53 @@ impl Scan2 {
         } else {
             (r2_span, r1_span)
         };
-        reverse_span.0 < forward_span.0
-            && forward_span.0 <= reverse_span.1
-            && reverse_span.1 < forward_span.1
-            && forward_span.1 - reverse_span.0 + 1 <= NON_BSJ_SEGMENT_MAX_SPAN
+        let (reverse_record, forward_record) = if r1_reverse { (r1, r2) } else { (r2, r1) };
+        if reverse_span == forward_span {
+            return Self::has_paired_outward_terminal_clip(reverse_record, forward_record);
+        }
+        forward_span.0 - reverse_span.0 >= NON_BSJ_OUTWARD_MIN_PAIR_OFFSET
+            && forward_span.1 - reverse_span.1 >= NON_BSJ_OUTWARD_MIN_PAIR_OFFSET
+    }
+
+    /// Returns whether same-span mate pairs carry outward-specific clip tails.
+    ///
+    /// CIGAR terminal clips are in query order. Subtracting the opposite mate's
+    /// 5' clip keeps ordinary mate-overlap clipping from masquerading as paired
+    /// 3' outward evidence.
+    fn has_paired_outward_terminal_clip<'a>(
+        reverse_record: &AlignmentRecord<'a>,
+        forward_record: &AlignmentRecord<'a>,
+    ) -> bool {
+        let Some((reverse_5p, reverse_3p)) =
+            Self::terminal_query_clips(reverse_record.cigar.as_ref())
+        else {
+            return false;
+        };
+        let Some((forward_5p, forward_3p)) =
+            Self::terminal_query_clips(forward_record.cigar.as_ref())
+        else {
+            return false;
+        };
+        reverse_3p >= NON_BSJ_OUTWARD_MIN_TERMINAL_CLIP
+            && forward_3p >= NON_BSJ_OUTWARD_MIN_TERMINAL_CLIP
+            && reverse_3p - forward_5p >= NON_BSJ_OUTWARD_MIN_TERMINAL_CLIP
+            && forward_3p - reverse_5p >= NON_BSJ_OUTWARD_MIN_TERMINAL_CLIP
+    }
+
+    /// Returns 5' and 3' terminal query clip lengths from a SAM CIGAR.
+    fn terminal_query_clips(cigar: &str) -> Option<(i32, i32)> {
+        let ops = parse_cigar_ops_basic(cigar)?;
+        let five_prime = ops
+            .first()
+            .copied()
+            .filter(|(_, op)| matches!(op, 'S' | 'H'))
+            .map_or(0, |(len, _)| len);
+        let three_prime = ops
+            .last()
+            .copied()
+            .filter(|(_, op)| matches!(op, 'S' | 'H'))
+            .map_or(0, |(len, _)| len);
+        Some((five_prime, three_prime))
     }
 
     /// Tests whether split alignments can form a CIRI-AS-style backward candidate.
@@ -1725,6 +2512,44 @@ impl Scan2 {
         ))
     }
 
+    /// Builds a borrowed display-duplicate key from one priority Scan2 row.
+    ///
+    /// Display rescue is only allowed to skip candidates that would be filtered
+    /// later as exact duplicates of main Scan2 output. The validator-derived tag
+    /// fields are deliberately excluded because the pre-validator candidate
+    /// identity is enough to prove the display branch is rediscovering the same
+    /// first-hit row.
+    fn scan2_display_skip_key(line: &str) -> Option<Scan2DisplaySkipKey<'_>> {
+        let parts: Vec<&str> = line.split('\t').collect();
+        let payload_start = bsj_payload_start(&parts);
+        if payload_start != 3 || parts.len() < payload_start + 9 {
+            return None;
+        }
+        Some(Scan2DisplaySkipKey {
+            mate: parts[1],
+            cigar: parts[payload_start],
+            chrom: parts[payload_start + 2],
+            site1: parts[payload_start + 3],
+            site2: parts[payload_start + 4],
+            signal1: parts[payload_start + 5],
+            signal2: parts[payload_start + 6],
+            sum_q: parts[payload_start + 7],
+        })
+    }
+
+    /// Returns whether a display candidate is an exact duplicate of a main hit.
+    fn display_candidate_is_main_duplicate(
+        skip_keys: &[Scan2DisplaySkipKey<'_>],
+        mate: &str,
+        cigar: &str,
+        chrom: &str,
+        cand: &CandidateBreakpoint,
+    ) -> bool {
+        skip_keys
+            .iter()
+            .any(|key| key.matches(mate, cigar, chrom, cand))
+    }
+
     /// Streams a SAM file into one shard output while batching grouped reads for
     /// parallel Scan2 rescue evaluation.
     fn process_sam_file_to_file(
@@ -1756,6 +2581,14 @@ impl Scan2 {
         } else {
             None
         };
+        let mut fsj_pair_writer = if fsj_pair_dump_path().is_some() {
+            Some(BufWriter::with_capacity(
+                256 * 1024,
+                File::create(format!("{fsj_path}.pairs"))?,
+            ))
+        } else {
+            None
+        };
         let batch_size = (rayon::current_num_threads().max(1) * 256).max(1024);
         let (tx, rx) =
             mpsc::sync_channel::<Vec<SamOwnedScan2Group>>(rayon::current_num_threads().max(2));
@@ -1774,6 +2607,7 @@ impl Scan2 {
                     display_writer.as_mut(),
                     segments_writer.as_mut(),
                     non_bsj_segments_writer.as_mut(),
+                    fsj_pair_writer.as_mut(),
                     &mut batch,
                     &mut merged_fsj,
                     chr_tcga_map,
@@ -1795,6 +2629,9 @@ impl Scan2 {
             writer.flush()?;
         }
         if let Some(writer) = non_bsj_segments_writer.as_mut() {
+            writer.flush()?;
+        }
+        if let Some(writer) = fsj_pair_writer.as_mut() {
             writer.flush()?;
         }
         Self::write_fsj_shard(fsj_path, &local_fsj)
@@ -1971,6 +2808,7 @@ impl Scan2 {
         mut display_writer: Option<&mut BufWriter<File>>,
         mut segments_writer: Option<&mut BufWriter<File>>,
         mut non_bsj_segments_writer: Option<&mut BufWriter<File>>,
+        mut fsj_pair_writer: Option<&mut BufWriter<File>>,
         batch: &mut Vec<SamOwnedScan2Group>,
         merged_fsj: &mut HashMap<String, i32>,
         chr_tcga_map: &HashMap<String, String>,
@@ -1978,9 +2816,12 @@ impl Scan2 {
         profile: Option<&Scan2Profile>,
     ) -> Result<()> {
         let groups = std::mem::take(batch);
+        let collect_fsj_pair_rows = fsj_pair_writer.is_some();
+        let suppress_display_duplicates = display_writer.is_none();
         let results: Vec<(
             Vec<String>,
             HashMap<String, i32>,
+            Vec<String>,
             Vec<String>,
             Vec<String>,
             Vec<String>,
@@ -1989,6 +2830,8 @@ impl Scan2 {
             .map(|owned| {
                 let mut local_lines = Vec::new();
                 let mut local_fsj = HashMap::new();
+                let mut fsj_pair_rows = Vec::new();
+                let fsj_pair_dump = collect_fsj_pair_rows.then_some(&mut fsj_pair_rows);
                 let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
                 let _ = self.process_group_view(
                     &owned.read_id,
@@ -1996,6 +2839,7 @@ impl Scan2 {
                     &owned.stand_map,
                     &mut local_lines,
                     &mut local_fsj,
+                    fsj_pair_dump,
                     chr_tcga_map,
                     &mut validator,
                     profile,
@@ -2003,12 +2847,21 @@ impl Scan2 {
                 let display_lines = if let Some((display_helper, scan1_claims)) = display_scan2 {
                     let mut display_validator =
                         IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
+                    let display_skip_keys: Vec<_> = if suppress_display_duplicates {
+                        local_lines
+                            .iter()
+                            .filter_map(|line| Self::scan2_display_skip_key(line))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     display_helper
                         .process_group_view_display(
                             &owned.read_id,
                             &owned.alignments,
                             &owned.stand_map,
                             scan1_claims,
+                            &display_skip_keys,
                             chr_tcga_map,
                             &mut display_validator,
                         )
@@ -2050,11 +2903,12 @@ impl Scan2 {
                     display_lines,
                     evidence,
                     non_bsj_evidence,
+                    fsj_pair_rows,
                 )
             })
             .collect();
 
-        for (lines, fsj_map, display_lines, evidence, non_bsj_evidence) in results {
+        for (lines, fsj_map, display_lines, evidence, non_bsj_evidence, fsj_pair_rows) in results {
             let main_keys: HashSet<String> = lines
                 .iter()
                 .filter_map(|line| Self::scan2_priority_key(line))
@@ -2079,6 +2933,11 @@ impl Scan2 {
             }
             for (key, count) in fsj_map {
                 *merged_fsj.entry(key).or_insert(0) += count;
+            }
+            if let Some(fsj_pair_writer) = fsj_pair_writer.as_deref_mut() {
+                for row in fsj_pair_rows {
+                    writeln!(fsj_pair_writer, "{}", row)?;
+                }
             }
             if let Some(segments_writer) = segments_writer.as_deref_mut() {
                 let mut rows = 0_u64;
@@ -2157,6 +3016,14 @@ impl Scan2 {
         } else {
             None
         };
+        let mut fsj_pair_writer = if fsj_pair_dump_path().is_some() {
+            Some(BufWriter::with_capacity(
+                256 * 1024,
+                File::create(format!("{fsj_path}.pairs"))?,
+            ))
+        } else {
+            None
+        };
         let mut local_fsj = HashMap::new();
         let mut validator = IsBSJHg2::new(self.linear_range_size_min, self.min_mapq_uni);
         let mut display_validator = display_scan2
@@ -2206,6 +3073,9 @@ impl Scan2 {
             if let Some(non_bsj_segments_writer) = non_bsj_segments_writer.as_mut() {
                 non_bsj_segments_writer.flush()?;
             }
+            if let Some(fsj_pair_writer) = fsj_pair_writer.as_mut() {
+                fsj_pair_writer.flush()?;
+            }
             return Self::write_fsj_shard(fsj_path, &local_fsj);
         }
 
@@ -2230,6 +3100,7 @@ impl Scan2 {
         let mut cigar_buf = String::with_capacity(64);
         let mut seq_buf = String::with_capacity(256);
         let mut res_batch = Vec::new();
+        let mut fsj_pair_rows = Vec::new();
 
         while reader.read_record(&mut record)? != 0 {
             if let Some(profile) = profile {
@@ -2274,21 +3145,41 @@ impl Scan2 {
                 if !current_id.is_empty() {
                     let id_str = String::from_utf8_lossy(&current_id);
                     res_batch.clear();
+                    fsj_pair_rows.clear();
+                    let fsj_pair_dump = if fsj_pair_writer.is_some() {
+                        Some(&mut fsj_pair_rows)
+                    } else {
+                        None
+                    };
                     self.process_group_view(
                         &id_str,
                         &alignments,
                         &stand_map,
                         &mut res_batch,
                         &mut local_fsj,
+                        fsj_pair_dump,
                         chr_tcga_map,
                         &mut validator,
                         profile,
                     )?;
+                    if let Some(fsj_pair_writer) = fsj_pair_writer.as_mut() {
+                        for row in &fsj_pair_rows {
+                            writeln!(fsj_pair_writer, "{}", row)?;
+                        }
+                    }
                     let write_started = profile.map(|_| Instant::now());
                     let main_keys: HashSet<String> = res_batch
                         .iter()
                         .filter_map(|line| Self::scan2_priority_key(line))
                         .collect();
+                    let display_skip_keys: Vec<_> = if display_writer.is_none() {
+                        res_batch
+                            .iter()
+                            .filter_map(|line| Self::scan2_display_skip_key(line))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     for line in &res_batch {
                         writeln!(writer, "{}", line)?;
                     }
@@ -2308,6 +3199,7 @@ impl Scan2 {
                                 &alignments,
                                 &stand_map,
                                 scan1_claims,
+                                &display_skip_keys,
                                 chr_tcga_map,
                                 display_validator,
                             )?
@@ -2501,21 +3393,41 @@ impl Scan2 {
         if !current_id.is_empty() {
             let id_str = String::from_utf8_lossy(&current_id);
             res_batch.clear();
+            fsj_pair_rows.clear();
+            let fsj_pair_dump = if fsj_pair_writer.is_some() {
+                Some(&mut fsj_pair_rows)
+            } else {
+                None
+            };
             self.process_group_view(
                 &id_str,
                 &alignments,
                 &stand_map,
                 &mut res_batch,
                 &mut local_fsj,
+                fsj_pair_dump,
                 chr_tcga_map,
                 &mut validator,
                 profile,
             )?;
+            if let Some(fsj_pair_writer) = fsj_pair_writer.as_mut() {
+                for row in &fsj_pair_rows {
+                    writeln!(fsj_pair_writer, "{}", row)?;
+                }
+            }
             let write_started = profile.map(|_| Instant::now());
             let main_keys: HashSet<String> = res_batch
                 .iter()
                 .filter_map(|line| Self::scan2_priority_key(line))
                 .collect();
+            let display_skip_keys: Vec<_> = if display_writer.is_none() {
+                res_batch
+                    .iter()
+                    .filter_map(|line| Self::scan2_display_skip_key(line))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             for line in &res_batch {
                 writeln!(writer, "{}", line)?;
             }
@@ -2534,6 +3446,7 @@ impl Scan2 {
                         &alignments,
                         &stand_map,
                         scan1_claims,
+                        &display_skip_keys,
                         chr_tcga_map,
                         display_validator,
                     )?
@@ -2649,6 +3562,9 @@ impl Scan2 {
         if let Some(non_bsj_segments_writer) = non_bsj_segments_writer.as_mut() {
             non_bsj_segments_writer.flush()?;
         }
+        if let Some(fsj_pair_writer) = fsj_pair_writer.as_mut() {
+            fsj_pair_writer.flush()?;
+        }
         if let (Some(profile), Some(shard_started)) = (profile, shard_started) {
             profile
                 .shard_total_ns
@@ -2672,6 +3588,7 @@ impl Scan2 {
         stand_map: &HashMap<i32, (char, Cow<'a, str>)>,
         results: &mut Vec<String>,
         local_fsj: &mut HashMap<String, i32>,
+        mut fsj_pair_dump: Option<&mut Vec<String>>,
         chr_tcga_map: &HashMap<String, String>,
         is_bsj_hg2: &mut IsBSJHg2,
         profile: Option<&Scan2Profile>,
@@ -2720,10 +3637,18 @@ impl Scan2 {
                     continue;
                 }
                 let c = misd(cigar_ref.as_ref(), slen);
-                if cigar_ref == format!("{}M", slen) {
+                if cigar_is_full_match(cigar_ref.as_ref(), slen) {
                     let start_tem = aln.pos + 6;
                     let end_tem = aln.pos + slen - 7;
-                    self.collect_fsj_keys_in_range(chr, start_tem, end_tem, 0, &mut tem_fsj_keys);
+                    self.collect_fsj_keys_for_alignment(
+                        chr,
+                        start_tem,
+                        end_tem,
+                        0,
+                        aln.pos,
+                        cigar_ref.as_ref(),
+                        &mut tem_fsj_keys,
+                    );
                     continue;
                 }
                 if c[0] == -1 || c[0] == 10 {
@@ -2851,8 +3776,14 @@ impl Scan2 {
                                 // insertions are one of the main places where
                                 // BSJ parity can already be perfect while FSJ
                                 // counts still drift.
-                                tem_fsj_keys
-                                    .insert(format!("{}\t{}\t{}", chr, cand.data[0], cand.data[1]));
+                                Self::insert_fsj_key_for_alignment(
+                                    chr,
+                                    &cand.data[0],
+                                    &cand.data[1],
+                                    aln.pos,
+                                    cigar_ref.as_ref(),
+                                    &mut tem_fsj_keys,
+                                );
                                 Ok(false)
                             } else if tag != "2" {
                                 if let Some(profile) = profile {
@@ -3035,8 +3966,14 @@ impl Scan2 {
                                 ));
                             }
                             if tag == "0" {
-                                tem_fsj_keys
-                                    .insert(format!("{}\t{}\t{}", chr, cand.data[0], cand.data[1]));
+                                Self::insert_fsj_key_for_alignment(
+                                    chr,
+                                    &cand.data[0],
+                                    &cand.data[1],
+                                    aln.pos,
+                                    cigar_ref.as_ref(),
+                                    &mut tem_fsj_keys,
+                                );
                                 Ok(false)
                             } else if tag != "2" {
                                 if let Some(profile) = profile {
@@ -3103,11 +4040,22 @@ impl Scan2 {
                 // genomic span, exactly like Java `GetFSJClass.getFSJ(...)`.
                 let start_tem = aln.pos + 6;
                 let end_tem = aln.pos + c[3] - 7;
-                self.collect_fsj_keys_in_range(chr, start_tem, end_tem, c[0], &mut tem_fsj_keys);
+                self.collect_fsj_keys_for_alignment(
+                    chr,
+                    start_tem,
+                    end_tem,
+                    c[0],
+                    aln.pos,
+                    cigar_ref.as_ref(),
+                    &mut tem_fsj_keys,
+                );
             }
         }
-        for k in tem_fsj_keys {
-            *local_fsj.entry(k).or_insert(0) += 1;
+        for count_key in collapsed_fsj_count_keys(tem_fsj_keys) {
+            if let Some(dump) = fsj_pair_dump.as_deref_mut() {
+                dump.push(format!("{count_key}\t{id}"));
+            }
+            *local_fsj.entry(count_key).or_insert(0) += 1;
         }
         if let (Some(profile), Some(started)) = (profile, started) {
             profile
@@ -3129,6 +4077,7 @@ impl Scan2 {
         alignments: &[AlignmentRecord<'a>],
         stand_map: &HashMap<i32, (char, Cow<'a, str>)>,
         scan1_claims: &Scan2DisplayClaims,
+        main_skip_keys: &[Scan2DisplaySkipKey<'_>],
         chr_tcga_map: &HashMap<String, String>,
         is_bsj_hg2: &mut IsBSJHg2,
     ) -> Result<Vec<String>> {
@@ -3242,6 +4191,28 @@ impl Scan2 {
                                         break;
                                     }
                                 }
+                            }
+                            if Self::display_candidate_is_main_duplicate(
+                                main_skip_keys,
+                                mate_label,
+                                cigar_ref.as_ref(),
+                                chr,
+                                cand,
+                            ) {
+                                if trace_read {
+                                    emit_trace_line(&format!(
+                                        "[TRACE_SCAN2_DISPLAY] id={} type=sm seg={} aln_pos={} chr={} site1={} site2={} cand_site={} cigar={} skipped=main_duplicate",
+                                        id,
+                                        seg_idx,
+                                        aln.pos,
+                                        chr,
+                                        cand.data[0],
+                                        cand.data[1],
+                                        cand.site,
+                                        cigar_ref.as_ref()
+                                    ));
+                                }
+                                return Ok(true);
                             }
                             let circ_c = vec![
                                 (if aln.flag & 0x10 != 0 { "1" } else { "0" }).to_string(),
@@ -3397,6 +4368,28 @@ impl Scan2 {
                                         break;
                                     }
                                 }
+                            }
+                            if Self::display_candidate_is_main_duplicate(
+                                main_skip_keys,
+                                mate_label,
+                                cigar_ref.as_ref(),
+                                chr,
+                                cand,
+                            ) {
+                                if trace_read {
+                                    emit_trace_line(&format!(
+                                        "[TRACE_SCAN2_DISPLAY] id={} type=ms seg={} aln_pos={} chr={} site1={} site2={} cand_site={} cigar={} skipped=main_duplicate",
+                                        id,
+                                        seg_idx,
+                                        aln.pos,
+                                        chr,
+                                        cand.data[0],
+                                        cand.data[1],
+                                        cand.site,
+                                        cigar_ref.as_ref()
+                                    ));
+                                }
+                                return Ok(true);
                             }
                             let circ_c = vec![
                                 (if aln.flag & 0x10 != 0 { "1" } else { "0" }).to_string(),

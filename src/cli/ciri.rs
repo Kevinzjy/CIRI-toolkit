@@ -265,8 +265,7 @@ fn write_and_log_segments_bam(
         reference,
         threads,
     )?;
-    let message = format!("{}", bam_path);
-    log_info(log_writer, "Output segments BAM", &message)?;
+    log_info(log_writer, "Output segments BAM", &bam_path)?;
     Ok(())
 }
 
@@ -1539,13 +1538,38 @@ pub fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if summary.circ_count == 0 {
+        File::create(&bsj_output)?;
+        let (bedpe_path, _bedpe_rows) = write_bsj_bedpe(&args.out_prefix, &result_output)?;
+        log_info(&mut log_writer, "Output BEDPE file", &bedpe_path)?;
+        log_info(
+            &mut log_writer,
+            "No circRNAs found",
+            "Stopping before segments and isoform reconstruction",
+        )?;
+        log_info(
+            &mut log_writer,
+            "Total runtime",
+            &format!("{:.2} seconds", run_started.elapsed().as_secs_f64()),
+        )?;
+        if !args.debug {
+            cleanup_pipeline_temp_files(
+                &[
+                    &bsj1_output,
+                    &bsj2_output,
+                    &segments1_output,
+                    &segments2_output,
+                    &segments_non_bsj_output,
+                    &fsj_output,
+                ],
+                &scan2_segment_artifacts.non_bsj_segment_evidence_paths,
+            );
+        }
+        return Ok(());
+    }
     write_display_bsj(&bsj_output, &bsj1_output, &bsj2_output)?;
     let (bedpe_path, _bedpe_rows) = write_bsj_bedpe(&args.out_prefix, &result_output)?;
-    log_info(
-        &mut log_writer,
-        "Output BEDPE file",
-        &format!("{}", bedpe_path),
-    )?;
+    log_info(&mut log_writer, "Output BEDPE file", &bedpe_path)?;
 
     let stage2_label = format!("=== STAGE 2/{} ===", total_stages);
     log_info(
@@ -1687,6 +1711,25 @@ pub fn main() -> Result<()> {
     Ok(())
 }
 
+/// Removes internal stage sidecars after the final user-facing outputs exist.
+///
+/// Official CLI outputs should remain focused on the final result files. The
+/// intermediate `.bsj1/.bsj2/.segments1/.segments2` stems are implementation
+/// details kept only when `--debug` is set, while shard paths are removed here
+/// because Scan1/Scan2/segments may leave either merged stems or `.part_*.tmp`
+/// files depending on which fast path was active.
+fn cleanup_pipeline_temp_files(stems: &[&str], extra_paths: &[String]) {
+    for path in extra_paths {
+        let _ = std::fs::remove_file(path);
+    }
+    for stem in stems {
+        let _ = std::fs::remove_file(stem);
+        for idx in 0..rayon::current_num_threads().max(1) {
+            let _ = std::fs::remove_file(crate::utils::part_path(stem, idx));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1816,24 +1859,5 @@ mod tests {
         assert!(line.contains("\t4M\t"));
         assert!(line.contains("\tNNNN\t"));
         assert!(!line.contains("\tcs:Z:"));
-    }
-}
-
-/// Removes internal stage sidecars after the final user-facing outputs exist.
-///
-/// Official CLI outputs should remain focused on the final result files. The
-/// intermediate `.bsj1/.bsj2/.segments1/.segments2` stems are implementation
-/// details kept only when `--debug` is set, while shard paths are removed here
-/// because Scan1/Scan2/segments may leave either merged stems or `.part_*.tmp`
-/// files depending on which fast path was active.
-fn cleanup_pipeline_temp_files(stems: &[&str], extra_paths: &[String]) {
-    for path in extra_paths {
-        let _ = std::fs::remove_file(path);
-    }
-    for stem in stems {
-        let _ = std::fs::remove_file(stem);
-        for idx in 0..rayon::current_num_threads().max(1) {
-            let _ = std::fs::remove_file(crate::utils::part_path(stem, idx));
-        }
     }
 }

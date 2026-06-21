@@ -114,8 +114,7 @@ impl Annotation {
             // Extract 'gene_id' from the semicolon-separated attributes list.
             let gene_id = attributes
                 .split(';')
-                .filter(|s| s.trim().starts_with("gene_id"))
-                .next()
+                .find(|s| s.trim().starts_with("gene_id"))
                 .and_then(|s| s.split('"').nth(1))
                 .unwrap_or("NA")
                 .to_string();
@@ -143,7 +142,7 @@ impl Annotation {
                 .insert(end, (gene_id_key.clone(), strand_char));
             self.gene_exon_map
                 .entry(gene_id)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push((start, end));
             if let Some(transcript_id) = transcript_id {
                 transcript_exons
@@ -205,7 +204,15 @@ impl Annotation {
             });
         }
         for spans in self.chr_gene_map.values_mut() {
-            spans.sort_by_key(|span| span.start);
+            // Summary stops at the first gene span containing a circRNA. Gene
+            // bounds are accumulated through a HashMap, so full tie-breakers are
+            // required to keep overlapping annotation labels byte-reproducible.
+            spans.sort_by(|a, b| {
+                a.start
+                    .cmp(&b.start)
+                    .then_with(|| a.end.cmp(&b.end))
+                    .then_with(|| a.gene_id.cmp(&b.gene_id))
+            });
         }
         Ok(())
     }
@@ -250,5 +257,11 @@ impl Annotation {
             }
         }
         None
+    }
+}
+
+impl Default for Annotation {
+    fn default() -> Self {
+        Self::new()
     }
 }

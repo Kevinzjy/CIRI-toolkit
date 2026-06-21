@@ -151,6 +151,8 @@ fn advise_dontneed_aligned(mmap: &Mmap, offset: usize, len: usize) {
     let aligned_len = ((offset + len + page_size - 1) / page_size) * page_size - aligned_offset;
 
     unsafe {
+        // SAFETY: `aligned_offset` and `aligned_len` are page-aligned within the
+        // live mmap, and `madvise` only receives a non-mutating cache hint.
         let ptr = mmap.as_ptr().add(aligned_offset);
         libc::madvise(ptr as *mut libc::c_void, aligned_len, libc::MADV_DONTNEED);
     }
@@ -997,6 +999,8 @@ impl Scan1 {
         let profile_ref = profile.as_ref();
         let file = File::open(bam_file)?;
         let file_size = std::fs::metadata(bam_file)?.len();
+        // SAFETY: the file descriptor remains open while the mapping is created;
+        // the returned `Mmap` owns the mapping for the rest of this scope.
         let mmap = unsafe { Mmap::map(&file)? };
         let num_threads = bam_shard_count(mmap.len(), rayon::current_num_threads());
         let shard_size = mmap.len() / num_threads;
@@ -1013,6 +1017,8 @@ impl Scan1 {
         pb.enable_steady_tick(Duration::from_millis(120));
 
         unsafe {
+            // SAFETY: the pointer and length come from the live mapping, and
+            // `madvise` only changes the kernel's read-ahead/cache policy.
             libc::madvise(
                 mmap.as_ptr() as *mut libc::c_void,
                 mmap.len(),

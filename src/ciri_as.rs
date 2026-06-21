@@ -29,20 +29,28 @@ use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Seek, Write};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::annotation::Annotation;
 use crate::sam_bam::{detect_format, InputFormat};
 use crate::utils::{
-    bam_shard_count, bsj_payload_start, clip_placement_cigar, clip_sequence_payload,
-    exact_clip_match_positions, is_bsj_mate_label, parse_cigar_ops_basic, parse_clip_payload,
-    part_path, reverse_complement,
+    bam_shard_count, bsj_payload_start, cigar_is_full_match, clip_match_placements,
+    clip_placement_cigar, clip_sequence_payload, exact_clip_match_positions, is_bsj_mate_label,
+    parse_cigar_ops_basic, parse_clip_payload, part_path, reverse_complement,
 };
 
 const MIN_INTRON: i32 = 70;
 const MIN_EXON_LENGTH: i32 = 20;
 const MAX_EXON_LENGTH: i32 = 2000;
 const MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH: i32 = 10;
+/// Minimum `D` CIGAR span treated as a splice-like segment break.
+///
+/// BWA uses `N` for RNA gaps, but minibwa can encode the same exon-skipping
+/// evidence as a large deletion. Splitting only intron-scale deletions preserves
+/// normal small allele deletions inside one segment while recovering junction
+/// topology from mapper-compatible `D` records.
+const MIN_SPLIT_DELETION_SEGMENT_GAP: i32 = MIN_INTRON;
 const INTERNAL_SPLICE_CORRECTION_WINDOW: i32 = 4;
 const PARTIAL_LOCAL_SPLICE_CORRECTION_WINDOW: i32 = 16;
 /// Maximum movement allowed when a Summary-confirmed BSJ row is snapped back to
@@ -69,6 +77,10 @@ const OUTWARD_MIN_TERMINAL_CLIP: i32 = 19;
 /// outward-facing pair. Terminal clips are not required when the aligned spans
 /// already provide this much outward extension.
 const OUTWARD_MIN_PAIR_OFFSET: i32 = 19;
+const OUTWARD_SA_RETENTION_ENV: &str = "CIRI_SEGMENTS_OUTWARD_SA_RETENTION";
+const OUTWARD_SA_SHADOW_OVERLAP: i32 = OUTWARD_MIN_PAIR_OFFSET;
+const OUTWARD_SA_SHADOW_DISTANCE: i32 = 30;
+const OUTWARD_AMBIGUOUS_RANK_MARGIN: i32 = 20;
 const MAPQ_UNI: i32 = 0;
 const MAPQ_BOTH: i32 = 0;
 /// Maximum unspliced graph block kept as a single mature exon in isoform output.
@@ -78,12 +90,20 @@ const MAPQ_BOTH: i32 = 0;
 /// splice evidence; when annotation is available, those blocks are projected to
 /// known exons so intronic genomic span is not reported as mature RNA sequence.
 const MAJOR_MAX_UNSPLICED_EXON_LEN: i32 = MAX_EXON_LENGTH;
-/// Minimum BSJ/backward read-chain support required for every adjacent selected
-/// junction pair in a mature multi-exon isoform.
+/// Minimum read-chain support required for every adjacent selected junction pair
+/// in a mature multi-exon isoform.
 ///
-/// Outward reads are useful weak completion evidence during path selection, but
-/// they do not localize a BSJ range precisely enough to certify mature phasing.
+/// BSJ/backward rows contribute directly. Outward rows are pair-level circular
+/// evidence, so they do not choose structural splice edges; many outward rows
+/// supporting the same neighboring-junction link can only weakly certify that an
+/// already selected chain is phased.
 const MAJOR_MIN_MATURE_LINK_SUPPORT: f64 = 1.0;
+/// Weak contribution of outward reads to mature neighboring-junction phasing.
+///
+/// This requires roughly twenty outward read chains to equal one BSJ/backward
+/// chain and avoids letting unphased pair-orientation evidence overtake exact
+/// BSJ/backward structure during isoform path selection.
+const MAJOR_OUTWARD_LINK_WEIGHT: f64 = 0.05;
 /// Minimum continuous anchor on both sides of a candidate junction-exclusion span.
 ///
 /// A continuous block that merely overruns a splice boundary by a few bases can
@@ -108,6 +128,15 @@ const MAJOR_NON_BSJ_MIN_DISTANCE_SCALE: f64 = 100.0;
 /// that span define the scale would incorrectly make distant internal reads look
 /// compatible with an outer BSJ.
 const MAJOR_NON_BSJ_MAX_DISTANCE_SCALE: f64 = 1000.0;
+
+/// Outward pair source policy for minibwa non-BSJ sidecar evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutwardSaRetentionMode {
+    PrimaryOnly,
+    Supplementary,
+    Relaxed,
+    Filtered,
+}
 /// Maximum genomic gap used to merge high-confidence read spans into one
 /// estimate anchor.
 ///
@@ -151,6 +180,10 @@ const NON_BSJ_LOCAL_CLIP_ANCHOR_FLANK_MULTIPLIER: i32 = 2;
 const NON_BSJ_LOCAL_CLIP_MAX_ROWS_PER_READ: usize = 16;
 /// Maximum local clip placements retained for one clipped side before chain ranking.
 const NON_BSJ_LOCAL_CLIP_MAX_PLACEMENTS_PER_SIDE: usize = 4;
+/// Half-window around confirmed BSJ boundaries searched for terminal clip rescue.
+const BSJ_LOCAL_CLIP_BOUNDARY_FLANK_MULTIPLIER: i32 = 2;
+/// Maximum confirmed-BSJ clip placements retained per read before chain ranking.
+const BSJ_LOCAL_CLIP_MAX_ROWS_PER_READ: usize = 8;
 /// Minimum selected XA anchor length accepted by the backward negative filter.
 const XA_REJECT_MIN_ANCHOR_LEN: i32 = MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH;
 /// Minimum span reduction required before XA can reject a backward sidecar row.
@@ -1784,11 +1817,15 @@ fn spill_grouped_non_bsj_segment_evidence_mmap(
 ) -> Result<Vec<SegmentScanShardPaths>> {
     let file =
         File::open(path).with_context(|| format!("open non-BSJ segment evidence {}", path))?;
+    // SAFETY: the file descriptor remains open while the mapping is created;
+    // the returned `Mmap` owns the mapping for the rest of this scope.
     let mmap = unsafe { Mmap::map(&file)? };
     if mmap.is_empty() {
         return Ok(Vec::new());
     }
     unsafe {
+        // SAFETY: the pointer and length come from the live mapping, and
+        // `madvise` only changes the kernel's read-ahead/cache policy.
         libc::madvise(
             mmap.as_ptr() as *mut libc::c_void,
             mmap.len(),
@@ -2488,6 +2525,12 @@ fn parse_borrowed_chain_blocks(
                 }
                 read_pos += count;
             }
+            'D' if count >= MIN_SPLIT_DELETION_SEGMENT_GAP => {
+                if let Some(block) = current.take() {
+                    blocks.push(block);
+                }
+                ref_pos += count;
+            }
             'D' => {
                 ref_pos += count;
             }
@@ -2597,27 +2640,235 @@ fn is_outward_pair_group_view(
     records: &[NonBsjAlignmentView<'_>],
     ctx: &SegmentScanContext<'_>,
 ) -> bool {
-    let Some((r1, r2)) = primary_mate_pair_view(records) else {
-        return false;
-    };
-    if r1.chr != r2.chr || r1.chr == "*" || r1.mapq < ctx.min_mapq || r2.mapq < ctx.min_mapq {
-        return false;
-    }
     if has_linear_mate_pair_mapping_view(records, ctx) {
         return false;
     }
-    let Some(r1_span) = alignment_ref_span_view(r1) else {
-        return false;
-    };
-    let Some(r2_span) = alignment_ref_span_view(r2) else {
-        return false;
-    };
+    select_outward_mate_pair_view(records, ctx).is_some()
+}
+
+/// Selects the borrowed R1/R2 pair used for outward prefiltering.
+///
+/// The default path is the historical primary-only rule. The opt-in minibwa
+/// evaluation modes use supplementary alignments only after the primary pair
+/// fails, so already validated outward rows keep the same evidence source.
+fn select_outward_mate_pair_view<'a>(
+    records: &'a [NonBsjAlignmentView<'a>],
+    ctx: &SegmentScanContext<'_>,
+) -> Option<(&'a NonBsjAlignmentView<'a>, &'a NonBsjAlignmentView<'a>)> {
+    if let Some(pair) = primary_outward_mate_pair_view(records, ctx, false) {
+        return Some(pair);
+    }
+    let mode = outward_sa_retention_mode();
+    if mode == OutwardSaRetentionMode::PrimaryOnly {
+        return None;
+    }
+    let mut filtered_candidates: Vec<(
+        (&'a NonBsjAlignmentView<'a>, &'a NonBsjAlignmentView<'a>),
+        (i32, i32, i32),
+        ((i32, i32), (i32, i32)),
+    )> = Vec::new();
+    let mut best_candidate: Option<(
+        (&'a NonBsjAlignmentView<'a>, &'a NonBsjAlignmentView<'a>),
+        (i32, i32, i32),
+    )> = None;
+    for left_idx in 0..records.len() {
+        let left = &records[left_idx];
+        if !is_outward_retention_record_view(left) {
+            continue;
+        }
+        let Some(left_span) = alignment_ref_span_view(left) else {
+            continue;
+        };
+        for right in &records[left_idx + 1..] {
+            if !is_outward_retention_record_view(right)
+                || left.chr != right.chr
+                || mate_bucket(left.flag) == mate_bucket(right.flag)
+                || !outward_pair_mapq_pass(left.mapq, right.mapq, ctx.min_mapq, mode)
+            {
+                continue;
+            }
+            let Some(right_span) = alignment_ref_span_view(right) else {
+                continue;
+            };
+            if !has_3p_outward_pair_geometry_view(left, left_span, right, right_span) {
+                continue;
+            }
+            if mode == OutwardSaRetentionMode::Filtered
+                && has_shadowed_supplementary_pair_view(
+                    records,
+                    left,
+                    left_span,
+                    right,
+                    right_span,
+                    ctx.min_mapq,
+                )
+            {
+                continue;
+            }
+            let span_start = left_span.0.min(right_span.0);
+            let span_end = left_span.1.max(right_span.1);
+            if span_end - span_start + 1 > BACKWARD_MAX_SPAN {
+                continue;
+            }
+            let primary_count =
+                i32::from(!is_supplementary(left.flag)) + i32::from(!is_supplementary(right.flag));
+            let rank = (
+                left.mapq + right.mapq,
+                primary_count,
+                -(span_end - span_start + 1),
+            );
+            if mode == OutwardSaRetentionMode::Filtered {
+                filtered_candidates.push(((left, right), rank, (left_span, right_span)));
+            } else if best_candidate
+                .as_ref()
+                .map_or(true, |(_, best_rank)| rank >= *best_rank)
+            {
+                best_candidate = Some(((left, right), rank));
+            }
+        }
+    }
+    if mode != OutwardSaRetentionMode::Filtered {
+        return best_candidate.map(|(pair, _)| pair);
+    }
+    let (best_idx, _) = filtered_candidates
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (_, rank, _))| *rank)?;
+    if has_ambiguous_outward_candidate_view(&filtered_candidates, best_idx) {
+        return None;
+    }
+    Some(filtered_candidates[best_idx].0)
+}
+
+/// Applies the historical primary-only outward geometry to borrowed records.
+fn primary_outward_mate_pair_view<'a>(
+    records: &'a [NonBsjAlignmentView<'a>],
+    ctx: &SegmentScanContext<'_>,
+    relaxed_mapq: bool,
+) -> Option<(&'a NonBsjAlignmentView<'a>, &'a NonBsjAlignmentView<'a>)> {
+    let (r1, r2) = primary_mate_pair_view(records)?;
+    if r1.chr != r2.chr
+        || r1.chr == "*"
+        || !outward_pair_mapq_pass(
+            r1.mapq,
+            r2.mapq,
+            ctx.min_mapq,
+            if relaxed_mapq {
+                OutwardSaRetentionMode::Relaxed
+            } else {
+                OutwardSaRetentionMode::Supplementary
+            },
+        )
+    {
+        return None;
+    }
+    let r1_span = alignment_ref_span_view(r1)?;
+    let r2_span = alignment_ref_span_view(r2)?;
     if !has_3p_outward_pair_geometry_view(r1, r1_span, r2, r2_span) {
-        return false;
+        return None;
     }
     let span_start = r1_span.0.min(r2_span.0);
     let span_end = r1_span.1.max(r2_span.1);
-    span_end - span_start + 1 <= BACKWARD_MAX_SPAN
+    (span_end - span_start + 1 <= BACKWARD_MAX_SPAN).then_some((r1, r2))
+}
+
+/// Returns whether one borrowed alignment can participate in opt-in outward recovery.
+fn is_outward_retention_record_view(record: &NonBsjAlignmentView<'_>) -> bool {
+    record.flag & 0x4 == 0 && !is_secondary(record.flag) && record.chr != "*" && record.cigar != "*"
+}
+
+/// Rejects supplementary outward pairs that are explained by a nearby primary mate.
+fn has_shadowed_supplementary_pair_view(
+    records: &[NonBsjAlignmentView<'_>],
+    left: &NonBsjAlignmentView<'_>,
+    left_span: (i32, i32),
+    right: &NonBsjAlignmentView<'_>,
+    right_span: (i32, i32),
+    min_mapq: i32,
+) -> bool {
+    supplementary_is_shadowed_view(records, left, right_span, min_mapq)
+        || supplementary_is_shadowed_view(records, right, left_span, min_mapq)
+}
+
+/// Returns whether a borrowed outward pair has a near-equal alternative placement.
+fn has_ambiguous_outward_candidate_view(
+    candidates: &[(
+        (&NonBsjAlignmentView<'_>, &NonBsjAlignmentView<'_>),
+        (i32, i32, i32),
+        ((i32, i32), (i32, i32)),
+    )],
+    best_idx: usize,
+) -> bool {
+    let (best_pair, best_rank, best_spans) = &candidates[best_idx];
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *idx != best_idx)
+        .any(|(_, (pair, rank, spans))| {
+            rank.0 + OUTWARD_AMBIGUOUS_RANK_MARGIN >= best_rank.0
+                && outward_candidate_is_distinct_view(best_pair, best_spans, pair, spans)
+        })
+}
+
+/// Returns whether two borrowed outward candidates place evidence differently.
+fn outward_candidate_is_distinct_view(
+    best_pair: &(&NonBsjAlignmentView<'_>, &NonBsjAlignmentView<'_>),
+    best_spans: &((i32, i32), (i32, i32)),
+    pair: &(&NonBsjAlignmentView<'_>, &NonBsjAlignmentView<'_>),
+    spans: &((i32, i32), (i32, i32)),
+) -> bool {
+    best_pair.0.chr != pair.0.chr
+        || best_pair.1.chr != pair.1.chr
+        || span_distance(best_spans.0, spans.0) > OUTWARD_SA_SHADOW_DISTANCE
+        || span_distance(best_spans.1, spans.1) > OUTWARD_SA_SHADOW_DISTANCE
+}
+
+/// Returns whether one selected supplementary alignment has a primary explanation.
+fn supplementary_is_shadowed_view(
+    records: &[NonBsjAlignmentView<'_>],
+    selected: &NonBsjAlignmentView<'_>,
+    opposite_span: (i32, i32),
+    min_mapq: i32,
+) -> bool {
+    if !is_supplementary(selected.flag) {
+        return false;
+    }
+    for record in records {
+        if record.flag & 0x4 != 0
+            || is_secondary(record.flag)
+            || is_supplementary(record.flag)
+            || record.mapq < min_mapq
+            || mate_bucket(record.flag) != mate_bucket(selected.flag)
+            || record.chr != selected.chr
+        {
+            continue;
+        }
+        let Some(primary_span) = alignment_ref_span_view(record) else {
+            continue;
+        };
+        if span_overlap(primary_span, opposite_span) >= OUTWARD_SA_SHADOW_OVERLAP
+            || span_distance(primary_span, opposite_span) <= OUTWARD_SA_SHADOW_DISTANCE
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns the overlap length between two inclusive reference spans.
+fn span_overlap(left: (i32, i32), right: (i32, i32)) -> i32 {
+    0.max(left.1.min(right.1) - left.0.max(right.0) + 1)
+}
+
+/// Returns the gap between two inclusive reference spans, or zero if overlapping.
+fn span_distance(left: (i32, i32), right: (i32, i32)) -> i32 {
+    if left.1 < right.0 {
+        right.0 - left.1
+    } else if right.1 < left.0 {
+        left.0 - right.1
+    } else {
+        0
+    }
 }
 
 /// Borrowed-form equivalent of the linear mate-pair negative filter.
@@ -3836,6 +4087,8 @@ fn scan_backward_bam_groups_parallel(
 ) -> Result<Vec<SegmentScanShardPaths>> {
     let file = File::open(path).with_context(|| format!("open BAM {}", path))?;
     let file_size = std::fs::metadata(path)?.len();
+    // SAFETY: the file descriptor remains open while the mapping is created;
+    // the returned `Mmap` owns the mapping for the rest of this scope.
     let mmap = unsafe { Mmap::map(&file)? };
     let num_threads = bam_shard_count(mmap.len(), rayon::current_num_threads());
     let shard_size = mmap.len() / num_threads;
@@ -3844,6 +4097,8 @@ fn scan_backward_bam_groups_parallel(
     let pb = segment_scan_progress_bar(path)?;
 
     unsafe {
+        // SAFETY: the pointer and length come from the live mapping, and
+        // `madvise` only changes the kernel's read-ahead/cache policy.
         libc::madvise(
             mmap.as_ptr() as *mut libc::c_void,
             mmap.len(),
@@ -4014,6 +4269,8 @@ fn advise_segment_mmap_dontneed(mmap: &Mmap, offset: usize, len: usize) {
     let aligned_offset = (offset / page_size) * page_size;
     let aligned_len = ((offset + len + page_size - 1) / page_size) * page_size - aligned_offset;
     unsafe {
+        // SAFETY: `aligned_offset` and `aligned_len` are page-aligned within the
+        // live mmap, and `madvise` only receives a non-mutating cache hint.
         let ptr = mmap.as_ptr().add(aligned_offset);
         libc::madvise(ptr as *mut libc::c_void, aligned_len, libc::MADV_DONTNEED);
     }
@@ -4716,6 +4973,189 @@ fn non_bsj_local_clip_alignments(
     out
 }
 
+/// Adds circ-boundary local soft-clip pseudo-alignments for one confirmed BSJ row.
+///
+/// This rescue is deliberately narrower than the non-BSJ local-clip path: the
+/// Summary row already fixes the circRNA locus, so clipped anchors are searched
+/// only around the two confirmed BSJ boundaries. That recovers mapper-missed
+/// terminal anchors such as `22S128M` without promoting unrelated repeat hits
+/// from the rest of the read neighborhood.
+fn try_add_bsj_local_clip_alignments(
+    records: &[AsAlignment],
+    circ: &CircRecord,
+    correction: &SegmentCorrectionContext<'_>,
+    read_len: i32,
+) -> Option<Vec<AsAlignment>> {
+    if !records.iter().any(|record| {
+        !record.from_local_clip
+            && record.chr == circ.chr
+            && record.cigar.contains('S')
+            && !record.seq.is_empty()
+            && record.seq != "*"
+    }) {
+        return None;
+    }
+
+    let windows = bsj_local_clip_windows(circ, correction.reference, read_len);
+    if windows.is_empty() {
+        return None;
+    }
+    let mut local = bsj_local_clip_alignments(records, circ, &windows, correction, read_len);
+    if local.is_empty() {
+        return None;
+    }
+    local.sort_by(|a, b| {
+        mate_bucket(a.flag)
+            .cmp(&mate_bucket(b.flag))
+            .then_with(|| a.pos.cmp(&b.pos))
+            .then_with(|| a.cigar.cmp(&b.cigar))
+    });
+    local.truncate(BSJ_LOCAL_CLIP_MAX_ROWS_PER_READ);
+    let mut out = records.to_vec();
+    out.extend(local);
+    Some(out)
+}
+
+/// Builds two confirmed-boundary windows for BSJ terminal-clip placement.
+fn bsj_local_clip_windows(
+    circ: &CircRecord,
+    reference: &HashMap<String, String>,
+    read_len: i32,
+) -> Vec<LocalClipWindow> {
+    let mut windows = Vec::new();
+    let mut seen = HashSet::new();
+    let flank = read_len * BSJ_LOCAL_CLIP_BOUNDARY_FLANK_MULTIPLIER;
+    push_local_clip_anchor_window(
+        &mut windows,
+        &mut seen,
+        reference,
+        &circ.chr,
+        circ.start,
+        flank,
+    );
+    push_local_clip_anchor_window(
+        &mut windows,
+        &mut seen,
+        reference,
+        &circ.chr,
+        circ.end,
+        flank,
+    );
+    windows
+}
+
+/// Generates BSJ-boundary pseudo-alignments from full or longest-partial clips.
+fn bsj_local_clip_alignments(
+    records: &[AsAlignment],
+    circ: &CircRecord,
+    windows: &[LocalClipWindow],
+    correction: &SegmentCorrectionContext<'_>,
+    read_len: i32,
+) -> Vec<AsAlignment> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let min_clip_len = MIN_JUNCTION_SUPPORT_SEGMENT_LENGTH as usize;
+    for record in records {
+        if record.from_local_clip
+            || record.chr != circ.chr
+            || !record.cigar.contains('S')
+            || record.seq.is_empty()
+            || record.seq == "*"
+        {
+            continue;
+        }
+        let payload = segment_clip_payload(record);
+        if payload == "*" {
+            continue;
+        }
+        for (side, clip_seq) in parse_clip_payload(&payload) {
+            if clip_seq.len() < min_clip_len || clip_seq.contains('N') {
+                continue;
+            }
+            let query = clip_seq.to_ascii_uppercase();
+            if query.contains('N') {
+                continue;
+            }
+            let mut candidates: Vec<((i32, i32, i32, i32), AsAlignment)> = Vec::new();
+            for window in windows.iter().filter(|window| window.chr == record.chr) {
+                let Some(chr_seq) = correction.reference.get(&window.chr) else {
+                    continue;
+                };
+                let Some(local_seq) = chr_seq.get((window.start - 1) as usize..window.end as usize)
+                else {
+                    continue;
+                };
+                for placement in
+                    clip_match_placements(local_seq, &query, window.start, window.end, min_clip_len)
+                {
+                    let boundary_distance =
+                        bsj_clip_boundary_distance(placement.pos, placement.len, circ);
+                    if boundary_distance > CONFIRMED_BSJ_BOUNDARY_CORRECTION_WINDOW {
+                        continue;
+                    }
+                    let Some(cigar) = clip_placement_cigar(
+                        side,
+                        clip_seq.len(),
+                        placement.clip_offset,
+                        placement.len,
+                        read_len,
+                    ) else {
+                        continue;
+                    };
+                    let flag = record.flag | 0x800;
+                    let key = (
+                        flag,
+                        window.chr.clone(),
+                        placement.pos,
+                        cigar.clone(),
+                        side,
+                        placement.clip_offset,
+                        placement.len,
+                    );
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    let distance =
+                        local_clip_distance_to_group(records, &window.chr, placement.pos, read_len);
+                    candidates.push((
+                        (
+                            boundary_distance,
+                            -(placement.len as i32),
+                            distance,
+                            placement.pos,
+                        ),
+                        AsAlignment {
+                            flag,
+                            chr: window.chr.clone(),
+                            pos: placement.pos,
+                            mapq: record.mapq.saturating_sub(1),
+                            cigar,
+                            seq: String::new(),
+                            cs: format!(":{}", placement.len),
+                            from_local_clip: true,
+                            xa_alternatives: Vec::new(),
+                        },
+                    ));
+                }
+            }
+            candidates.sort_by(|a, b| a.0.cmp(&b.0));
+            out.extend(
+                candidates
+                    .into_iter()
+                    .take(NON_BSJ_LOCAL_CLIP_MAX_PLACEMENTS_PER_SIDE)
+                    .map(|(_, alignment)| alignment),
+            );
+        }
+    }
+    out
+}
+
+/// Scores whether a local clip placement lands on either confirmed BSJ edge.
+fn bsj_clip_boundary_distance(pos: i32, len: usize, circ: &CircRecord) -> i32 {
+    let end = pos + len as i32 - 1;
+    (pos - circ.start).abs().min((end - circ.end).abs())
+}
+
 /// Scores how close a local clip placement is to the read group's mapped blocks.
 fn local_clip_distance_to_group(
     records: &[AsAlignment],
@@ -4787,27 +5227,278 @@ fn is_outward_pair_group(records: &[AsAlignment], state: &ScanState) -> bool {
 
 /// Shared-context form of outward pair detection for parallel segments shards.
 fn is_outward_pair_group_ctx(records: &[AsAlignment], ctx: &SegmentScanContext<'_>) -> bool {
-    let Some((r1, r2)) = primary_mate_pair(records) else {
-        return false;
-    };
-    if r1.chr != r2.chr || r1.chr == "*" || r1.mapq < ctx.min_mapq || r2.mapq < ctx.min_mapq {
-        return false;
-    }
     if has_linear_mate_pair_mapping(records, ctx) {
         return false;
     }
-    let Some((r1_start, r1_end)) = alignment_ref_span(r1, ctx.read_len) else {
-        return false;
-    };
-    let Some((r2_start, r2_end)) = alignment_ref_span(r2, ctx.read_len) else {
-        return false;
-    };
-    if !has_3p_outward_pair_geometry(r1, (r1_start, r1_end), r2, (r2_start, r2_end)) {
+    select_outward_mate_pair(records, ctx.read_len, ctx.min_mapq).is_some()
+}
+
+/// Selects the R1/R2 pair used to materialize one outward segment row.
+///
+/// Default behavior is primary-only for CIRI3-compatible segment output. The
+/// environment-controlled modes are deliberately experimental and exist to
+/// measure whether minibwa supplementary alignments can recover outward reads
+/// without changing Scan1/Scan2 BSJ decisions.
+fn select_outward_mate_pair(
+    records: &[AsAlignment],
+    read_len: i32,
+    min_mapq: i32,
+) -> Option<(&AsAlignment, &AsAlignment)> {
+    if let Some(pair) = primary_outward_mate_pair(records, read_len, min_mapq, false) {
+        return Some(pair);
+    }
+    let mode = outward_sa_retention_mode();
+    if mode == OutwardSaRetentionMode::PrimaryOnly {
+        return None;
+    }
+    let mut filtered_candidates: Vec<(
+        (&AsAlignment, &AsAlignment),
+        (i32, i32, i32),
+        ((i32, i32), (i32, i32)),
+    )> = Vec::new();
+    let mut best_candidate: Option<((&AsAlignment, &AsAlignment), (i32, i32, i32))> = None;
+    for left_idx in 0..records.len() {
+        let left = &records[left_idx];
+        if !is_outward_retention_record(left) {
+            continue;
+        }
+        let Some(left_span) = alignment_ref_span(left, read_len) else {
+            continue;
+        };
+        for right in &records[left_idx + 1..] {
+            if !is_outward_retention_record(right)
+                || left.chr != right.chr
+                || mate_bucket(left.flag) == mate_bucket(right.flag)
+                || !outward_pair_mapq_pass(left.mapq, right.mapq, min_mapq, mode)
+            {
+                continue;
+            }
+            let Some(right_span) = alignment_ref_span(right, read_len) else {
+                continue;
+            };
+            if !has_3p_outward_pair_geometry(left, left_span, right, right_span) {
+                continue;
+            }
+            if mode == OutwardSaRetentionMode::Filtered
+                && has_shadowed_supplementary_pair(
+                    records, left, left_span, right, right_span, read_len, min_mapq,
+                )
+            {
+                continue;
+            }
+            let span_start = left_span.0.min(right_span.0);
+            let span_end = left_span.1.max(right_span.1);
+            if span_end - span_start + 1 > BACKWARD_MAX_SPAN {
+                continue;
+            }
+            let primary_count =
+                i32::from(!is_supplementary(left.flag)) + i32::from(!is_supplementary(right.flag));
+            let rank = (
+                left.mapq + right.mapq,
+                primary_count,
+                -(span_end - span_start + 1),
+            );
+            if mode == OutwardSaRetentionMode::Filtered {
+                filtered_candidates.push(((left, right), rank, (left_span, right_span)));
+            } else if best_candidate
+                .as_ref()
+                .map_or(true, |(_, best_rank)| rank >= *best_rank)
+            {
+                best_candidate = Some(((left, right), rank));
+            }
+        }
+    }
+    if mode != OutwardSaRetentionMode::Filtered {
+        return best_candidate.map(|(pair, _)| pair);
+    }
+    let (best_idx, _) = filtered_candidates
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, (_, rank, _))| *rank)?;
+    if has_ambiguous_outward_candidate(&filtered_candidates, best_idx) {
+        return None;
+    }
+    Some(filtered_candidates[best_idx].0)
+}
+
+/// Applies the historical primary-pair outward rule to owned alignments.
+fn primary_outward_mate_pair(
+    records: &[AsAlignment],
+    read_len: i32,
+    min_mapq: i32,
+    relaxed_mapq: bool,
+) -> Option<(&AsAlignment, &AsAlignment)> {
+    let (r1, r2) = primary_mate_pair(records)?;
+    if r1.chr != r2.chr
+        || r1.chr == "*"
+        || !outward_pair_mapq_pass(
+            r1.mapq,
+            r2.mapq,
+            min_mapq,
+            if relaxed_mapq {
+                OutwardSaRetentionMode::Relaxed
+            } else {
+                OutwardSaRetentionMode::Supplementary
+            },
+        )
+    {
+        return None;
+    }
+    let r1_span = alignment_ref_span(r1, read_len)?;
+    let r2_span = alignment_ref_span(r2, read_len)?;
+    if !has_3p_outward_pair_geometry(r1, r1_span, r2, r2_span) {
+        return None;
+    }
+    let span_start = r1_span.0.min(r2_span.0);
+    let span_end = r1_span.1.max(r2_span.1);
+    (span_end - span_start + 1 <= BACKWARD_MAX_SPAN).then_some((r1, r2))
+}
+
+/// Returns whether one owned alignment can participate in opt-in outward recovery.
+fn is_outward_retention_record(record: &AsAlignment) -> bool {
+    record.flag & 0x4 == 0
+        && !record.from_local_clip
+        && !is_secondary(record.flag)
+        && record.chr != "*"
+        && record.cigar != "*"
+}
+
+/// Rejects supplementary outward pairs that a same-mate primary alignment shadows.
+fn has_shadowed_supplementary_pair(
+    records: &[AsAlignment],
+    left: &AsAlignment,
+    left_span: (i32, i32),
+    right: &AsAlignment,
+    right_span: (i32, i32),
+    read_len: i32,
+    min_mapq: i32,
+) -> bool {
+    supplementary_is_shadowed(records, left, right_span, read_len, min_mapq)
+        || supplementary_is_shadowed(records, right, left_span, read_len, min_mapq)
+}
+
+/// Returns whether one owned outward pair has a near-equal alternative placement.
+fn has_ambiguous_outward_candidate(
+    candidates: &[(
+        (&AsAlignment, &AsAlignment),
+        (i32, i32, i32),
+        ((i32, i32), (i32, i32)),
+    )],
+    best_idx: usize,
+) -> bool {
+    let (best_pair, best_rank, best_spans) = &candidates[best_idx];
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *idx != best_idx)
+        .any(|(_, (pair, rank, spans))| {
+            rank.0 + OUTWARD_AMBIGUOUS_RANK_MARGIN >= best_rank.0
+                && outward_candidate_is_distinct(best_pair, best_spans, pair, spans)
+        })
+}
+
+/// Returns whether two owned outward candidates place evidence differently.
+fn outward_candidate_is_distinct(
+    best_pair: &(&AsAlignment, &AsAlignment),
+    best_spans: &((i32, i32), (i32, i32)),
+    pair: &(&AsAlignment, &AsAlignment),
+    spans: &((i32, i32), (i32, i32)),
+) -> bool {
+    best_pair.0.chr != pair.0.chr
+        || best_pair.1.chr != pair.1.chr
+        || span_distance(best_spans.0, spans.0) > OUTWARD_SA_SHADOW_DISTANCE
+        || span_distance(best_spans.1, spans.1) > OUTWARD_SA_SHADOW_DISTANCE
+}
+
+/// Returns whether one selected supplementary alignment is likely a linear SA tail.
+fn supplementary_is_shadowed(
+    records: &[AsAlignment],
+    selected: &AsAlignment,
+    opposite_span: (i32, i32),
+    read_len: i32,
+    min_mapq: i32,
+) -> bool {
+    if !is_supplementary(selected.flag) {
         return false;
     }
-    let span_start = r1_start.min(r2_start);
-    let span_end = r1_end.max(r2_end);
-    span_end - span_start + 1 <= BACKWARD_MAX_SPAN
+    for record in records {
+        if record.flag & 0x4 != 0
+            || record.from_local_clip
+            || is_secondary(record.flag)
+            || is_supplementary(record.flag)
+            || record.mapq < min_mapq
+            || mate_bucket(record.flag) != mate_bucket(selected.flag)
+            || record.chr != selected.chr
+        {
+            continue;
+        }
+        let Some(primary_span) = alignment_ref_span(record, read_len) else {
+            continue;
+        };
+        if span_overlap(primary_span, opposite_span) >= OUTWARD_SA_SHADOW_OVERLAP
+            || span_distance(primary_span, opposite_span) <= OUTWARD_SA_SHADOW_DISTANCE
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns the outward supplementary-retention mode.
+///
+/// Simulator evaluation currently favors recall over scan-time speed for this
+/// evidence layer, so the default keeps relaxed SA-aware retention enabled.
+/// Operators can still select `filtered` or `primary` through the environment
+/// when auditing stricter precision or lower sidecar volume.
+fn outward_sa_retention_mode() -> OutwardSaRetentionMode {
+    static MODE: OnceLock<OutwardSaRetentionMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let value = std::env::var(OUTWARD_SA_RETENTION_ENV).ok();
+        parse_outward_sa_retention_mode(value.as_deref())
+    })
+}
+
+/// Parses outward supplementary-retention configuration.
+///
+/// This keeps the recognition-first default explicit and independently
+/// testable while the runtime path still caches the parsed environment value.
+/// Only an unset environment variable opts into that default; unknown explicit
+/// values fall back to primary-only so stale or typoed overrides do not expand
+/// sidecar retention.
+fn parse_outward_sa_retention_mode(value: Option<&str>) -> OutwardSaRetentionMode {
+    let Some(value) = value else {
+        return OutwardSaRetentionMode::Relaxed;
+    };
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("supplementary") {
+        OutwardSaRetentionMode::Supplementary
+    } else if value.eq_ignore_ascii_case("relaxed") {
+        OutwardSaRetentionMode::Relaxed
+    } else if value.eq_ignore_ascii_case("filtered") {
+        OutwardSaRetentionMode::Filtered
+    } else if value.eq_ignore_ascii_case("primary")
+        || value.eq_ignore_ascii_case("primary_only")
+        || value.eq_ignore_ascii_case("primary-only")
+    {
+        OutwardSaRetentionMode::PrimaryOnly
+    } else {
+        OutwardSaRetentionMode::PrimaryOnly
+    }
+}
+
+/// Applies the MAPQ policy for primary and supplementary outward pair tests.
+fn outward_pair_mapq_pass(
+    left_mapq: i32,
+    right_mapq: i32,
+    min_mapq: i32,
+    mode: OutwardSaRetentionMode,
+) -> bool {
+    match mode {
+        OutwardSaRetentionMode::PrimaryOnly => false,
+        OutwardSaRetentionMode::Supplementary => left_mapq >= min_mapq && right_mapq >= min_mapq,
+        OutwardSaRetentionMode::Filtered => left_mapq >= min_mapq && right_mapq >= min_mapq,
+        OutwardSaRetentionMode::Relaxed => left_mapq.max(right_mapq) >= min_mapq,
+    }
 }
 
 /// Returns whether any R1/R2 alignment pair can explain the read as linear.
@@ -4986,6 +5677,14 @@ fn primary_mate_alignment_strands(records: &[AsAlignment]) -> (String, String) {
     (
         strands[0].map_or_else(|| "NA".to_string(), |strand| strand.to_string()),
         strands[1].map_or_else(|| "NA".to_string(), |strand| strand.to_string()),
+    )
+}
+
+/// Returns alignment strands for the actual pair chosen for an outward row.
+fn selected_mate_alignment_strands(r1: &AsAlignment, r2: &AsAlignment) -> (String, String) {
+    (
+        strand_char(r1.flag).to_string(),
+        strand_char(r2.flag).to_string(),
     )
 }
 
@@ -5530,7 +6229,7 @@ fn msid(cigar: &str, read_len: i32) -> Msid {
         };
     }
     if counts.len() == 1 {
-        return if cigar == format!("{}M", read_len) {
+        return if cigar_is_full_match(cigar, read_len) {
             Msid {
                 kind: 0,
                 clip1: 0,
@@ -6558,8 +7257,11 @@ fn build_bsj_segment_record(
     {
         bsj_row_junction_hints.push((-circ.end, -circ.start));
     }
+    let enriched_records =
+        correction.and_then(|ctx| try_add_bsj_local_clip_alignments(records, circ, ctx, read_len));
+    let chain_records = enriched_records.as_deref().unwrap_or(records);
     let mut chains = build_pair_chains(
-        records,
+        chain_records,
         read_len,
         Some(circ),
         "bsj",
@@ -6569,7 +7271,7 @@ fn build_bsj_segment_record(
     );
     repair_bsj_non_bsj_mates_by_xa(
         &mut chains,
-        records,
+        chain_records,
         circ,
         read_len,
         token_strand,
@@ -6578,7 +7280,7 @@ fn build_bsj_segment_record(
     );
     repair_bsj_non_bsj_mates_by_circ_records(
         &mut chains,
-        records,
+        chain_records,
         circ,
         read_len,
         token_strand,
@@ -6587,7 +7289,7 @@ fn build_bsj_segment_record(
     );
     repair_bsj_mates_by_confirmed_site(
         &mut chains,
-        records,
+        chain_records,
         circ,
         mate_bsj_evidence,
         read_len,
@@ -6716,13 +7418,14 @@ fn build_outward_segment_record(
     read_len: i32,
     min_mapq: i32,
 ) -> Option<SegmentRecord> {
-    let (r1, r2) = primary_mate_pair(records)?;
-    if r1.mapq < min_mapq || r2.mapq < min_mapq {
-        return None;
-    }
+    let (left, right) = select_outward_mate_pair(records, read_len, min_mapq)?;
+    let (r1, r2) = selected_pair_in_mate_order(left, right)?;
+    let selected = [r1.clone(), r2.clone()];
     let mut chains = build_pair_chains(records, read_len, None, "outward", '?', &[], correction);
     if chains.iter().flatten().any(|chain| chain.is_circular) {
-        let selected = [r1.clone(), r2.clone()];
+        chains = build_pair_chains(&selected, read_len, None, "outward", '?', &[], correction);
+    }
+    if selected_chain_span(&chains).is_none() {
         chains = build_pair_chains(&selected, read_len, None, "outward", '?', &[], correction);
     }
     if chains.iter().flatten().any(|chain| chain.is_circular) {
@@ -6740,7 +7443,17 @@ fn build_outward_segment_record(
             correction,
         );
         if chains.iter().flatten().any(|chain| chain.is_circular) {
-            let selected = [r1.clone(), r2.clone()];
+            chains = build_pair_chains(
+                &selected,
+                read_len,
+                None,
+                "outward",
+                token_strand,
+                &[],
+                correction,
+            );
+        }
+        if selected_chain_span(&chains).is_none() {
             chains = build_pair_chains(
                 &selected,
                 read_len,
@@ -6765,7 +7478,7 @@ fn build_outward_segment_record(
     if !has_3p_outward_pair_geometry(r1, r1_span, r2, r2_span) {
         return None;
     }
-    let (r1_align_strand, r2_align_strand) = primary_mate_alignment_strands(records);
+    let (r1_align_strand, r2_align_strand) = selected_mate_alignment_strands(r1, r2);
     let (r1_segments, r1_cigar, r1_cs, _) = chain_text(chains[0].as_ref());
     let (r2_segments, r2_cigar, r2_cs, _) = chain_text(chains[1].as_ref());
     Some(SegmentRecord {
@@ -6788,6 +7501,23 @@ fn build_outward_segment_record(
         r2_cs,
         r2_segments,
     })
+}
+
+/// Returns a selected outward pair as R1/R2 regardless of sidecar scan order.
+///
+/// Supplementary-aware retention scans all alignment pairs in stored order, so
+/// an R2 record can be selected before its R1 mate. Downstream chain arrays are
+/// indexed by mate bucket, making this normalization required before comparing
+/// selected alignment metadata with `chains[0]` and `chains[1]`.
+fn selected_pair_in_mate_order<'a>(
+    left: &'a AsAlignment,
+    right: &'a AsAlignment,
+) -> Option<(&'a AsAlignment, &'a AsAlignment)> {
+    match (mate_bucket(left.flag), mate_bucket(right.flag)) {
+        (0, 1) => Some((left, right)),
+        (1, 0) => Some((right, left)),
+        _ => None,
+    }
 }
 
 /// Infers an outward row's RNA strand from mate-internal splice junctions.
@@ -7875,6 +8605,12 @@ fn parse_alignment_blocks(record: &AsAlignment, read_len: i32) -> Option<Vec<Seg
                 }
                 read_pos += count;
             }
+            'D' if count >= MIN_SPLIT_DELETION_SEGMENT_GAP => {
+                if let Some(block) = current.take() {
+                    blocks.push(block);
+                }
+                ref_pos += count;
+            }
             'D' => {
                 if let Some(block) = current.as_mut() {
                     block.ref_end += count;
@@ -8188,6 +8924,11 @@ fn synced_payload_block_after_boundary_correction(
 /// rows mark every selected wrap even when the boundary is not a confirmed BSJ.
 /// Re-sorting these blocks by coordinate would turn `C|B|A` circRNA evidence
 /// into a linear-looking `A|B|C` chain.
+///
+/// Non-BSJ gaps shorter than `MIN_INTRON` are kept as deletion-like alignment
+/// detail instead of splice `N` operators. Minibwa can fragment exonic sequence
+/// by a few bases; writing those fragments as separate segment tokens would
+/// create false junction support for downstream isoform reconstruction.
 fn materialize_read_chain_output(
     blocks: &[SegmentBlock],
     query_seqs: &[String],
@@ -8213,20 +8954,39 @@ fn materialize_read_chain_output(
         }
     }
     for (idx, block) in blocks.iter().enumerate() {
+        let mut merge_with_previous_token = false;
         if idx > 0 {
             let prev = &blocks[idx - 1];
             let gap = interval_gap(prev, block);
-            let op = if boundary_gap_idxs.contains(&idx) {
-                'B'
-            } else {
-                'N'
-            };
-            let _ = write!(&mut cigar, "{}{}", gap, op);
-            if let Some(chr_seq) = reference_seq {
-                cs.push_str(&segment_gap_cs(prev, block, chr_seq, op == 'B'));
-            }
-            if op == 'B' {
-                tokens.push("<bsj>".to_string());
+            match read_chain_gap_op(boundary_gap_idxs, idx, gap) {
+                'B' => {
+                    let _ = write!(&mut cigar, "{}B", gap);
+                    if let Some(chr_seq) = reference_seq {
+                        cs.push_str(&segment_gap_cs(prev, block, chr_seq, true));
+                    }
+                    tokens.push("<bsj>".to_string());
+                }
+                'N' => {
+                    let _ = write!(&mut cigar, "{}N", gap);
+                    if let Some(chr_seq) = reference_seq {
+                        cs.push_str(&segment_gap_cs(prev, block, chr_seq, false));
+                    }
+                }
+                'D' => {
+                    if gap > 0 {
+                        let _ = write!(&mut cigar, "{}D", gap);
+                        if let Some(chr_seq) = reference_seq {
+                            let gap_cs = segment_deletion_gap_cs(prev, block, chr_seq);
+                            if gap_cs == "*" {
+                                cs_available = false;
+                            } else {
+                                cs.push_str(&gap_cs);
+                            }
+                        }
+                    }
+                    merge_with_previous_token = true;
+                }
+                _ => unreachable!("read-chain gap op is constrained to B/N/D"),
             }
         }
         let block_cigar = segment_block_cigar(block);
@@ -8237,6 +8997,11 @@ fn materialize_read_chain_output(
                 cs_available = false;
             }
             cs.push_str(&block_cs);
+        }
+        if merge_with_previous_token
+            && merge_last_segment_token(&mut tokens, &mut token_spans, block, token_strand)
+        {
+            continue;
         }
         tokens.push(format!(
             "{}-{}:{}",
@@ -8260,6 +9025,50 @@ fn materialize_read_chain_output(
         "*".to_string()
     };
     (tokens, token_spans, cigar, cs)
+}
+
+/// Chooses the public read-chain gap operator between adjacent output blocks.
+///
+/// Circular read-order boundaries remain `B` even at zero genomic distance.
+/// Ordinary intron-scale skips remain `N`. Sub-intron gaps are represented as
+/// deletion-like `D` detail and their segment tokens are merged, preventing tiny
+/// mapper gaps from becoming splice graph edges.
+fn read_chain_gap_op(boundary_gap_idxs: &[usize], idx: usize, gap: i32) -> char {
+    if boundary_gap_idxs.contains(&idx) {
+        'B'
+    } else if gap >= MIN_INTRON {
+        'N'
+    } else {
+        'D'
+    }
+}
+
+/// Extends the last emitted segment token across a sub-intron mapper gap.
+fn merge_last_segment_token(
+    tokens: &mut [String],
+    token_spans: &mut [(i32, i32)],
+    block: &SegmentBlock,
+    token_strand: char,
+) -> bool {
+    let Some(last_token) = tokens.last_mut() else {
+        return false;
+    };
+    let Some((prev_start, prev_end, prev_strand)) = parse_segment_token(last_token) else {
+        return false;
+    };
+    if prev_strand != token_strand {
+        return false;
+    }
+    let merged_start = prev_start.min(block.ref_start);
+    let merged_end = prev_end.max(block.ref_end);
+    *last_token = format!("{merged_start}-{merged_end}:{token_strand}");
+    if let Some(last_span) = token_spans.last_mut() {
+        *last_span = (
+            last_span.0.min(block.ref_start),
+            last_span.1.max(block.ref_end),
+        );
+    }
+    true
 }
 
 /// Returns the CIGAR operations for one output segment block.
@@ -8429,6 +9238,31 @@ fn segment_gap_cs(
     let acceptor = reference_dinucleotide_lower(reference_seq, high_start - 2)
         .unwrap_or_else(|| "nn".to_string());
     format!("{op}{donor}{gap}{acceptor}")
+}
+
+/// Encodes a sub-intron gap between adjacent blocks as a short-form cs deletion.
+fn segment_deletion_gap_cs(
+    left: &SegmentBlock,
+    right: &SegmentBlock,
+    reference_seq: &str,
+) -> String {
+    let gap = interval_gap(left, right).max(0);
+    if gap == 0 {
+        return String::new();
+    }
+    let (low_end, high_start) = if left.ref_end < right.ref_start {
+        (left.ref_end, right.ref_start)
+    } else if right.ref_end < left.ref_start {
+        (right.ref_end, left.ref_start)
+    } else {
+        return String::new();
+    };
+    let start = low_end as usize;
+    let end = (high_start - 1) as usize;
+    let Some(deleted) = reference_seq.get(start..end) else {
+        return "*".to_string();
+    };
+    format!("-{}", deleted.to_ascii_lowercase())
 }
 
 /// Appends a pending short-form cs match run.
@@ -9688,9 +10522,10 @@ fn write_segments(path: &str, records: &[SegmentRecord]) -> Result<()> {
 /// Builds and writes one major full-length isoform for every confirmed circRNA.
 ///
 /// This is the Rust integration of the validated phase-seed-union prototype:
-/// BSJ/backward reads define high-confidence phasing edges, outward reads can
-/// fill compatible gaps with low weight, and ambiguous non-BSJ rows are ignored
-/// unless their segment span is uniquely contained by one final circRNA.
+/// BSJ/backward reads define high-confidence structure and phasing edges.
+/// Outward reads remain weak circular support for coverage and mature-link
+/// auditing, but they no longer choose splice edges because pair-level outward
+/// evidence is not phased enough to define exon chains.
 fn build_major_isoforms_from_segments_file(
     circ_records: &[CircRecord],
     segments_path: &str,
@@ -10331,6 +11166,7 @@ fn major_segment_junction_chain(segments: &str, circ: &CircRecord) -> Vec<MajorJ
                     (end, prev_start)
                 };
                 if donor_end < acceptor_start
+                    && major_edge_has_intronic_gap(donor_end, acceptor_start)
                     && donor_end >= circ.start
                     && acceptor_start <= circ.end
                 {
@@ -10346,6 +11182,16 @@ fn major_segment_junction_chain(segments: &str, circ: &CircRecord) -> Vec<MajorJ
         pending_bsj = false;
     }
     out
+}
+
+/// Returns whether two aligned blocks are separated by an intron-scale gap.
+///
+/// Minibwa can fragment otherwise continuous exonic sequence into several
+/// adjacent blocks with only a few unaligned bases between them. Those
+/// sub-intron gaps are useful as alignment detail but should not become
+/// isoform-graph splice edges, or they over-split mature exons.
+fn major_edge_has_intronic_gap(donor_end: i32, acceptor_start: i32) -> bool {
+    acceptor_start - donor_end - 1 >= MIN_INTRON
 }
 
 /// Returns continuous aligned blocks from one mate segment string.
@@ -10412,6 +11258,7 @@ fn major_segment_has_reused_overlap(segments: &str, circ: &CircRecord) -> bool {
                     (end, prev_start)
                 };
                 if donor_end < acceptor_start
+                    && major_edge_has_intronic_gap(donor_end, acceptor_start)
                     && donor_end >= circ.start
                     && acceptor_start <= circ.end
                 {
@@ -10478,23 +11325,25 @@ fn major_chain_has_adjacent_link_support(
 /// Returns whether one neighboring-junction link is supported and not excluded.
 ///
 /// Positive phasing and junction-exclusive evidence are treated symmetrically
-/// for mature classification: one high-confidence BSJ/backward read can support
-/// a link, but one high-confidence BSJ/backward read showing contradictory
-/// cyclic reuse prevents that link from certifying a mature path.
+/// for mature classification: one high-confidence BSJ/backward read, or many
+/// weak outward read chains, can support a link. Contradictory support prevents
+/// that link from certifying a mature path by the same weighted rule.
 fn major_link_is_mature_supported(
     link: MajorJunctionLink,
     link_support: &HashMap<MajorJunctionLink, MajorLinkSupport>,
     link_exclusion: &HashMap<MajorJunctionLink, MajorLinkSupport>,
 ) -> bool {
-    let supported = link_support
-        .get(&link)
-        .is_some_and(|support| support.bsj + support.backward >= MAJOR_MIN_MATURE_LINK_SUPPORT);
+    let supported = link_support.get(&link).is_some_and(|support| {
+        support.bsj + support.backward + support.outward * MAJOR_OUTWARD_LINK_WEIGHT
+            >= MAJOR_MIN_MATURE_LINK_SUPPORT
+    });
     if !supported {
         return false;
     }
-    !link_exclusion
-        .get(&link)
-        .is_some_and(|support| support.bsj + support.backward >= MAJOR_MIN_MATURE_LINK_SUPPORT)
+    !link_exclusion.get(&link).is_some_and(|support| {
+        support.bsj + support.backward + support.outward * MAJOR_OUTWARD_LINK_WEIGHT
+            >= MAJOR_MIN_MATURE_LINK_SUPPORT
+    })
 }
 
 /// Selects the single major isoform path for one circRNA.
@@ -10613,7 +11462,11 @@ fn major_set_isoform_identity(record: &mut MajorIsoformRecord, rank: usize) {
     record.isoform_id = format!("{}.iso{}", record.circ_id, rank);
 }
 
-/// Builds the BSJ-phased chain and fills gaps with backward/outward evidence.
+/// Builds the BSJ-phased chain and fills gaps with backward evidence.
+///
+/// Outward support is intentionally excluded from edge selection. It can confirm
+/// that many reads are circular, but it cannot phase an internal splice path
+/// without BSJ/backward read-chain support.
 fn major_phase_chain(
     circ: &CircRecord,
     support: &HashMap<MajorEdge, MajorEdgeSupport>,
@@ -10631,7 +11484,7 @@ fn major_phase_chain(
                 .iter()
                 .filter_map(|(&edge, counts)| {
                     if edge.donor_end >= start && edge.acceptor_start <= end {
-                        let weight = counts.backward as f64 + counts.outward as f64 * 0.05;
+                        let weight = counts.backward as f64;
                         (weight > 0.0).then_some((edge, weight))
                     } else {
                         None
@@ -11308,7 +12161,11 @@ fn push_major_exon_block(
 
 /// Infers splice edges inside one unphased graph block.
 ///
-/// Read-supported BSJ/backward/outward junctions are positive candidates.
+/// Read-supported BSJ/backward junctions are positive candidates.
+///
+/// Outward junctions are deliberately excluded from structural edge selection:
+/// they are unphased pair-level circular evidence and minibwa can produce many
+/// short exonic fragments that would otherwise over-split mature isoforms.
 /// Annotation-only junctions are added only when no high-confidence continuous
 /// BSJ/backward alignment spans across the candidate intron, so aligned
 /// junction-exclusive evidence can prevent over-splitting.
@@ -11598,7 +12455,7 @@ fn major_isoform_strand(circ: &CircRecord, edges: &[MajorEdge]) -> char {
 
 /// Weight used by the selected path score and coverage estimate.
 fn major_edge_weight(support: &MajorEdgeSupport) -> f64 {
-    support.bsj + support.backward + support.outward * 0.05
+    support.bsj + support.backward
 }
 
 /// Returns a stable sample label from the output prefix.
@@ -12510,6 +13367,65 @@ mod tests {
     }
 
     #[test]
+    fn outward_sa_retention_defaults_to_recognition_first_relaxed() {
+        assert_eq!(
+            parse_outward_sa_retention_mode(None),
+            OutwardSaRetentionMode::Relaxed
+        );
+        assert_eq!(
+            parse_outward_sa_retention_mode(Some("primary_only")),
+            OutwardSaRetentionMode::PrimaryOnly
+        );
+        assert_eq!(
+            parse_outward_sa_retention_mode(Some(" primary-only ")),
+            OutwardSaRetentionMode::PrimaryOnly
+        );
+        assert_eq!(
+            parse_outward_sa_retention_mode(Some("bogus")),
+            OutwardSaRetentionMode::PrimaryOnly
+        );
+        assert_eq!(
+            parse_outward_sa_retention_mode(Some("filtered")),
+            OutwardSaRetentionMode::Filtered
+        );
+    }
+
+    #[test]
+    fn outward_record_normalizes_relaxed_pair_to_mate_order() {
+        let records = vec![
+            AsAlignment {
+                flag: 0x80,
+                chr: "chr1".to_string(),
+                pos: 250,
+                mapq: 60,
+                cigar: "1S100M21S".to_string(),
+                seq: "A".repeat(122),
+                cs: "*".to_string(),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+            AsAlignment {
+                flag: 0x40 | 0x10,
+                chr: "chr1".to_string(),
+                pos: 100,
+                mapq: 9,
+                cigar: "1S100M21S".to_string(),
+                seq: "A".repeat(122),
+                cs: "*".to_string(),
+                from_local_clip: false,
+                xa_alternatives: Vec::new(),
+            },
+        ];
+
+        let row = build_outward_segment_record("read1", &records, None, 122, 10).unwrap();
+
+        assert_eq!(row.r1_align_strand, "-");
+        assert_eq!(row.r2_align_strand, "+");
+        assert_eq!(row.r1_segments, "100-199:?");
+        assert_eq!(row.r2_segments, "250-349:?");
+    }
+
+    #[test]
     fn annotation_breaks_multi_motif_offset_ties() {
         let mut annotation = Annotation::new();
         annotation
@@ -12919,7 +13835,7 @@ mod tests {
                 flag: 0x80,
                 chr: "chr1".to_string(),
                 pos: 250,
-                mapq: 60,
+                mapq: 9,
                 cigar: "1S100M21S".to_string(),
                 seq: "A".repeat(122),
                 cs: "*".to_string(),
@@ -13224,9 +14140,9 @@ mod tests {
             &segments_path,
             concat!(
                 "read_id\ttype\tcirc_id\tchrom\tstart\tend\tstrand\tis_circular\tis_r1_bsj\tis_r2_bsj\tr1_align_strand\tr2_align_strand\tr1_cigar\tr1_segments\tr2_cigar\tr2_segments\n",
-                "read1\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M49N21M\t280-300:+|<bsj>|100-150:+|200-220:+\tNA\tNA\n",
-                "read2\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t31M49N101M\t120-150:+|200-300:+|<bsj>|100-110:+\tNA\tNA\n",
-                "read3\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M49N21M\t280-300:+|<bsj>|100-150:+|200-220:+\tNA\tNA\n",
+                "read1\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M70N21M\t280-300:+|<bsj>|100-150:+|221-241:+\tNA\tNA\n",
+                "read2\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t31M70N80M\t120-150:+|221-300:+|<bsj>|100-110:+\tNA\tNA\n",
+                "read3\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M70N21M\t280-300:+|<bsj>|100-150:+|221-241:+\tNA\tNA\n",
             ),
         )
         .unwrap();
@@ -13260,7 +14176,7 @@ mod tests {
         let legacy_source = format!("{}-{}", "CIRI", "rs");
         assert!(!gtf.contains(&legacy_source));
         assert!(gtf.contains("\texon\t100\t150\t"));
-        assert!(gtf.contains("\texon\t200\t300\t"));
+        assert!(gtf.contains("\texon\t221\t300\t"));
         assert!(gtf.contains("type \"mature\";"));
         assert!(gtf.contains("evidence \"phased_junction\";"));
         assert!(gtf.contains("weakness \"3.000\";"));
@@ -13288,8 +14204,8 @@ mod tests {
         assert!(fasta.contains(">chrT:100|300.iso1 "));
         assert!(fasta.contains("type=mature"));
         assert!(fasta.contains("evidence=phased_junction"));
-        assert!(fasta.contains("len=152"));
-        assert!(fasta.contains("cirexon=100-150:+,200-300:+"));
+        assert!(fasta.contains("len=131"));
+        assert!(fasta.contains("cirexon=100-150:+,221-300:+"));
         assert!(!fasta.contains("structure_hash="));
         assert!(!fasta.contains("estimate_reason="));
         assert!(!fasta.contains("segment_coverage_pct="));
@@ -13327,11 +14243,11 @@ mod tests {
             format!("{}.segments", s1_prefix),
             concat!(
                 "read_id\ttype\tcirc_id\tchrom\tstart\tend\tstrand\tis_circular\tis_r1_bsj\tis_r2_bsj\tr1_align_strand\tr2_align_strand\tr1_cigar\tr1_segments\tr2_cigar\tr2_segments\n",
-                "s1r1\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M49N21M\t280-300:+|<bsj>|100-150:+|200-220:+\tNA\tNA\n",
-                "s1r2\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t31M49N101M\t120-150:+|200-300:+|<bsj>|100-110:+\tNA\tNA\n",
-                "s1r3\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M49N21M\t280-300:+|<bsj>|100-150:+|200-220:+\tNA\tNA\n",
-                "s1r4\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t31M49N101M\t120-150:+|200-300:+|<bsj>|100-110:+\tNA\tNA\n",
-                "s1r5\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t31M49N101M\t120-150:+|200-300:+|<bsj>|100-110:+\tNA\tNA\n",
+                "s1r1\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M70N21M\t280-300:+|<bsj>|100-150:+|221-241:+\tNA\tNA\n",
+                "s1r2\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t31M70N80M\t120-150:+|221-300:+|<bsj>|100-110:+\tNA\tNA\n",
+                "s1r3\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M70N21M\t280-300:+|<bsj>|100-150:+|221-241:+\tNA\tNA\n",
+                "s1r4\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t31M70N80M\t120-150:+|221-300:+|<bsj>|100-110:+\tNA\tNA\n",
+                "s1r5\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t31M70N80M\t120-150:+|221-300:+|<bsj>|100-110:+\tNA\tNA\n",
             ),
         )
         .unwrap();
@@ -13339,11 +14255,11 @@ mod tests {
             format!("{}.segments", s2_prefix),
             concat!(
                 "read_id\ttype\tcirc_id\tchrom\tstart\tend\tstrand\tis_circular\tis_r1_bsj\tis_r2_bsj\tr1_align_strand\tr2_align_strand\tr1_cigar\tr1_segments\tr2_cigar\tr2_segments\n",
-                "s2r1\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M69N21M\t280-300:+|<bsj>|100-170:+|240-260:+\tNA\tNA\n",
-                "s2r2\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t51M69N101M\t120-170:+|240-300:+|<bsj>|100-110:+\tNA\tNA\n",
-                "s2r3\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M69N21M\t280-300:+|<bsj>|100-170:+|240-260:+\tNA\tNA\n",
-                "s2r4\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t51M69N101M\t120-170:+|240-300:+|<bsj>|100-110:+\tNA\tNA\n",
-                "s2r5\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t51M69N101M\t120-170:+|240-300:+|<bsj>|100-110:+\tNA\tNA\n",
+                "s2r1\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M70N20M\t280-300:+|<bsj>|100-170:+|241-260:+\tNA\tNA\n",
+                "s2r2\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t51M70N60M\t120-170:+|241-300:+|<bsj>|100-110:+\tNA\tNA\n",
+                "s2r3\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t21M70N20M\t280-300:+|<bsj>|100-170:+|241-260:+\tNA\tNA\n",
+                "s2r4\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t51M70N60M\t120-170:+|241-300:+|<bsj>|100-110:+\tNA\tNA\n",
+                "s2r5\tbsj\tchrT:100|300\tchrT\t100\t300\t+\t1\t1\t0\t+\tNA\t51M70N60M\t120-170:+|241-300:+|<bsj>|100-110:+\tNA\tNA\n",
             ),
         )
         .unwrap();
@@ -14244,7 +15160,7 @@ mod tests {
             &segments_path,
             concat!(
                 "read_id\ttype\tcirc_id\tchrom\tstart\tend\tstrand\tis_circular\tis_r1_bsj\tis_r2_bsj\tr1_align_strand\tr2_align_strand\tr1_cigar\tr1_segments\tr2_cigar\tr2_segments\n",
-                "read1\tbsj\tchrT:100|300\tchrT\t100\t300\t-\t1\t1\t1\t+\t-\t58M80B21M69N51M\t246-303:-|<bsj>|150-170:-|240-290:-\t21M69N61M109B31M\t150-170:-|240-300:-|<bsj>|100-130:-\n",
+                "read1\tbsj\tchrT:100|300\tchrT\t100\t300\t-\t1\t1\t1\t+\t-\t58M80B21M70N50M\t246-303:-|<bsj>|150-170:-|241-290:-\t21M70N60M109B31M\t150-170:-|241-300:-|<bsj>|100-130:-\n",
             ),
         )
         .unwrap();
@@ -14273,7 +15189,7 @@ mod tests {
         assert_eq!(summary.circ_rnas, 1);
         let gtf = std::fs::read_to_string(format!("{}.isoforms.gtf", out_prefix)).unwrap();
         assert!(gtf.contains("\texon\t100\t170\t"));
-        assert!(gtf.contains("\texon\t240\t300\t"));
+        assert!(gtf.contains("\texon\t241\t300\t"));
         assert!(gtf.contains("type \"estimate\";"));
         assert!(gtf.contains("evidence \"unphased_junction\";"));
         let _ = std::fs::remove_file(&segments_path);
@@ -15136,6 +16052,89 @@ mod tests {
     }
 
     #[test]
+    fn materialize_chain_merges_sub_intron_gap_as_deletion() {
+        let mut chr = vec![b'N'; 120];
+        chr[99..111].copy_from_slice(b"AAAAGGGGCCCC");
+        let mut reference = HashMap::new();
+        reference.insert("chr1".to_string(), String::from_utf8(chr).unwrap());
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: None,
+            junction_support: None,
+        };
+        let parsed = vec![ParsedAlignment {
+            flag: 0,
+            chrom: "chr1".to_string(),
+            strand: '+',
+            mapq: 60,
+            seq: "AAAACCCC".to_string(),
+            blocks: vec![
+                SegmentBlock {
+                    read_start: 1,
+                    read_end: 4,
+                    ref_start: 100,
+                    ref_end: 103,
+                    from_local_clip: false,
+                    cigar_ops: Vec::new(),
+                },
+                SegmentBlock {
+                    read_start: 5,
+                    read_end: 8,
+                    ref_start: 108,
+                    ref_end: 111,
+                    from_local_clip: false,
+                    cigar_ops: Vec::new(),
+                },
+            ],
+        }];
+
+        let chain =
+            materialize_chain(&parsed, 8, None, '+', &[], Some(&correction), false).unwrap();
+
+        assert_eq!(chain.tokens, vec!["100-111:+".to_string()]);
+        assert_eq!(chain.cigar, "4M4D4M");
+        assert_eq!(chain.cs, ":4-gggg:4");
+    }
+
+    #[test]
+    fn large_deletion_cigar_splits_into_junction_gap() {
+        let record = AsAlignment {
+            flag: 0,
+            chr: "chr1".to_string(),
+            pos: 100,
+            mapq: 60,
+            cigar: "20M135D119M11S".to_string(),
+            seq: "A".repeat(150),
+            cs: "*".to_string(),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        };
+        let blocks = parse_alignment_blocks(&record, 150).unwrap();
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!((blocks[0].read_start, blocks[0].read_end), (1, 20));
+        assert_eq!((blocks[0].ref_start, blocks[0].ref_end), (100, 119));
+        assert_eq!((blocks[1].read_start, blocks[1].read_end), (21, 139));
+        assert_eq!((blocks[1].ref_start, blocks[1].ref_end), (255, 373));
+
+        let parsed = vec![ParsedAlignment {
+            flag: record.flag,
+            chrom: record.chr,
+            strand: '+',
+            mapq: record.mapq,
+            seq: record.seq,
+            blocks,
+        }];
+        let chain = materialize_chain(&parsed, 150, None, '+', &[], None, false).unwrap();
+
+        assert_eq!(
+            chain.tokens,
+            vec!["100-119:+".to_string(), "255-373:+".to_string()]
+        );
+        assert_eq!(chain.cigar, "20M135N119M11S");
+    }
+
+    #[test]
     fn materialize_chain_reslices_query_after_internal_boundary_correction() {
         let mut annotation = Annotation::new();
         annotation
@@ -15478,6 +16477,64 @@ mod tests {
         assert_eq!(record.is_r1_bsj, 0);
         assert_eq!(record.r2_segments, "100-189:+");
         assert_eq!(record.r2_cigar, "90M10S");
+        assert_eq!(record.is_r2_bsj, 1);
+    }
+
+    #[test]
+    fn bsj_local_clip_rescue_recovers_terminal_anchor() {
+        let mut chr = vec![b'N'; 220];
+        chr[99..189].copy_from_slice("A".repeat(90).as_bytes());
+        chr[189..199].copy_from_slice("C".repeat(10).as_bytes());
+        let mut reference = HashMap::new();
+        reference.insert("chr1".to_string(), String::from_utf8(chr).unwrap());
+        let correction = SegmentCorrectionContext {
+            reference: &reference,
+            annotation: None,
+            junction_support: None,
+        };
+        let circ = CircRecord {
+            id: "chr1:100|199".to_string(),
+            chr: "chr1".to_string(),
+            start: 100,
+            end: 199,
+            junction_read_count: "1".to_string(),
+            gene_id: "GENE1".to_string(),
+            strand: "+".to_string(),
+        };
+        let records = vec![AsAlignment {
+            flag: 0x80,
+            chr: "chr1".to_string(),
+            pos: 100,
+            mapq: 60,
+            cigar: "10S90M".to_string(),
+            seq: format!("{}{}", "C".repeat(10), "A".repeat(90)),
+            cs: "*".to_string(),
+            from_local_clip: false,
+            xa_alternatives: Vec::new(),
+        }];
+        let evidence = vec![MateBsjEvidence {
+            mate_bucket: 1,
+            chr: "chr1".to_string(),
+            start: 100,
+            end: 199,
+            strand: "+".to_string(),
+            priority: 0,
+            source_stage: "scan2".to_string(),
+        }];
+
+        let record = build_bsj_segment_record(
+            "read1",
+            &records,
+            &circ,
+            &evidence,
+            &[],
+            Some(&correction),
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(record.r2_segments, "100-189:+|<bsj>|190-199:+");
+        assert_eq!(record.r2_cigar, "90M0B10M");
         assert_eq!(record.is_r2_bsj, 1);
     }
 
@@ -16336,7 +17393,7 @@ mod tests {
             .insert("chr1\t149".to_string(), "GENE1\t+".to_string());
         annotation
             .chr_exon_start_map
-            .insert("chr1\t200".to_string(), "GENE1\t+".to_string());
+            .insert("chr1\t221".to_string(), "GENE1\t+".to_string());
         annotation
             .chr_exon_end_map
             .insert("chr1\t345".to_string(), "GENE1\t+".to_string());
@@ -16375,8 +17432,8 @@ mod tests {
                 SegmentBlock {
                     read_start: 102,
                     read_end: 153,
-                    ref_start: 198,
-                    ref_end: 249,
+                    ref_start: 219,
+                    ref_end: 270,
                     from_local_clip: false,
                     cigar_ops: Vec::new(),
                 },
@@ -16400,10 +17457,10 @@ mod tests {
                 "300-349:+".to_string(),
                 "<bsj>".to_string(),
                 "100-149:+".to_string(),
-                "200-249:+".to_string(),
+                "221-270:+".to_string(),
             ]
         );
-        assert_eq!(chain.cigar, "50M150B50M50N50M");
+        assert_eq!(chain.cigar, "50M150B50M71N50M");
     }
 
     #[test]
@@ -16603,11 +17660,8 @@ mod tests {
             materialize_chain(&parsed, 68, Some(&circ), '+', &[(-199, -100)], None, false).unwrap();
 
         assert!(!chain.is_bsj);
-        assert_eq!(
-            chain.tokens,
-            vec!["80-91:+".to_string(), "150-199:+".to_string()]
-        );
-        assert_eq!(chain.cigar, "12M58N50M6S");
+        assert_eq!(chain.tokens, vec!["80-199:+".to_string()]);
+        assert_eq!(chain.cigar, "12M58D50M6S");
     }
 
     #[test]
@@ -16615,8 +17669,8 @@ mod tests {
         let mut chr = vec![b'N'; 300];
         chr[149] = b'G';
         chr[150] = b'T';
-        chr[198] = b'A';
-        chr[199] = b'G';
+        chr[218] = b'A';
+        chr[219] = b'G';
         let chr = String::from_utf8(chr).unwrap();
         let mut reference = HashMap::new();
         reference.insert("chr1".to_string(), chr);
@@ -16643,8 +17697,8 @@ mod tests {
                 SegmentBlock {
                     read_start: 53,
                     read_end: 105,
-                    ref_start: 198,
-                    ref_end: 250,
+                    ref_start: 218,
+                    ref_end: 270,
                     from_local_clip: false,
                     cigar_ops: Vec::new(),
                 },
@@ -16656,8 +17710,8 @@ mod tests {
 
         assert_eq!(
             chain.tokens,
-            vec!["100-149:+".to_string(), "201-250:+".to_string()]
+            vec!["100-149:+".to_string(), "221-270:+".to_string()]
         );
-        assert_eq!(chain.cigar, "50M51N50M");
+        assert_eq!(chain.cigar, "50M71N50M");
     }
 }

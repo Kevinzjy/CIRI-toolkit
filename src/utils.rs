@@ -90,6 +90,38 @@ pub fn parse_cigar_ops_basic(cigar: &str) -> Option<Vec<(i32, char)>> {
     }
 }
 
+/// Returns whether a CIGAR is exactly `<read_len>M` without allocating.
+///
+/// Hot Scan2 and segments paths only need to recognize the canonical full-match
+/// CIGAR used by Java-compatible FSJ logic. This helper preserves the exact
+/// string-level behavior of comparing with `format!("{}M", read_len)` while
+/// avoiding a temporary `String` for every alignment.
+pub(crate) fn cigar_is_full_match(cigar: &str, read_len: i32) -> bool {
+    let Some(digits) = cigar.strip_suffix('M') else {
+        return false;
+    };
+    if digits.is_empty() || read_len < 0 {
+        return false;
+    }
+    if digits.len() > 1 && digits.as_bytes()[0] == b'0' {
+        return false;
+    }
+    let mut value = 0_i32;
+    for byte in digits.bytes() {
+        if !byte.is_ascii_digit() {
+            return false;
+        }
+        value = match value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add((byte - b'0') as i32))
+        {
+            Some(value) => value,
+            None => return false,
+        };
+    }
+    value == read_len
+}
+
 /// Encodes only recoverable soft-clipped bases for segment-evidence sidecars.
 ///
 /// Storing full read sequences would inflate the BSJ sidecar substantially. The
@@ -691,6 +723,16 @@ mod tests {
         assert_eq!(bam_shard_count(4 * 1024 * 1024, 16), 1);
         assert_eq!(bam_shard_count(8 * 1024 * 1024, 16), 2);
         assert_eq!(bam_shard_count(128 * 1024 * 1024, 4), 4);
+    }
+
+    #[test]
+    fn cigar_full_match_check_matches_canonical_string_compare() {
+        assert!(cigar_is_full_match("150M", 150));
+        assert!(cigar_is_full_match("0M", 0));
+        assert!(!cigar_is_full_match("149M", 150));
+        assert!(!cigar_is_full_match("150M1S", 150));
+        assert!(!cigar_is_full_match("0150M", 150));
+        assert!(!cigar_is_full_match("*", 150));
     }
 
     #[test]

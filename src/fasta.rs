@@ -55,6 +55,12 @@ impl FastaReader {
     }
 }
 
+impl Default for FastaReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

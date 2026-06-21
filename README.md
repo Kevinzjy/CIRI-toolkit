@@ -20,7 +20,17 @@ Benchmark dataset: ~80 GB BAM file (~300 GB SAM).
 
 ## Installation
 
-Download a prebuilt binary from the [release page](https://bioinfo.ioz.ac.cn/git/zhangjy/CIRI-toolkit/releases), or build from source:
+The recommended installation method is Cargo:
+
+```bash
+# Install Rust first if needed.
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Install CIRI-toolkit from crates.io.
+cargo install ciri-toolkit
+```
+
+Alternatively, you can download a prebuilt binary from the [release page](https://bioinfo.ioz.ac.cn/git/zhangjy/CIRI-toolkit/releases), or build CIRI-toolkit from source:
 
 ```bash
 git clone https://bioinfo.ioz.ac.cn/git/zhangjy/CIRI-toolkit.git
@@ -37,6 +47,10 @@ cargo build --release
 # Step 1. Align reads with BWA-MEM and write a BAM file.
 # NOTE: BAM must **NOT** be coordinate-sorted.
 bwa mem -t <threads> -T 19 <bwa_index> <R1.fastq.gz> <R2.fastq.gz> \
+  | samtools view -bS -@ <threads> -o <bam_file> -
+
+# Or use minibwa (which is 3-4x faster than bwa)
+minibwa map -t <threads> -x sr --adap=no -m19 -s19 <bwa_index> <R1.fastq.gz> <R2.fastq.gz> \
   | samtools view -bS -@ <threads> -o <bam_file> -
 
 # Step 2. Run CIRI-toolkit.

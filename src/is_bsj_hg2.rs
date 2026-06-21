@@ -1354,8 +1354,9 @@ impl IsBSJHg2 {
                         let mut tag = 1;
                         if circ_line_arr[5].len() > 5 {
                             // Java parity: preserve original branch order/conditions.
+                            let java_left_anchor_margin = 5;
                             let pem_null = if circ_line_arr[0] == "1"
-                                && site1_new - site1_new + 5 >= self.linear_range_size_min
+                                && java_left_anchor_margin >= self.linear_range_size_min
                             {
                                 if 2 * site1_new >= site2_new + 6 {
                                     java_substring(
