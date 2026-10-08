@@ -60,11 +60,17 @@ dist/ciri-toolkit-0.2.4-linux-x86_64-musl.tar.gz
 
 ## Release process
 
-`.github/workflows/release-linux-x86_64.yml` builds and attaches the static
-binary tarball automatically whenever a GitHub release is published. It checks
-out the release tag, so the tag must exist before the release is created:
+`.github/workflows/release-linux-x86_64.yml` turns a pushed tag into a
+published release. Pushing a `v*` tag to GitHub triggers the workflow, which
+checks out the tag, confirms it matches the version in `Cargo.toml`, builds the
+musl binaries, then creates the release with GitHub-generated notes and
+attaches the tarball and its checksum. Never create the release by hand:
+the workflow owns release creation, and a hand-made release would not have
+assets until a tag push happens anyway.
 
-1. Tag the release commit on `main`, then push `main` and the tag to GitHub
+1. Confirm `Cargo.toml` carries the release version.
+
+2. Tag the release commit on `main`, then push `main` and the tag to GitHub
    (`main` is the only branch synced to GitHub):
 
    ```bash
@@ -72,20 +78,12 @@ out the release tag, so the tag must exist before the release is created:
    git push <github-remote> main vX.Y.Z
    ```
 
-2. Create the release from the existing tag:
-
-   ```bash
-   gh release create vX.Y.Z --verify-tag --generate-notes
-   ```
-
-   `--verify-tag` fails if the tag does not exist yet, which enforces the
-   tag-first ordering. Creating the release first would make GitHub create the
-   tag at the default branch head instead.
-
-3. The workflow then builds the musl binaries and attaches
-   `ciri-toolkit-<version>-linux-x86_64-musl.tar.gz` plus a `.sha256` checksum
-   to the release. The archive name uses the version from `Cargo.toml`, which
-   should match the tag.
+That is the whole release action. The workflow publishes the release with
+automatically generated notes (commits since the previous tag) and uploads
+`ciri-toolkit-<version>-linux-x86_64-musl.tar.gz` plus a `.sha256` checksum.
+The workflow fails early if the tag does not match the `Cargo.toml` version.
+If a job fails, re-run it from the GitHub Actions page: release creation and
+asset upload are both idempotent.
 
 ## Runtime notes
 

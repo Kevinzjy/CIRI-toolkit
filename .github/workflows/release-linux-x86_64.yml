@@ -1,8 +1,8 @@
 name: Release Linux x86-64 binaries
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['v*']
 
 permissions:
   contents: write
@@ -15,13 +15,23 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Check out the release tag
+      # Tag push is the whole release action: the workflow creates the
+      # published release itself, so a release must never be created by hand.
+      - name: Check out the pushed tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ github.ref }}
 
       - name: Confirm the runner is x86-64
         run: test "$(uname -m)" = x86_64
+
+      # The tarball name comes from Cargo.toml, so a mismatched tag would
+      # publish an asset whose version does not match the release; fail early.
+      - name: Confirm the tag matches Cargo.toml version
+        run: |
+          version="$(awk -F '"' '/^version[[:space:]]*=/{print $2; exit}' Cargo.toml)"
+          echo "tag=${GITHUB_REF_NAME} cargo_version=${version}"
+          test "v${version}" = "${GITHUB_REF_NAME}"
 
       - name: Build and package static binaries
         working-directory: docker
@@ -54,11 +64,25 @@ jobs:
             printf 'checksum=%s\n' "${checksum}"
           } >> "$GITHUB_OUTPUT"
 
+      # Idempotent on re-run: keep an existing release instead of failing, so a
+      # retried job only refreshes the assets. --generate-notes lets GitHub
+      # build the notes from commits since the previous tag.
+      - name: Create the release with generated notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists"
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+          fi
+
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.ref_name }}
           PACKAGE: ${{ steps.assets.outputs.package }}
           CHECKSUM: ${{ steps.assets.outputs.checksum }}
         run: |
