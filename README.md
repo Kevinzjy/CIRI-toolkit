@@ -41,6 +41,33 @@ cargo build --release
 ./target/release/ciri --help
 ```
 
+### Linux x86-64 static binaries
+
+Release assets are Linux x86-64 static binaries built with the configuration in
+`docker/`. Download and unpack a release tarball:
+
+```bash
+tar -xzf ciri-toolkit-*-linux-x86_64-musl.tar.gz
+./ciri --help
+```
+
+The binaries target the generic x86-64 CPU baseline and do not require the host
+glibc, so they are suitable for older distributions such as CentOS 7. Docker is
+not needed to run them. `samtools` remains a runtime dependency for BAM input,
+and `ciri-simulator` uses `pigz` when available and otherwise falls back to
+`gzip`.
+
+To reproduce the release package on an x86-64 host with Docker:
+
+```bash
+cd docker
+make package
+```
+
+`make package` writes the tarball under `docker/dist/`; the release workflow
+also attaches a SHA-256 checksum. See `docker/README.md` for verification
+details.
+
 ## Quick Start
 
 ```bash

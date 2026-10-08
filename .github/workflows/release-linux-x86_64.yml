@@ -1,0 +1,68 @@
+name: Release Linux x86-64 binaries
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # Keep release automation on the x86-64 GitHub-hosted runner.
+    if: runner.arch == 'X64'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Confirm the runner is x86-64
+        run: test "$(uname -m)" = x86_64
+
+      - name: Build and package static binaries
+        working-directory: docker
+        run: make package
+
+      - name: Verify static Linux x86-64 binaries
+        working-directory: docker
+        run: |
+          set -euo pipefail
+          for binary in ciri ciri-simulator ciri-merge ciri-assemble; do
+            file "dist/${binary}" | grep -q 'x86-64'
+            if readelf -l "dist/${binary}" | grep -Eq '(^|[[:space:]])INTERP([[:space:]]|$)'; then
+              echo "ERROR: ${binary} has a dynamic interpreter" >&2
+              exit 1
+            fi
+            "./dist/${binary}" --help >/dev/null
+          done
+
+      - name: Select release assets
+        id: assets
+        run: |
+          set -euo pipefail
+          package="$(find docker/dist -maxdepth 1 -type f \
+            -name 'ciri-toolkit-*-linux-x86_64-musl.tar.gz' -print -quit)"
+          test -n "${package}"
+          checksum="${package}.sha256"
+          sha256sum "${package}" > "${checksum}"
+          {
+            printf 'package=%s\n' "${package}"
+            printf 'checksum=%s\n' "${checksum}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          PACKAGE: ${{ steps.assets.outputs.package }}
+          CHECKSUM: ${{ steps.assets.outputs.checksum }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            "$PACKAGE" \
+            "$CHECKSUM" \
+            --clobber

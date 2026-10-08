@@ -16,6 +16,7 @@ vendor/
 
 # --- Local Debug/Temp Workspace ---
 tmp/
+docker/dist/
 
 # Ignore intermediate back-spliced junction (BSJ) files
 tests/chr1*
