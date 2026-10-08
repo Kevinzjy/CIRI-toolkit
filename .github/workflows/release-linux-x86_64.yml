@@ -13,8 +13,6 @@ permissions:
 
 jobs:
   build:
-    # Keep release automation on the x86-64 GitHub-hosted runner.
-    if: runner.arch == 'X64'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -27,6 +25,9 @@ jobs:
           ref: ${{ github.ref }}
 
       - name: Confirm the runner is x86-64
+        # Keep release automation on the x86-64 GitHub-hosted runner. This
+        # must stay a step-level check: the runner context is not available
+        # in job-level `if`, and using it there invalidates the whole file.
         run: test "$(uname -m)" = x86_64
 
       # The tarball name comes from Cargo.toml, so a mismatched tag would
