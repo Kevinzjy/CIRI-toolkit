@@ -63,8 +63,13 @@ jobs:
           package="$(find docker/dist -maxdepth 1 -type f \
             -name 'ciri-toolkit-*-linux-x86_64-musl.tar.gz' -print -quit)"
           test -n "${package}"
+          # Record the plain file name (not the repo-relative path) so
+          # `sha256sum -c` works next to the downloaded release asset.
+          (
+            cd "$(dirname "${package}")" \
+              && sha256sum "$(basename "${package}")" > "$(basename "${package}").sha256"
+          )
           checksum="${package}.sha256"
-          sha256sum "${package}" > "${checksum}"
           {
             printf 'package=%s\n' "${package}"
             printf 'checksum=%s\n' "${checksum}"
