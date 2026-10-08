@@ -3,6 +3,10 @@ name: Release Linux x86-64 binaries
 on:
   push:
     tags: ['v*']
+  # Manual runs are dry runs: build + verify on a real runner without
+  # touching releases. Only a v* tag push creates a release and uploads
+  # assets, so a hand-run workflow can never publish anything.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -28,6 +32,7 @@ jobs:
       # The tarball name comes from Cargo.toml, so a mismatched tag would
       # publish an asset whose version does not match the release; fail early.
       - name: Confirm the tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           version="$(awk -F '"' '/^version[[:space:]]*=/{print $2; exit}' Cargo.toml)"
           echo "tag=${GITHUB_REF_NAME} cargo_version=${version}"
@@ -68,6 +73,7 @@ jobs:
       # retried job only refreshes the assets. --generate-notes lets GitHub
       # build the notes from commits since the previous tag.
       - name: Create the release with generated notes
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -79,6 +85,7 @@ jobs:
           fi
 
       - name: Upload release assets
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

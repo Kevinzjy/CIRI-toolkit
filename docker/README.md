@@ -85,6 +85,14 @@ The workflow fails early if the tag does not match the `Cargo.toml` version.
 If a job fails, re-run it from the GitHub Actions page: release creation and
 asset upload are both idempotent.
 
+## Dry run
+
+To exercise the build on a real GitHub runner without publishing, trigger the
+workflow manually (`Actions` -> `Release Linux x86-64 binaries` -> `Run
+workflow`, or `gh workflow run release-linux-x86_64.yml --ref <branch-or-tag>`).
+Manual runs build, verify, and select the assets, then stop: release creation
+and asset upload only execute for a `v*` tag push.
+
 ## Runtime notes
 
 Static linking removes the toolkit's direct glibc and dynamic-loader
